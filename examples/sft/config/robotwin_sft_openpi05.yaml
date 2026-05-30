@@ -1,0 +1,80 @@
+defaults:
+  - model/pi0_5@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 0-0
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "test_openpi05_sft"
+    logger_backends: ["tensorboard"] # wandb, swanlab
+
+  max_epochs: 1000
+  max_steps: -1
+  val_check_interval: -1
+  save_interval: 10
+
+data:
+  data_path: "/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/stack_bowls_three-demo_clean-50"
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  global_batch_size: 16
+  seed: 0
+
+  # Override the default values in model/pi05
+  model:
+    precision: null
+    model_path: "/shared_disk/users/weijie.ke/giga-rlinf/checkpoints/torch/pi05_base"
+    num_action_chunks: 15 # interface for the env
+    add_value_head: False
+    openpi:
+      config_name: "pi05_aloha_robotwin"
+      num_action_chunks: 50
+      action_dim: 14
+      num_images_in_input: 3
+
+  optim:
+    lr: 7.91e-6
+    value_lr: 1.55e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 0.01
+    clip_grad: 1.0
+
+  # Override the default values in training_backend/fsdp
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: False # for openpi, gradient checkpointing is not supported, please do not change this value
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
