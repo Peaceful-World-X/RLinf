@@ -1,0 +1,49 @@
+# Offline evaluation config.
+# Run:
+#   bash examples/embodiment/run_offline_eval.sh offline_eval_pi05
+#
+# actor.model.rl_token_path:
+#   null  -> load pure pi05 backbone (openpi), output pi05 actions
+#   path  -> load TD3 RL token actor (openpi_rl_token), output TD3 actor actions
+
+actor:
+  model:
+    model_type: "openpi"   # set to "openpi_rl_token" when using rl_token_path
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_plug_cable"
+    rl_token_path: null   # set to checkpoint path to use TD3 RL token actor
+
+    precision: null
+    action_dim: 14
+    action_horizon: 50
+    num_action_chunks: 50
+    num_steps: 5
+    is_lora: False
+    lora_rank: 32
+    add_value_head: False
+
+    openpi:
+      config_name: "pi05_aloha_robotwin"
+      num_images_in_input: 3
+      noise_level: 0.3
+      train_expert_only: True
+      action_chunk: 50
+      action_env_dim: 14
+      num_steps: 5
+      detach_critic_input: null
+      noise_method: "flow_sde"
+      add_value_head: False
+      value_after_vlm: False
+      value_vlm_mode: "mean_token"
+
+rollout:
+  model:
+    precision: null
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_plug_cable"
+
+# Dataset
+dataset_path: "/home/focal/shared_disk/users/kwj/data/lerobot_data/plug_in_network_cable_merged"
+num_trajectories: 5
+num_steps: 5
+output_dir: "logs/offline_eval"
+sample_frames: 5
+seed: 42

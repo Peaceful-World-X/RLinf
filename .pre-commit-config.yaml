@@ -11,4 +11,6 @@ repos:
     hooks: # support hooks
     -   id: check-message  # requires commit-msg hook
     -   id: check-commit-signoff
+        stages: [commit-msg]
+        pass_filenames: true
 

@@ -93,7 +93,9 @@ class RealWorldEnv(gym.Env):
             # Piper 双臂关节空间：无 tcp_pose；不套 GripperCloseEnv（仅适用于 Franka 7D EE）
             if not env.config.is_dummy and self.cfg.get("use_spacemouse", False):
                 env = SpacemouseIntervention(env)
-            if not env.config.is_dummy and self.cfg.get("keyboard_reward_wrapper", None):
+            if not env.config.is_dummy and self.cfg.get(
+                "keyboard_reward_wrapper", None
+            ):
                 if self.cfg.keyboard_reward_wrapper == "multi_stage":
                     env = KeyboardRewardDoneMultiStageWrapper(env)
                 elif self.cfg.keyboard_reward_wrapper == "single_stage":
@@ -122,14 +124,12 @@ class RealWorldEnv(gym.Env):
         This is for any node-level setup required by RealWorld environments. For example, ROS
         requires a single roscore instance per node, so we ensure that any existing roscore
         processes are terminated before starting a new one.
-
         This function is called once when the RealWorldEnv class is first imported.
-        
         Set RLINF_SKIP_ROS_CLEANUP=1 to skip ROS cleanup if you want to keep existing ROS nodes.
         """
         if os.environ.get("RLINF_SKIP_ROS_CLEANUP", "0") == "1":
             return
-        
+
         # Concurrency control is needed for multiple processes on the same node
         node_lock_file = "/tmp/.realworld.lock"
         # Check if the path is valid
@@ -268,7 +268,7 @@ class RealWorldEnv(gym.Env):
         raw_images.pop(self.main_image_key)
 
         if raw_images:
-            obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=1)
+            obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=0)
 
         obs = to_tensor(obs)
         obs["task_descriptions"] = self.task_descriptions
