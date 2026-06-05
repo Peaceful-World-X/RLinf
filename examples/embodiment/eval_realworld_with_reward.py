@@ -24,26 +24,35 @@ Usage:
         realworld_piper_peginsertion_pi05_eval_with_reward
 """
 
+import json
 import os
 import time
+
+os.environ.setdefault("RLINF_SKIP_ROS_CLEANUP", "1")
 
 import hydra
 import numpy as np
 import torch
-from omegaconf import DictConfig, open_dict
+import torch.multiprocessing as mp
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
 
 from rlinf.data.embodied_io_struct import ChunkStepResult, EmbodiedRolloutResult
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
-from rlinf.envs.realworld.common.keyboard.keyboard_listener import KeyboardListener
-from rlinf.envs.realworld.realworld_env import RealWorldEnv
-from rlinf.models import get_model
-from rlinf.scheduler import Cluster, ComponentPlacement, Worker
+from rlinf.scheduler import Worker
+
+mp.set_start_method("spawn", force=True)
 
 
 class EvalWithRewardCollector(Worker):
     def __init__(self, cfg: DictConfig):
         super().__init__()
+
+        from rlinf.envs.realworld.common.keyboard.keyboard_listener import (
+            KeyboardListener,
+        )
+        from rlinf.envs.realworld.realworld_env import RealWorldEnv
+        from rlinf.models import get_model
 
         self.cfg = cfg
         self.num_rollouts = cfg.runner.num_data_episodes
@@ -71,6 +80,8 @@ class EvalWithRewardCollector(Worker):
             worker_info=self.worker_info,
         )
 
+        self._keyboard = KeyboardListener()
+
         buffer_path = os.path.join(cfg.runner.logger.log_path, "demos")
         self.log_info(f"Initializing ReplayBuffer at: {buffer_path}")
         self.buffer = TrajectoryReplayBuffer(
@@ -81,40 +92,97 @@ class EvalWithRewardCollector(Worker):
             trajectory_format="pt",
         )
 
-        self._keyboard = KeyboardListener()
-
     def _process_obs(self, obs: dict) -> dict:
         if not self.cfg.runner.get("record_task_description", False):
             obs.pop("task_descriptions", None)
         ret = {}
         for key, val in obs.items():
+            out_key = "main_images" if key == "images" else key
+            if isinstance(val, list):
+                ret[out_key] = list(val)
+                continue
             if isinstance(val, np.ndarray):
                 val = torch.from_numpy(val)
             val = val.cpu()
-            ret["main_images" if key == "images" else key] = val.clone()
+            ret[out_key] = val.clone()
         return ret
 
     def _wait_enter(self, rollout_idx: int):
-        self.log_info(
-            f"[Rollout {rollout_idx + 1}/{self.num_rollouts}] Press ENTER to start..."
+        print(
+            f"[Rollout {rollout_idx + 1}/{self.num_rollouts}] Press ENTER to start...",
+            flush=True,
         )
-        with open("/dev/tty") as tty:
-            tty.readline()
+        while not self._keyboard.consume_press("Key.enter"):
+            time.sleep(0.05)
 
-    def _get_keyboard_reward(self) -> tuple[float, bool]:
-        """Block until a/b/c is pressed. Returns (reward, done)."""
-        self.log_info(
-            "Give reward: [a] fail(-1, done)  [b] neutral(0)  [c] success(1, done)"
+    def _execute_action_chunk(self, chunk_actions):
+        eval_cfg = self.cfg.env.eval
+        break_after_intervention = (
+            eval_cfg.get("break_chunk_after_intervention", False)
+            if hasattr(eval_cfg, "get")
+            else getattr(eval_cfg, "break_chunk_after_intervention", False)
         )
-        while True:
-            key = self._keyboard.get_key()
-            if key == "a":
-                return -1.0, True
-            if key == "b":
-                return 0.0, False
-            if key == "c":
-                return 1.0, True
-            time.sleep(0.02)
+        if not break_after_intervention:
+            return self.env.chunk_step(chunk_actions)
+
+        obs_list = []
+        infos_list = []
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+        raw_chunk_intervene_actions = []
+        raw_chunk_intervene_flags = []
+
+        was_intervening = False
+        for step_idx in range(chunk_actions.shape[1]):
+            actions = chunk_actions[:, step_idx]
+            obs, reward, terminations, truncations, infos = self.env.step(
+                actions, auto_reset=False
+            )
+
+            obs_list.append(obs)
+            infos_list.append(infos)
+            chunk_rewards.append(torch.as_tensor(reward))
+            raw_chunk_terminations.append(torch.as_tensor(terminations))
+            raw_chunk_truncations.append(torch.as_tensor(truncations))
+
+            intervene_flag = infos.get("intervene_flag")
+            current_intervening = False
+            if intervene_flag is not None:
+                intervene_flag = torch.as_tensor(intervene_flag, dtype=torch.bool)
+                current_intervening = bool(intervene_flag.any().item())
+                raw_chunk_intervene_flags.append(intervene_flag)
+                if "intervene_action" in infos:
+                    raw_chunk_intervene_actions.append(
+                        torch.as_tensor(infos["intervene_action"])
+                    )
+
+            done = bool((raw_chunk_terminations[-1] | raw_chunk_truncations[-1]).any())
+            intervention_released = was_intervening and not current_intervening
+            if done or intervention_released:
+                break
+            was_intervening = was_intervening or current_intervening
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+
+        infos_last = infos_list[-1] if infos_list else {}
+        if raw_chunk_intervene_flags:
+            infos_last["intervene_flag"] = torch.stack(raw_chunk_intervene_flags, dim=1)
+            if raw_chunk_intervene_actions:
+                infos_last["intervene_action"] = torch.stack(
+                    raw_chunk_intervene_actions, dim=1
+                ).reshape(chunk_actions.shape[0], -1)
+            infos_list[-1] = infos_last
+
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
 
     def run(self):
         saved = 0
@@ -150,14 +218,13 @@ class EvalWithRewardCollector(Worker):
                     .numpy()
                 )
 
-                # Execute full chunk via env.chunk_step
                 (
                     obs_list,
                     chunk_rewards,
                     chunk_terminations,
                     chunk_truncations,
                     infos_list,
-                ) = self.env.chunk_step(chunk_actions)
+                ) = self._execute_action_chunk(chunk_actions)
 
                 next_obs = obs_list[-1]
                 next_obs_processed = self._process_obs(next_obs)
@@ -168,15 +235,9 @@ class EvalWithRewardCollector(Worker):
                 truncated_tensor = chunk_truncations[:, -1:].bool()  # [1, 1]
                 done_tensor = terminated_tensor | truncated_tensor
 
-                # Recover intervene_action if any
                 action_tensor = torch.as_tensor(
                     actions.reshape(1, -1).cpu().numpy(), dtype=torch.float32
                 )
-                last_info = infos_list[-1]
-                if "intervene_action" in last_info:
-                    ia = last_info["intervene_action"]
-                    if isinstance(ia, torch.Tensor):
-                        action_tensor = ia.reshape(1, -1).float().cpu()
 
                 step = ChunkStepResult(
                     actions=action_tensor,
@@ -196,27 +257,11 @@ class EvalWithRewardCollector(Worker):
                 if done:
                     break
 
-            # Post-rollout: human assigns reward via keyboard
-            keyboard_reward, _ = self._get_keyboard_reward()
-            self.log_info(f"Keyboard reward: {keyboard_reward}")
-
             trajectory = rollout.to_trajectory()
-            # Overwrite final step reward with keyboard label
-            if trajectory.rewards is not None and len(trajectory.rewards) > 0:
-                trajectory.rewards[-1] = torch.full_like(
-                    trajectory.rewards[-1], keyboard_reward
-                )
-            # Mark all steps as human-labeled (mirrors collect_real_data.py)
-            if trajectory.intervene_flags is not None:
-                trajectory.intervene_flags = torch.ones_like(trajectory.intervene_flags)
-
             self.buffer.add_trajectories([trajectory])
             saved += 1
             progress_bar.update(1)
-            self.log_info(
-                f"Saved rollout {rollout_idx + 1} "
-                f"(reward={keyboard_reward}, total saved: {saved})"
-            )
+            self.log_info(f"Saved rollout {rollout_idx + 1} (total saved: {saved})")
 
         self.buffer.close()
         self.log_info(
@@ -231,9 +276,14 @@ class EvalWithRewardCollector(Worker):
     config_path="config",
     config_name="realworld_piper_peginsertion_pi05_eval_with_reward",
 )
-def main(cfg: DictConfig):
+def main(cfg: DictConfig) -> None:
+    print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
+
+    from rlinf.scheduler import Cluster
+    from rlinf.utils.placement import HybridComponentPlacement
+
     cluster = Cluster(cluster_cfg=cfg.cluster)
-    component_placement = ComponentPlacement(cfg, cluster)
+    component_placement = HybridComponentPlacement(cfg, cluster)
     env_placement = component_placement.get_strategy("env")
     collector = EvalWithRewardCollector.create_group(cfg).launch(
         cluster, name=cfg.env.group_name, placement_strategy=env_placement

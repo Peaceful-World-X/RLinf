@@ -19,13 +19,33 @@ import torch
 from omegaconf import DictConfig
 
 
+def _load_checkpoint_norm_stats(
+    checkpoint_dir,
+    asset_id: str,
+    *,
+    root_loader=None,
+    asset_loader=None,
+):
+    if root_loader is None:
+        import openpi.shared.normalize as _normalize
+
+        root_loader = _normalize.load
+    if asset_loader is None:
+        from openpi.training import checkpoints as _checkpoints
+
+        asset_loader = _checkpoints.load_norm_stats
+
+    if os.path.exists(os.path.join(checkpoint_dir, "norm_stats.json")):
+        return root_loader(checkpoint_dir)
+    return asset_loader(checkpoint_dir, asset_id)
+
+
 def get_model(cfg: DictConfig, torch_dtype=None):
     import glob
 
     import openpi.shared.download as download
     import openpi.transforms as transforms
     import safetensors
-    from openpi.training import checkpoints as _checkpoints
 
     from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
     from rlinf.models.embodiment.openpi.openpi_action_model import (
@@ -99,7 +119,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir, data_config.asset_id)
+        norm_stats = _load_checkpoint_norm_stats(checkpoint_dir, data_config.asset_id)
     # wrappers
     repack_transforms = transforms.Group()
     default_prompt = None

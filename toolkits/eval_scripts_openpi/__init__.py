@@ -22,9 +22,9 @@ import openpi.shared.download as download
 import openpi.transforms as transforms
 import safetensors
 from openpi.models_pytorch import pi0_pytorch
-from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 
+from rlinf.models.embodiment.openpi import _load_checkpoint_norm_stats
 from rlinf.models.embodiment.openpi.dataconfig import _CONFIGS_DICT
 
 
@@ -95,7 +95,7 @@ def create_trained_policy(
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir, data_config.asset_id)
+        norm_stats = _load_checkpoint_norm_stats(checkpoint_dir, data_config.asset_id)
 
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:

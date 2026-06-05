@@ -1,9 +1,9 @@
-# Piper dual-arm + pi0.5 real-world eval with keyboard reward labeling.
-# Supports pure pi0.5 (model_type=openpi) and pi0.5+RLToken+TD3 (model_type=openpi_rl_token).
+# Piper dual-arm + pure pi0.5 real-world eval.
+#
+# This config intentionally does not use pi0_5_rl_token or TD3 actor heads.
 #
 # Run:
-#   bash examples/embodiment/run_realworld_eval_with_reward.sh \
-#       realworld_piper_peginsertion_pi05_eval_with_reward
+#   bash examples/embodiment/run_realworld_eval.sh realworld_piper_peginsertion_pi05_eval
 
 defaults:
   - env/realworld_piper_peg_insertion@env.train
@@ -29,9 +29,9 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: null
+    log_path: "../results"
     project_name: rlinf
-    experiment_name: "piper_pi05_eval_with_reward"
+    experiment_name: "piper_pi05_eval"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1
@@ -43,10 +43,9 @@ runner:
   resume_dir: null
   ckpt_path: null
 
-  num_data_episodes: 10
-  record_task_description: False
-
 algorithm:
+  # Eval only. Use the embodied TD3 schema so pure pi0.5 does not need a PPO
+  # value head or an RLToken actor head.
   loss_type: embodied_td3
   sampling_params:
     do_sample: false
@@ -96,6 +95,8 @@ algorithm:
 env:
   group_name: "EnvGroup"
 
+  # Kept only because parts of EnvWorker still expect env.train to exist.
+  # runner.only_eval=true means this train env is not instantiated.
   train:
     total_num_envs: 1
     override_cfg:
@@ -111,21 +112,19 @@ env:
         - /camera_f/color/image_raw
         - /camera_l/color/image_raw
         - /camera_r/color/image_raw
-      obs_img_resolution: [224, 224]
+      obs_img_resolution: [480, 640]
 
   eval:
     total_num_envs: 1
-    keyboard_reward_wrapper: single_stage # single_stage or multi_stage
-    auto_reset: False
-    ignore_terminations: False
-    break_chunk_after_intervention: true
-    max_steps_per_rollout_epoch: 5000   # 30 Hz * ~167 s; must be divisible by num_action_chunks
-    max_episode_steps: 5000
+    auto_reset: false
+    max_steps_per_rollout_epoch: 90000  # 25 Hz * 3600 s; divisible by 50 and eval_execute_action_chunks.
+    max_episode_steps: 90000
     override_cfg:
-      is_dummy: False
+      is_dummy: false
       joint_action_mode: absolute
       success_hold_steps: 1
-      enable_human_intervention: True
+      enable_human_intervention: false
+      wait_enter_after_reset: true
       camera_names:
         - cam_high
         - cam_left_wrist
@@ -134,11 +133,12 @@ env:
         - /camera_f/color/image_raw
         - /camera_l/color/image_raw
         - /camera_r/color/image_raw
-      obs_img_resolution: [224, 224]
+      obs_img_resolution: [480, 640]
 
 rollout:
   group_name: "RolloutGroup"
   backend: "huggingface"
+  eval_execute_action_chunks: 25
   recompute_logprobs: false
   enable_offload: false
   pipeline_stage_num: 1
@@ -158,13 +158,13 @@ actor:
   enable_offload: false
 
   model:
-    model_path: "/home/ubuntu/user/chenshiyi/tos_downloads/pi05_weights/pi05_plug_cable"
-    num_action_chunks: 50
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert"
+    num_action_chunks: 10
     action_dim: 14
     add_value_head: false
-    num_steps: 5
+    num_steps: 10
     openpi:
-      config_name: "pi05_aloha_robotwin"
+      config_name: "pi05_aloha_cubeinsert"
       num_images_in_input: 3
       noise_level: 0.3
       train_expert_only: true

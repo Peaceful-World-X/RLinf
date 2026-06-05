@@ -9,7 +9,7 @@
 actor:
   model:
     model_type: "openpi"   # set to "openpi_rl_token" when using rl_token_path
-    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_plug_cable"
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert"
     rl_token_path: null   # set to checkpoint path to use TD3 RL token actor
 
     precision: null
@@ -38,12 +38,13 @@ actor:
 rollout:
   model:
     precision: null
-    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_plug_cable"
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert"
 
 # Dataset
-dataset_path: "/home/focal/shared_disk/users/kwj/data/lerobot_data/plug_in_network_cable_merged"
+dataset_path: "/home/focal/shared_disk/users/kwj/data/lerobot_data/cube_insert/"
 num_trajectories: 5
 num_steps: 5
 output_dir: "logs/offline_eval"
 sample_frames: 5
 seed: 42
+video_backend: "pyav"

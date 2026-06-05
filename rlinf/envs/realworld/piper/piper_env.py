@@ -50,17 +50,9 @@ from sensor_msgs.msg import Image, JointState
 from rlinf.utils.logging import get_logger
 
 from .piper_controller import PiperController
-from .piper_robot_state import PiperRobotState
 from .utils import (
-    PIPER_GRIPPER_MAX,
-    PIPER_GRIPPER_MIN,
-    PIPER_JOINT_LIMITS_HIGH,
-    PIPER_JOINT_LIMITS_LOW,
-    clip_gripper,
-    clip_joint_positions,
     split_dual_arm_action,
 )
-
 
 # =========================================================================
 # Configuration
@@ -99,6 +91,7 @@ class PiperRobotConfig:
         wait_teleop_release_before_reset: If True, ``reset`` waits until ``/enable_message_publish`` is False.
         teleop_release_poll_sec: Poll interval while waiting for teleop release.
         teleop_release_reset_timeout_sec: Max seconds to wait (None or <=0 = wait indefinitely).
+        wait_enter_after_reset: If True, ``reset`` waits for Enter before returning.
     """
 
     # ---- ROS namespaces ----
@@ -124,11 +117,22 @@ class PiperRobotConfig:
     obs_img_resolution: tuple[int, int] = (480, 640)  # (H, W) observation resolution
 
     # ---- Control parameters ----
-    step_frequency: float = 30.0  # Hz
-    publish_rate: int = 30
+    step_frequency: float = 25.0  # Hz
+    publish_rate: int = 25
     joint_speed_pct: int = 50
-    pos_lookahead_step: int = 50
+    pos_lookahead_step: int = 25
     chunk_size: int = 50
+    smooth_action_chunk: bool = True
+    action_smooth_cutoff_freq: float = 1.0
+    action_smooth_sampling_freq: float = 15.0
+    action_smooth_order: int = 2
+    sliding_window_action_buffer: bool = True
+    sliding_window_inference_trigger_remaining: int = 10
+    sliding_window_max_action_execute_horizon: int = 35
+    sliding_window_distance_thresh: float = 0.5
+    sliding_window_latency_steps: int = 0
+    gripper_action_threshold: Optional[float] = 0.03
+    gripper_action_scale: float = 1.1
 
     # ---- Environment parameters ----
     task_name: str = "task"
@@ -139,12 +143,26 @@ class PiperRobotConfig:
     # ---- Joint limits (per arm: 6 joints + 1 gripper) ----
     min_qpos: list[float] = field(
         default_factory=lambda: [
-            -2.618, 0.0, -2.967, -1.745, -1.22, -2.0944, 0.0, 0.0,
+            -2.618,
+            0.0,
+            -2.967,
+            -1.745,
+            -1.22,
+            -2.0944,
+            0.0,
+            0.0,
         ]
     )
     max_qpos: list[float] = field(
         default_factory=lambda: [
-            2.618, 3.14, 0.0, 1.745, 1.22, 2.0944, 1.0, 1.0,
+            2.618,
+            3.14,
+            0.0,
+            1.745,
+            1.22,
+            2.0944,
+            1.0,
+            1.0,
         ]
     )
 
@@ -167,6 +185,7 @@ class PiperRobotConfig:
     teleop_release_poll_sec: float = 0.1
     # None or <=0: wait indefinitely until teleop releases.
     teleop_release_reset_timeout_sec: Optional[float] = None
+    wait_enter_after_reset: bool = False
 
     # ---- ZMQ inference service (reserved) ----
     inference_host: str = "127.0.0.1"
@@ -232,6 +251,7 @@ class PiperEnv(gym.Env):
         self.env_idx = env_idx
         self._num_steps = 0
         self._success_hold_counter = 0
+        self._sliding_window_action_buffer = None
         self._ensure_reward_config_arrays()
 
         # ---- Initialize controller ----
@@ -285,7 +305,10 @@ class PiperEnv(gym.Env):
         # _master_action_left/right store latest 7D puppet joint states per arm (naming kept
         # for minimal diff). Combined to 14D when teleoperation is active for intervene_action.
         if config.enable_human_intervention and not config.is_dummy:
-            from rlinf.envs.realworld.common.keyboard.keyboard_listener import KeyboardListener
+            from rlinf.envs.realworld.common.keyboard.keyboard_listener import (
+                KeyboardListener,
+            )
+
             self._keyboard = KeyboardListener()
             self._policy_enabled = True
             self._master_action_left: np.ndarray | None = None
@@ -389,6 +412,21 @@ class PiperEnv(gym.Env):
                     break
             time.sleep(poll)
 
+    def _wait_for_enter_after_reset(self) -> None:
+        """Pause reset completion until the operator confirms policy execution."""
+        if self.config.is_dummy or not self.config.wait_enter_after_reset:
+            return
+
+        prompt = "Piper reset complete. Press Enter to start policy execution..."
+        self._logger.info(prompt)
+        try:
+            input(prompt)
+        except (EOFError, OSError) as exc:
+            self._logger.warning(
+                "Cannot wait for Enter in this process (%s). Continuing policy execution.",
+                exc,
+            )
+
     # ==================================================================
     # Action / observation spaces
     # ==================================================================
@@ -417,11 +455,15 @@ class PiperEnv(gym.Env):
             # Single-arm limits, tile to dual-arm
             action_low = np.tile(min_qpos[:7], 2).astype(np.float32)
             action_high = np.tile(max_qpos[:7], 2).astype(np.float32)
-            self.action_space = gym.spaces.Box(low=action_low, high=action_high, dtype=np.float32)
+            self.action_space = gym.spaces.Box(
+                low=action_low, high=action_high, dtype=np.float32
+            )
         else:
             action_low = min_qpos[:14].astype(np.float32)
             action_high = max_qpos[:14].astype(np.float32)
-            self.action_space = gym.spaces.Box(low=action_low, high=action_high, dtype=np.float32)
+            self.action_space = gym.spaces.Box(
+                low=action_low, high=action_high, dtype=np.float32
+            )
 
         h, w = self.config.obs_img_resolution
         state_space = gym.spaces.Dict(
@@ -439,6 +481,111 @@ class PiperEnv(gym.Env):
             {"state": state_space, "frames": frames_space}
         )
         self._base_observation_space = copy.deepcopy(self.observation_space)
+
+    # ==================================================================
+    # Action chunk preprocessing
+    # ==================================================================
+
+    def process_action_chunk(self, chunk_actions: np.ndarray) -> np.ndarray:
+        """Apply Piper-specific smoothing to one env's action chunk."""
+        actions = np.asarray(chunk_actions, dtype=np.float64).copy()
+        if actions.ndim != 2 or actions.shape[-1] < 14:
+            return actions
+
+        if self.config.sliding_window_action_buffer:
+            return self._apply_sliding_window_action_buffer(actions)
+        if self.config.smooth_action_chunk:
+            return self._smooth_action_sequence(actions)
+        return actions
+
+    def _apply_sliding_window_action_buffer(self, actions: np.ndarray) -> np.ndarray:
+        execute_steps = actions.shape[0]
+        trigger_remaining = int(self.config.sliding_window_inference_trigger_remaining)
+        latency_steps = max(0, int(self.config.sliding_window_latency_steps))
+
+        if self._sliding_window_action_buffer is None or trigger_remaining <= 0:
+            smoothed_actions = self._smooth_action_sequence(actions)
+        else:
+            old_tail_count = min(
+                max(1, execute_steps // 5),
+                trigger_remaining,
+                self._sliding_window_action_buffer.shape[0],
+            )
+            old_tail = self._sliding_window_action_buffer[-old_tail_count:]
+            adaptive_horizon = self._calculate_adaptive_horizon(actions)
+            new_start = min(latency_steps, max(0, adaptive_horizon - 1))
+            new_end = min(max(adaptive_horizon, execute_steps), actions.shape[0])
+            new_slice = actions[new_start:new_end]
+
+            if new_slice.shape[0] == 0:
+                new_slice = actions
+
+            stitched_actions = np.concatenate([old_tail, new_slice], axis=0)
+            stitched_actions = self._smooth_action_sequence(stitched_actions)
+            smoothed_actions = stitched_actions[old_tail_count:]
+
+            if smoothed_actions.shape[0] < execute_steps:
+                fallback_actions = np.concatenate([old_tail, actions], axis=0)
+                fallback_actions = self._smooth_action_sequence(fallback_actions)
+                smoothed_actions = fallback_actions[old_tail_count:]
+
+        smoothed_actions = smoothed_actions[:execute_steps]
+        processed_actions = actions.copy()
+        processed_actions[: smoothed_actions.shape[0]] = smoothed_actions
+        self._sliding_window_action_buffer = processed_actions.copy()
+        return processed_actions
+
+    def _calculate_adaptive_horizon(self, actions: np.ndarray) -> int:
+        max_horizon = int(self.config.sliding_window_max_action_execute_horizon)
+        trigger_remaining = int(self.config.sliding_window_inference_trigger_remaining)
+        distance_thresh = float(self.config.sliding_window_distance_thresh)
+
+        if actions.shape[0] < max_horizon:
+            return actions.shape[0]
+
+        actions_scaled = actions.copy()
+        actions_scaled[:, 6] *= 10.0
+        actions_scaled[:, 13] *= 10.0
+        actions_scaled = actions_scaled[:, [6, 13]]
+
+        base_action = actions_scaled[0]
+        for check_point in (15, 20, 25, 30, 40):
+            if check_point >= max_horizon or check_point >= actions_scaled.shape[0]:
+                break
+            l2_distance = np.linalg.norm(actions_scaled[check_point] - base_action)
+            if l2_distance > distance_thresh:
+                return min(check_point + trigger_remaining, actions.shape[0])
+
+        return min(max_horizon, actions.shape[0])
+
+    def _smooth_action_sequence(self, actions: np.ndarray) -> np.ndarray:
+        if actions.shape[0] <= 9 or actions.shape[-1] < 14:
+            return actions.copy()
+
+        from scipy.signal import butter, filtfilt
+
+        cutoff_freq = float(self.config.action_smooth_cutoff_freq)
+        sampling_freq = float(self.config.action_smooth_sampling_freq)
+        order = int(self.config.action_smooth_order)
+        b, a = butter(
+            order,
+            cutoff_freq / (0.5 * sampling_freq),
+            btype="low",
+            analog=False,
+        )
+
+        smoothed_actions = actions.copy()
+        left = smoothed_actions[:, :7].copy()
+        right = smoothed_actions[:, 7:14].copy()
+        left_gripper = left[:, -1].copy()
+        right_gripper = right[:, -1].copy()
+        left = filtfilt(b, a, left, axis=0)
+        right = filtfilt(b, a, right, axis=0)
+        left[:, -1] = left_gripper
+        right[:, -1] = right_gripper
+        smoothed_actions[:, :7] = left
+        smoothed_actions[:, 7:14] = right
+        return smoothed_actions
 
     # ==================================================================
     # Gym API: step
@@ -463,7 +610,9 @@ class PiperEnv(gym.Env):
 
         # ---- Delta / absolute_normalized: policy output [-1,1]^14 -> absolute joint target ----
         if self.config.joint_action_mode == "absolute_normalized":
-            assert self._joint_limit_low is not None and self._joint_limit_high is not None
+            assert (
+                self._joint_limit_low is not None and self._joint_limit_high is not None
+            )
             lo, hi = self._joint_limit_low, self._joint_limit_high
             action = (action + 1.0) / 2.0 * (hi - lo) + lo
             if self.config.delta_action_scale > 0:
@@ -475,7 +624,9 @@ class PiperEnv(gym.Env):
                 scale = float(self.config.delta_action_scale)
                 action = np.clip(action, current_qpos - scale, current_qpos + scale)
         elif self.config.joint_action_mode == "delta":
-            assert self._joint_limit_low is not None and self._joint_limit_high is not None
+            assert (
+                self._joint_limit_low is not None and self._joint_limit_high is not None
+            )
             current_qpos = (
                 self._controller.get_qpos()
                 if not self.config.is_dummy and self._controller is not None
@@ -489,21 +640,36 @@ class PiperEnv(gym.Env):
             )
 
         # ---- page_up: toggle policy output ----
-        if self._keyboard is not None and self._keyboard.consume_press(self.config.policy_enable_key):
+        if self._keyboard is not None and self._keyboard.consume_press(
+            self.config.policy_enable_key
+        ):
             self._policy_enabled = not self._policy_enabled
-            self._logger.info(f"Policy output {'enabled' if self._policy_enabled else 'disabled'}.")
+            self._logger.info(
+                f"Policy output {'enabled' if self._policy_enabled else 'disabled'}."
+            )
 
         # ---- If policy disabled, hold current position ----
-        if not self._policy_enabled and not self.config.is_dummy and self._controller is not None:
+        if (
+            not self._policy_enabled
+            and not self.config.is_dummy
+            and self._controller is not None
+        ):
             action = self._controller.get_qpos()
+
+        if self._policy_enabled and self.config.gripper_action_threshold is not None:
+            action = action.copy()
+            gripper_ids = [6, 13]
+            grippers = action[gripper_ids]
+            threshold = float(self.config.gripper_action_threshold)
+            scale = float(self.config.gripper_action_scale)
+            action[gripper_ids] = np.where(grippers < threshold, 0.0, grippers * scale)
 
         # ---- Split into left/right arm actions ----
         left_action, right_action = split_dual_arm_action(action)
 
         # ---- Check teleop state once (ROS node owns channel when active) ----
-        teleop_active = (
-            not self.config.is_dummy
-            and rospy.get_param("/enable_message_publish", False)
+        teleop_active = not self.config.is_dummy and rospy.get_param(
+            "/enable_message_publish", False
         )
 
         # ---- Publish control command ----
@@ -539,7 +705,10 @@ class PiperEnv(gym.Env):
         info: dict = {}
         if teleop_active:
             with self._master_action_lock:
-                if self._master_action_left is not None and self._master_action_right is not None:
+                if (
+                    self._master_action_left is not None
+                    and self._master_action_right is not None
+                ):
                     info["intervene_action"] = np.concatenate(
                         [self._master_action_left, self._master_action_right]
                     )
@@ -573,6 +742,7 @@ class PiperEnv(gym.Env):
         """
         self._num_steps = 0
         self._success_hold_counter = 0
+        self._sliding_window_action_buffer = None
 
         if self.config.is_dummy:
             observation = self._get_observation()
@@ -605,15 +775,19 @@ class PiperEnv(gym.Env):
 
         time.sleep(0.5)
 
-        observation = self._get_observation()
         self._logger.info("PiperEnv reset complete.")
+        self._wait_for_enter_after_reset()
+
+        observation = self._get_observation()
         return observation, {}
 
     def _ensure_reward_config_arrays(self) -> None:
         """Normalize target_qpos / reward_threshold to 14D float64 (compatible with YAML lists)."""
         cfg = self.config
         cfg.target_qpos = np.asarray(cfg.target_qpos, dtype=np.float64).reshape(14)
-        cfg.reward_threshold = np.asarray(cfg.reward_threshold, dtype=np.float64).reshape(14)
+        cfg.reward_threshold = np.asarray(
+            cfg.reward_threshold, dtype=np.float64
+        ).reshape(14)
 
     # ==================================================================
     # Observation
@@ -682,7 +856,10 @@ class PiperEnv(gym.Env):
             self._success_hold_counter = 0
             if self.config.use_dense_reward:
                 reward = float(
-                    np.exp(-self.config.dense_reward_scale * np.sum(np.square(target_delta)))
+                    np.exp(
+                        -self.config.dense_reward_scale
+                        * np.sum(np.square(target_delta))
+                    )
                 )
             else:
                 reward = 0.0

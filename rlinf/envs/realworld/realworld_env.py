@@ -268,7 +268,7 @@ class RealWorldEnv(gym.Env):
         raw_images.pop(self.main_image_key)
 
         if raw_images:
-            obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=0)
+            obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=1)
 
         obs = to_tensor(obs)
         obs["task_descriptions"] = self.task_descriptions
@@ -352,6 +352,9 @@ class RealWorldEnv(gym.Env):
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
+
+            if (terminations | truncations).any():
+                break
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(

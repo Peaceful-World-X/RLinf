@@ -43,8 +43,8 @@ runner:
   resume_dir: null
   ckpt_path: null
 
-  num_data_episodes: 10
-  record_task_description: False
+  num_data_episodes: 5
+  record_task_description: True
 
 algorithm:
   loss_type: embodied_td3
@@ -135,6 +135,7 @@ env:
         - /camera_l/color/image_raw
         - /camera_r/color/image_raw
       obs_img_resolution: [224, 224]
+      sliding_window_action_buffer: true
 
 rollout:
   group_name: "RolloutGroup"
@@ -158,13 +159,13 @@ actor:
   enable_offload: false
 
   model:
-    model_path: "/home/ubuntu/user/chenshiyi/tos_downloads/pi05_weights/pi05_plug_cable"
-    num_action_chunks: 50
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert"
+    num_action_chunks: 10
     action_dim: 14
     add_value_head: false
     num_steps: 5
     openpi:
-      config_name: "pi05_aloha_robotwin"
+      config_name: "pi05_aloha_cubeinsert"
       num_images_in_input: 3
       noise_level: 0.3
       train_expert_only: true

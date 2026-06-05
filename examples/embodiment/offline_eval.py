@@ -31,6 +31,17 @@ from omegaconf import open_dict
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("RLINF_SKIP_ROS_CLEANUP", "1")
+os.environ.setdefault("AV_LOG_LEVEL", "panic")
+os.environ.setdefault("LIBDAV1D_LOG_LEVEL", "0")
+
+
+def _suppress_video_logging() -> None:
+    try:
+        import av
+
+        av.logging.set_level(av.logging.FATAL)
+    except ImportError:
+        pass
 
 
 def get_episode_indices(
@@ -106,6 +117,20 @@ def frame_to_env_obs(frame: dict, task: str) -> dict:
     }
 
 
+def _align_gt_actions_to_prediction(
+    pred_chunk: np.ndarray, gt: np.ndarray
+) -> np.ndarray:
+    pred_dim = pred_chunk.shape[-1]
+    gt_dim = gt.shape[-1]
+    if gt_dim < pred_dim:
+        raise ValueError(
+            f"Ground-truth action dim {gt_dim} is smaller than prediction dim {pred_dim}."
+        )
+    if gt_dim > pred_dim:
+        return gt[..., :pred_dim]
+    return gt
+
+
 def eval_episode(
     model,
     stride_frames: list,
@@ -130,6 +155,7 @@ def eval_episode(
             gt = all_actions[t : min(t + H, T)]
             if len(gt) < H:
                 gt = np.pad(gt, ((0, H - len(gt)), (0, 0)), mode="edge")
+            gt = _align_gt_actions_to_prediction(pred_chunk, gt)
             errors.append(np.abs(pred_chunk - gt))
 
     return np.stack(errors, axis=0)  # [num_chunks, H, action_dim]
@@ -191,6 +217,7 @@ def plot_chunk_heatmaps(all_errors, episode_indices, output_dir, sample_frames=5
 def main(cfg) -> None:
     from rlinf.models import get_model
 
+    _suppress_video_logging()
     dataset_path = cfg.dataset_path
     output_dir = cfg.get("output_dir", "logs/offline_eval")
 
@@ -217,7 +244,11 @@ def main(cfg) -> None:
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
     print("Loading dataset...")
-    ds = LeRobotDataset(dataset_path, episodes=episode_indices)
+    ds = LeRobotDataset(
+        dataset_path,
+        episodes=episode_indices,
+        video_backend=cfg.get("video_backend", "pyav"),
+    )
 
     all_errors = []
     action_chunk = cfg.actor.model.num_action_chunks

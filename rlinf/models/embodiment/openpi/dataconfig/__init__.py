@@ -308,6 +308,18 @@ _CONFIGS = [
         num_train_steps=20_000,
     ),
     TrainConfig(
+        name="pi05_aloha_cubeinsert",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            assets=AssetsConfig(asset_id="cube_insert_norm"),
+            default_prompt="insert the cube",
+            extra_delta_transform=True,  # True for delta action, False for abs_action
+            adapt_to_pi=True,
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
         name="pi0_behavior",
         model=pi0_config.Pi0Config(),
         data=LeRobotBehaviorDataConfig(

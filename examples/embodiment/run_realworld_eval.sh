@@ -8,8 +8,8 @@ export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
 
 export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 export HYDRA_FULL_ERROR=1
-export RLINF_SKIP_ROS_CLEANUP="${RLINF_SKIP_ROS_CLEANUP:-1}"
-
+export RLINF_SKIP_ROS_CLEANUP=1
+export RAY_memory_usage_threshold=0.99
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <config_name> [hydra_overrides...]" >&2
     exit 1
