@@ -25,19 +25,21 @@ cluster:
     rollout: 0-0
 
 runner:
-  task_type: embodied
+  task_type: offline
   logger:
     log_path: "../results"
     project_name: rlinf
     experiment_name: "piper_td3_rl_token_real"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 10
-  max_steps: -1
+  max_epochs: 100000
+  max_steps: 100000
+  local_update_steps: 1
 
   only_eval: False
   val_check_interval: -1
-  save_interval: -1
+  save_interval: 500
+  log_interval: 20
   weight_sync_interval: 1
 
   resume_dir: null
@@ -63,7 +65,7 @@ algorithm:
   gamma: 0.99
   tau: 0.005
   update_epoch: 1
-  critic_actor_ratio: 2
+  critic_actor_ratio: 10
   target_update_freq: 1
   target_policy_noise: 0.2
   target_noise_clip: 0.5
@@ -82,11 +84,16 @@ algorithm:
     hard_penalty_coef: 5000.0
     hard_penalty_power: 1.0
 
+  offline_data_paths:
+    - "/home/focal/shared_disk/users/kwj/RLinf/logs/20260605-11:28:09-realworld_piper_cubeinsert_pi05_eval_with_reward/demos"
+    - "/home/focal/shared_disk/users/kwj/RLinf/logs/20260609-07:59:29-realworld_piper_cubeinsert_pi05_eval_with_reward/demos"
+  task_descriptions: "insert the cube"
+
   replay_buffer:
     enable_cache: True
     cache_size: 10
     min_buffer_size: 100
-    sample_window_size: 10
+    sample_window_size: 205
     auto_save: False
     prefetch_size: 2
 
@@ -113,12 +120,18 @@ env:
 
   eval:
     total_num_envs: 1
+    keyboard_reward_wrapper: single_stage
+    auto_reset: False
+    ignore_terminations: False
+    break_chunk_after_intervention: true
+    max_steps_per_rollout_epoch: 5000
+    max_episode_steps: 5000
     override_cfg:
-      is_dummy: true
+      is_dummy: false
       joint_action_mode: absolute_normalized
       delta_action_scale: 0.01
       success_hold_steps: 1
-      enable_human_intervention: false
+      enable_human_intervention: true
       camera_names:
         - cam_high
         - cam_left_wrist
@@ -128,6 +141,7 @@ env:
         - /camera_l/color/image_raw
         - /camera_r/color/image_raw
       obs_img_resolution: [224, 224]
+      sliding_window_action_buffer: true
 
 rollout:
   group_name: "RolloutGroup"
@@ -145,23 +159,26 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
 
-  micro_batch_size: 2
-  global_batch_size: 2
+  micro_batch_size: 8
+  global_batch_size: 32
   seed: 1234
   enable_offload: false
 
   model:
-    model_path: "/home/ubuntu/user/chenshiyi/tos_downloads/pi05_weights/pi05_plug_cable"
-    rl_token_path: "/home/ubuntu/user/chenshiyi/tos_downloads/pi05_weights/rl_token_pi05_image/10000"
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert"
+    rl_token_path: "/home/focal/shared_disk/users/kwj/weight/rltoken/pi05_cube_insert/pi05_cube_insert/10000"
     action_dim: 14
-    action_horizon: 50
-    num_action_chunks: 50
+    num_action_chunks: 10
     num_steps: 5
     openpi:
-      config_name: "pi05_aloha_robotwin"
+      config_name: "pi05_aloha_cubeinsert"
       num_images_in_input: 3
       noise_level: 0.3
       train_expert_only: True
+      action_chunk: ${actor.model.num_action_chunks}
+      action_env_dim: ${actor.model.action_dim}
+      num_steps: ${actor.model.num_steps}
+      detach_critic_input: null
 
   policy_head:
     enable_critic_q_upper_bound: True

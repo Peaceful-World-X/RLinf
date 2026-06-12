@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Synchronous TD3 policy worker for RLinf.
 
 Mirrors EmbodiedSACFSDPPolicy but uses TD3Algorithm (deterministic policy,
@@ -88,10 +102,14 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         self.qf_optimizer = self.critic_optimizer
 
         self.build_lr_schedulers()
-        self.grad_scaler = self.build_grad_scaler(self.cfg.actor.fsdp_config.grad_scaler)
+        self.grad_scaler = self.build_grad_scaler(
+            self.cfg.actor.fsdp_config.grad_scaler
+        )
 
     def build_lr_schedulers(self):
-        self.lr_scheduler = self.build_lr_scheduler(self.actor_optimizer, self.cfg.actor.optim)
+        self.lr_scheduler = self.build_lr_scheduler(
+            self.actor_optimizer, self.cfg.actor.optim
+        )
         self.qf_lr_scheduler = self.build_lr_scheduler(
             self.critic_optimizer, self.cfg.actor.critic_optim
         )
@@ -113,7 +131,9 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             sample_window_size=self.cfg.algorithm.replay_buffer.sample_window_size,
             auto_save=self.cfg.algorithm.replay_buffer.get("auto_save", False),
             auto_save_path=auto_save_path,
-            trajectory_format=self.cfg.algorithm.replay_buffer.get("trajectory_format", "pt"),
+            trajectory_format=self.cfg.algorithm.replay_buffer.get(
+                "trajectory_format", "pt"
+            ),
         )
 
         min_demo_buffer_size = 0
@@ -162,7 +182,10 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             self.cfg.algorithm, self.cfg.actor.policy_head
         )
         self.td3_algorithm.set_discount(self.cfg.algorithm.gamma)
-        self.td3_algorithm.set_action_horizon(self.cfg.actor.model.action_horizon)
+        action_horizon = self.cfg.actor.model.get(
+            "action_horizon", self.cfg.actor.model.num_action_chunks
+        )
+        self.td3_algorithm.set_action_horizon(action_horizon)
         self.target_update_type = self.cfg.algorithm.get("target_update_type", "all")
 
     # ------------------------------------------------------------------
@@ -219,7 +242,9 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         )
 
     def reshape_action_fn(self, action, name):
-        action_horizon = self.cfg.actor.model.action_horizon
+        action_horizon = self.cfg.actor.model.get(
+            "action_horizon", self.cfg.actor.model.num_action_chunks
+        )
         action_dim = self.cfg.actor.model.action_dim
         return action.reshape(action.shape[0], action_horizon, action_dim)
 
@@ -242,6 +267,30 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             "target_q_mean": target_q.mean().item(),
             **aux,
         }
+        # monitor actor action MSE against ground truth every step (no grad)
+        with torch.no_grad():
+            curr_obs = batch["curr_obs"]
+            visual_feat = self.build_visual_feat_fn(self.get_visual_input(curr_obs))
+            sampled_actions = self.reshape_action_fn(
+                batch["actions"].to(self.device, dtype=self.torch_dtype),
+                "batch.actions",
+            )
+            ref_action = self.get_ref_action(
+                curr_obs, sampled_actions, "curr_obs.ref_action"
+            )
+            actions, _ = self.model(
+                forward_type=ForwardType.TD3,
+                mode="actor",
+                visual_feat=visual_feat,
+                robot_state=self.get_robot_state(curr_obs),
+                ref_action=ref_action,
+                ref_action_dropout_p=0.0,
+                use_target=False,
+                compute_recon_loss=False,
+            )
+            metrics["actor_action_mse"] = torch.nn.functional.mse_loss(
+                actions, ref_action
+            ).item()
         return critic_loss, metrics
 
     @Worker.timer("forward_actor")
@@ -296,7 +345,9 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
 
     @Worker.timer("update_one_epoch")
     def update_one_epoch(self):
-        global_batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
+        global_batch_size_per_rank = (
+            self.cfg.actor.global_batch_size // self._world_size
+        )
         with self.worker_timer("sample"):
             global_batch = next(self.buffer_dataloader_iter)
 
@@ -350,12 +401,14 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             self.actor_optimizer.step()
             self.lr_scheduler.step()
             actor_updated = True
-            metrics_data.update({
-                "td3/actor_loss": np.mean(actor_losses),
-                "actor/lr": self.actor_optimizer.param_groups[0]["lr"],
-                "actor/grad_norm": actor_grad_norm,
-                **{f"actor/{k}": np.mean(v) for k, v in all_actor_metrics.items()},
-            })
+            metrics_data.update(
+                {
+                    "td3/actor_loss": np.mean(actor_losses),
+                    "actor/lr": self.actor_optimizer.param_groups[0]["lr"],
+                    "actor/grad_norm": actor_grad_norm,
+                    **{f"actor/{k}": np.mean(v) for k, v in all_actor_metrics.items()},
+                }
+            )
 
         # Target soft update
         tau = self.td3_algorithm.get_target_update_tau(
@@ -405,8 +458,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
 
     def process_train_metrics(self, metrics):
         replay_buffer_stats = {
-            f"replay_buffer/{k}": v
-            for k, v in self.replay_buffer.get_stats().items()
+            f"replay_buffer/{k}": v for k, v in self.replay_buffer.get_stats().items()
         }
         append_to_dict(metrics, replay_buffer_stats)
 

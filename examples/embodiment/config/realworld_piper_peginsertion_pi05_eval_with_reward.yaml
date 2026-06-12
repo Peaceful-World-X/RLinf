@@ -43,7 +43,7 @@ runner:
   resume_dir: null
   ckpt_path: null
 
-  num_data_episodes: 10
+  num_data_episodes: 200
   record_task_description: False
 
 algorithm:
