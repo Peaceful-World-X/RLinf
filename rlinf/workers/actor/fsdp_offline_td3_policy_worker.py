@@ -58,6 +58,12 @@ class OfflineTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
             sample_window_size=self.cfg.algorithm.replay_buffer.sample_window_size,
             auto_save=False,
         )
+        self.replay_buffer.mc_return_gamma = float(self.cfg.algorithm.gamma)
+        if hasattr(self.replay_buffer, "set_n_step"):
+            self.replay_buffer.set_n_step(
+                int(self.cfg.algorithm.get("n_step", 1)),
+                float(self.cfg.algorithm.gamma),
+            )
 
         for path in data_paths:
             if not os.path.isdir(path):
@@ -90,7 +96,7 @@ class OfflineTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
         self.buffer_dataloader_iter = iter(self.buffer_dataloader)
 
         self.td3_algorithm = TD3Algorithm(
-            self.cfg.algorithm, self.cfg.actor.policy_head
+            self.cfg.algorithm, self.cfg.actor.get("policy_head", None)
         )
         self.td3_algorithm.set_discount(self.cfg.algorithm.gamma)
         self.td3_algorithm.set_action_horizon(self.cfg.actor.model.num_action_chunks)
@@ -108,7 +114,14 @@ class OfflineTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
             // self._world_size
         )
         self.model.train()
-        metrics = self.update_one_epoch()
-        self.update_step += 1
-        metrics["__global_step"] = self.update_step
-        return metrics
+        metrics = {}
+        for _ in range(int(self.cfg.algorithm.get("update_epoch", 1))):
+            epoch_metrics = self.update_one_epoch()
+            for key, value in epoch_metrics.items():
+                metrics.setdefault(key, []).append(value)
+            self.update_step += 1
+        mean_metrics = {
+            key: sum(values) / len(values) for key, values in metrics.items() if values
+        }
+        mean_metrics["__global_step"] = self.update_step
+        return mean_metrics

@@ -164,13 +164,6 @@ actor:
       noise_level: 0.3
       train_expert_only: True
 
-  policy_head:
-    enable_critic_q_upper_bound: True
-    critic_q_upper_bound: 1.0
-    actor_q_loss_clamp_to_upper_bound: True
-    critic_target_clamp_to_upper_bound: True
-    critic_overshoot_penalty_coef: 1.0
-
   optim:
     lr: 3.0e-4
     adam_beta1: 0.9

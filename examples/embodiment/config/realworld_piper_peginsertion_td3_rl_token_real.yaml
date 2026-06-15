@@ -38,12 +38,38 @@ runner:
 
   only_eval: False
   val_check_interval: -1
-  save_interval: 500
+  save_interval: 50
+  save_initial_checkpoint: True
+  actor_critic_only_checkpoint: True
   log_interval: 20
   weight_sync_interval: 1
 
   resume_dir: null
   ckpt_path: null
+  offline_validation_visualization:
+    enabled: True
+    minimal: True
+    data_paths:
+      - "/home/focal/shared_disk/users/kwj/RLinf/logs/20260609-07:59:29-realworld_piper_cubeinsert_pi05_eval_with_reward/demos_fail_reward0_normdelta"
+    split_success_failure: True
+    num_success_trajectories: 1
+    num_failure_trajectories: 1
+    num_trajectories: 2
+    num_chunks_per_trajectory: 6
+    index_mode: "terminal_window"
+    urdf_path: "/home/focal/shared_disk/users/kwj/RLinf/assets/piper_local_assets/piper.urdf"
+    base_link: "base_link"
+    tip_link: "gripper"
+    joint_action_mode: "normalized_delta"
+    action_norm_stats_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert/norm_stats.json"
+    action_norm_std_floor: 1.0
+    delta_visualization_anchor: "robot_state"
+    delta_action_scale: 0.01
+    dual_arm_base_offsets:
+      - [0.0, 0.22, 0.0]
+      - [0.0, -0.22, 0.0]
+    min_qpos: [-2.618, 0.0, -2.967, -1.745, -1.22, -2.0944, 0.0]
+    max_qpos: [2.618, 3.14, 0.0, 1.745, 1.22, 2.0944, 1.0]
 
 algorithm:
   loss_type: embodied_td3
@@ -62,14 +88,40 @@ algorithm:
     min_length: 1
   adv_type: null
 
-  gamma: 0.99
-  tau: 0.005
+  gamma: 0.96
+  n_step: 10
+  tau: 0.05
   update_epoch: 1
-  critic_actor_ratio: 10
+  critic_actor_ratio: 1
   target_update_freq: 1
-  target_policy_noise: 0.2
-  target_noise_clip: 0.5
-  bc_coef: 1.0
+  target_policy_noise: 0.0
+  target_noise_clip: 0.0
+  target_action_clip: 1.2
+  critic_target_action_source: "data_next"
+  behavior_action_clip: null
+  bc_coef: 50.0
+  actor_q_coef: 0.0
+  critic_td_coef: 1.0
+  critic_mc_return_coef: 0.0
+  critic_train_rl_token_encoder: False
+  critic_separate_rl_token_encoder: False
+  critic_train_representation: False
+
+  training_stages:
+    actor_critic_coupling_start_step: 800
+    coupled_critic_target_action_source: "actor"
+    coupled_actor_q_coef: 0.1
+    coupled_bc_coef: 50.0
+    coupled_target_policy_noise: 0.05
+    coupled_target_noise_clip: 0.1
+    coupled_target_action_clip: 1.2
+
+  tail_curriculum:
+    enabled: True
+    start_window: 1
+    hold_steps: 100
+    end_window: 96
+    warmup_steps: 1000
 
   rollout_epoch: 1
   eval_rollout_epoch: 1
@@ -85,8 +137,7 @@ algorithm:
     hard_penalty_power: 1.0
 
   offline_data_paths:
-    - "/home/focal/shared_disk/users/kwj/RLinf/logs/20260605-11:28:09-realworld_piper_cubeinsert_pi05_eval_with_reward/demos"
-    - "/home/focal/shared_disk/users/kwj/RLinf/logs/20260609-07:59:29-realworld_piper_cubeinsert_pi05_eval_with_reward/demos"
+    - "/home/focal/shared_disk/users/kwj/RLinf/logs/20260609-07:59:29-realworld_piper_cubeinsert_pi05_eval_with_reward/demos_fail_reward0_normdelta"
   task_descriptions: "insert the cube"
 
   replay_buffer:
@@ -104,7 +155,7 @@ env:
     total_num_envs: 1
     override_cfg:
       is_dummy: false
-      joint_action_mode: absolute_normalized
+      joint_action_mode: absolute
       delta_action_scale: 0.01
       success_hold_steps: 1
       enable_human_intervention: false
@@ -128,7 +179,7 @@ env:
     max_episode_steps: 5000
     override_cfg:
       is_dummy: false
-      joint_action_mode: absolute_normalized
+      joint_action_mode: absolute
       delta_action_scale: 0.01
       success_hold_steps: 1
       enable_human_intervention: true
@@ -160,13 +211,23 @@ actor:
   training_backend: "fsdp"
 
   micro_batch_size: 8
-  global_batch_size: 32
+  global_batch_size: 64
   seed: 1234
   enable_offload: false
 
   model:
     model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert"
     rl_token_path: "/home/focal/shared_disk/users/kwj/weight/rltoken/pi05_cube_insert/pi05_cube_insert/10000"
+    freeze_rl_token: True
+    critic_train_rl_token_encoder: ${algorithm.critic_train_rl_token_encoder}
+    critic_separate_rl_token_encoder: ${algorithm.critic_separate_rl_token_encoder}
+    recon_loss_coef: 0.0
+    actor_output_bound: 1.2
+    use_robot_state: False
+    critic_use_robot_state: True
+    action_space: "normalized_delta"
+    action_norm_stats_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert/norm_stats.json"
+    action_norm_std_floor: 1.0
     action_dim: 14
     num_action_chunks: 10
     num_steps: 5
@@ -180,28 +241,21 @@ actor:
       num_steps: ${actor.model.num_steps}
       detach_critic_input: null
 
-  policy_head:
-    enable_critic_q_upper_bound: True
-    critic_q_upper_bound: 1.0
-    actor_q_loss_clamp_to_upper_bound: True
-    critic_target_clamp_to_upper_bound: True
-    critic_overshoot_penalty_coef: 1.0
-
   optim:
-    lr: 3.0e-4
+    lr: 1.0e-3
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-8
-    weight_decay: 0.01
+    weight_decay: 0.0
     clip_grad: 1.0
     lr_scheduler: torch_constant
 
   critic_optim:
-    lr: 3.0e-4
+    lr: 1.0e-3
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-8
-    weight_decay: 0.01
+    weight_decay: 0.0
     clip_grad: 1.0
     lr_scheduler: torch_constant
 

@@ -61,7 +61,7 @@ class KeyboardRewardDoneWrapper(BaseKeyboardRewardDoneWrapper):
 
         last_intervened = True
         if key == "a":
-            reward = -1
+            reward = 0
             done = True
             last_intervened = True
         elif key == "b":

@@ -35,6 +35,13 @@ mp.set_start_method("spawn", force=True)
 )
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)
+    if str(cfg.runner.get("task_type", "")) == "offline":
+        raise RuntimeError(
+            "Refusing to run an offline config with train_async.py. "
+            "The async embodied entrypoint always creates rollout/env workers and "
+            "can command real robots. Use examples/embodiment/train_offline_rl.py "
+            "for offline TD3/RLToken training and open-loop debug visualizations."
+        )
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
     cluster = Cluster(

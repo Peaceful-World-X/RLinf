@@ -247,6 +247,11 @@ class OfflineRunner:
         if log_interval < 1:
             raise ValueError(f"runner.log_interval must be >= 1, got {log_interval}.")
         worker_step_synced = False
+        if (
+            self.cfg.runner.get("save_initial_checkpoint", False)
+            and self.global_step == 0
+        ):
+            self._save_checkpoint()
 
         while self.global_step < self.max_steps:
             _step = self.global_step

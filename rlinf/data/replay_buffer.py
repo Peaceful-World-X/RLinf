@@ -256,6 +256,7 @@ class TrajectoryReplayBuffer:
         self.trajectory_format = trajectory_format
         self.enable_cache = enable_cache
         self.sample_window_size = sample_window_size
+        self.sample_tail_window_size = 0
         self.auto_save = auto_save
         self.logger = get_logger()
 
@@ -314,6 +315,13 @@ class TrajectoryReplayBuffer:
         self._window_cache_cumulative_ends: list[int] = []
         self._window_cache_cumulative_ends_tensor: Optional[torch.Tensor] = None
         self._window_cache_total_samples = 0
+        self._tail_window_cache_size = None
+        self._tail_window_cache_version = None
+        self._tail_window_cache_window_size = 0
+        self._tail_window_cache_ids: list[int] = []
+        self._tail_window_cache_cumulative_ends: list[int] = []
+        self._tail_window_cache_cumulative_ends_tensor: Optional[torch.Tensor] = None
+        self._tail_window_cache_total_samples = 0
 
         # Buffer state
         self.size = 0  # Current number of trajectories
@@ -324,6 +332,70 @@ class TrajectoryReplayBuffer:
         self.random_generator: Optional[torch.Generator] = None
 
         self._init_random_generator(self.seed)
+
+    def _compute_mc_returns(self, trajectory: Trajectory) -> Optional[torch.Tensor]:
+        rewards = getattr(trajectory, "rewards", None)
+        if not torch.is_tensor(rewards):
+            return None
+
+        gamma = float(getattr(self, "mc_return_gamma", 1.0))
+        rewards_f = rewards.float()
+        returns = torch.zeros_like(rewards_f)
+        running = torch.zeros_like(rewards_f[0])
+
+        done_like = None
+        masks = []
+        for field_name in ("terminations", "dones", "truncations"):
+            value = getattr(trajectory, field_name, None)
+            if torch.is_tensor(value):
+                if value.shape[0] == rewards.shape[0] + 1:
+                    value = value[1:]
+                elif value.shape[0] != rewards.shape[0]:
+                    value = value[: rewards.shape[0]]
+                masks.append(value.to(dtype=torch.bool))
+        if masks:
+            done_like = masks[0]
+            for mask in masks[1:]:
+                done_like = done_like | mask
+
+        for step in range(rewards_f.shape[0] - 1, -1, -1):
+            future = running
+            if done_like is not None:
+                future = torch.where(done_like[step], torch.zeros_like(future), future)
+            running = rewards_f[step] + gamma * future
+            returns[step] = running
+        return returns.to(dtype=rewards.dtype)
+
+    def _ensure_mc_returns(self, trajectory: Trajectory) -> None:
+        forward_inputs = getattr(trajectory, "forward_inputs", None)
+        if not isinstance(forward_inputs, dict):
+            trajectory.forward_inputs = {}
+            forward_inputs = trajectory.forward_inputs
+        if "mc_return" in forward_inputs and torch.is_tensor(
+            forward_inputs["mc_return"]
+        ):
+            return
+        mc_return = self._compute_mc_returns(trajectory)
+        if mc_return is not None:
+            forward_inputs["mc_return"] = mc_return
+
+    def set_n_step(self, n_step: int, gamma: float) -> None:
+        new_n_step = max(1, int(n_step))
+        new_gamma = float(gamma)
+        if (
+            getattr(self, "n_step", None) == new_n_step
+            and getattr(self, "n_step_gamma", None) == new_gamma
+        ):
+            return
+        self.n_step = new_n_step
+        self.n_step_gamma = new_gamma
+        if self._flat_trajectory_cache is not None:
+            self._flat_trajectory_cache.clear()
+        self._window_cache_version = None
+        self._tail_window_cache_version = None
+
+    def set_sample_tail_window_size(self, tail_window_size: int) -> None:
+        self.sample_tail_window_size = max(0, int(tail_window_size))
 
     def _init_random_generator(self, seed):
         """(Re)initialize numpy and torch RNGs from self.seed."""
@@ -434,6 +506,7 @@ class TrajectoryReplayBuffer:
         )
         for field_name, value in trajectory_dict.items():
             setattr(trajectory, field_name, value)
+        self._ensure_mc_returns(trajectory)
 
         return trajectory
 
@@ -451,6 +524,7 @@ class TrajectoryReplayBuffer:
 
         save_futures = []
         for trajectory in trajectories:
+            self._ensure_mc_returns(trajectory)
             model_weights_id = trajectory.model_weights_id
             trajectory_id = self._trajectory_counter
 
@@ -565,14 +639,55 @@ class TrajectoryReplayBuffer:
 
         # Sample from the most recent trajectories (windowed)
         window_size = max(0, int(self.sample_window_size))
+        tail_window_size = max(0, int(getattr(self, "sample_tail_window_size", 0)))
         with self._index_lock:
-            if (
+            if tail_window_size > 0:
+                cache_ok = (
+                    self._tail_window_cache_size == window_size
+                    and self._tail_window_cache_window_size == tail_window_size
+                    and self._tail_window_cache_version == self._index_version
+                )
+                if cache_ok:
+                    window_ids = self._tail_window_cache_ids
+                    cumulative_ends = self._tail_window_cache_cumulative_ends
+                    window_total_samples = self._tail_window_cache_total_samples
+                else:
+                    if window_size > 0:
+                        window_ids = list(self._trajectory_id_list[-window_size:])
+                    else:
+                        window_ids = list(self._trajectory_id_list)
+
+                    cumulative_ends = []
+                    running = 0
+                    for single_id in window_ids:
+                        num_samples = int(
+                            self._trajectory_index[single_id]["num_samples"]
+                        )
+                        running += min(num_samples, tail_window_size)
+                        cumulative_ends.append(running)
+                    window_total_samples = running
+
+                    self._tail_window_cache_size = window_size
+                    self._tail_window_cache_window_size = tail_window_size
+                    self._tail_window_cache_version = self._index_version
+                    self._tail_window_cache_ids = window_ids
+                    self._tail_window_cache_cumulative_ends = cumulative_ends
+                    self._tail_window_cache_cumulative_ends_tensor = (
+                        torch.as_tensor(cumulative_ends, dtype=torch.long)
+                        if cumulative_ends
+                        else None
+                    )
+                    self._tail_window_cache_total_samples = window_total_samples
+
+                cumulative_ends_tensor = self._tail_window_cache_cumulative_ends_tensor
+            elif (
                 self._window_cache_size == window_size
                 and self._window_cache_version == self._index_version
             ):
                 window_ids = self._window_cache_ids
                 cumulative_ends = self._window_cache_cumulative_ends
                 window_total_samples = self._window_cache_total_samples
+                cumulative_ends_tensor = self._window_cache_cumulative_ends_tensor
             else:
                 if window_size > 0:
                     window_ids = list(self._trajectory_id_list[-window_size:])
@@ -596,6 +711,7 @@ class TrajectoryReplayBuffer:
                     else None
                 )
                 self._window_cache_total_samples = window_total_samples
+                cumulative_ends_tensor = self._window_cache_cumulative_ends_tensor
 
         if not window_ids:
             return {}
@@ -616,7 +732,6 @@ class TrajectoryReplayBuffer:
 
         # Convert global sample indices to per-trajectory local indices
         grouped_indices: dict[str, list[tuple[int, int]]] = {}
-        cumulative_ends_tensor = self._window_cache_cumulative_ends_tensor
         if cumulative_ends_tensor is None or cumulative_ends_tensor.numel() == 0:
             return {}
 
@@ -629,6 +744,19 @@ class TrajectoryReplayBuffer:
             [torch.zeros(1, dtype=torch.long), cumulative_ends_tensor[:-1]]
         )
         local_sample_indices = sample_ids_tensor - starts[bucket_indices]
+        if tail_window_size > 0:
+            local_offsets = []
+            for idx_in_batch in range(sample_ids_tensor.numel()):
+                traj_idx = int(bucket_indices[idx_in_batch])
+                trajectory_id = window_ids[traj_idx]
+                num_samples = int(self._trajectory_index[trajectory_id]["num_samples"])
+                available = min(num_samples, tail_window_size)
+                offset = max(0, num_samples - available)
+                local_offsets.append(offset)
+            local_sample_indices = local_sample_indices + torch.as_tensor(
+                local_offsets,
+                dtype=torch.long,
+            )
 
         for idx_in_batch in range(sample_ids_tensor.numel()):
             idx = int(bucket_indices[idx_in_batch])
@@ -709,10 +837,233 @@ class TrajectoryReplayBuffer:
 
         return batch if batch is not None else {}
 
+    def _ensure_return_balanced_ids(self) -> None:
+        cache_version = getattr(self, "_return_balanced_cache_version", None)
+        if cache_version == self._index_version:
+            return
+        success_ids: list[int] = []
+        failure_ids: list[int] = []
+        for trajectory_id in self._trajectory_id_list:
+            info = self._trajectory_index.get(trajectory_id, None)
+            if info is None:
+                continue
+            trajectory = self._load_trajectory(trajectory_id, info["model_weights_id"])
+            self._ensure_mc_returns(trajectory)
+            mc_return = getattr(trajectory, "forward_inputs", {}).get("mc_return", None)
+            if torch.is_tensor(mc_return) and bool(
+                (mc_return.float() > 1e-6).any().item()
+            ):
+                success_ids.append(trajectory_id)
+            else:
+                failure_ids.append(trajectory_id)
+        self._return_balanced_success_ids = success_ids
+        self._return_balanced_failure_ids = failure_ids
+        self._return_balanced_cache_version = self._index_version
+
+    def sample_balanced_mc_return(
+        self, num_chunks: int, tail_window_size: int = 0
+    ) -> dict[str, torch.Tensor]:
+        self._ensure_return_balanced_ids()
+        success_ids = list(getattr(self, "_return_balanced_success_ids", []))
+        failure_ids = list(getattr(self, "_return_balanced_failure_ids", []))
+        if not success_ids or not failure_ids:
+            return self.sample_chunks(num_chunks)
+
+        flats: list[dict] = []
+        buffer_indices: list[int] = []
+        rng = self.random_generator
+        id_groups = (success_ids, failure_ids)
+        group_offsets = torch.randint(0, 2, (1,), generator=rng).item()
+
+        # Interleave success and failure samples. The TD3 worker splits the global
+        # batch into micro-batches, so putting all positives before all zero-return
+        # samples prevents per-micro-batch margin losses from ever seeing both.
+        for sample_idx in range(int(num_chunks)):
+            ids = id_groups[(int(sample_idx) + int(group_offsets)) % 2]
+            pick = int(torch.randint(0, len(ids), (1,), generator=rng).item())
+            tid = int(ids[pick])
+            info = self._trajectory_index[tid]
+            trajectory = self._load_trajectory(tid, info["model_weights_id"])
+            flat = self._flatten_trajectory(trajectory)
+            num_samples = int(info["num_samples"])
+            available = (
+                min(num_samples, int(tail_window_size))
+                if int(tail_window_size) > 0
+                else num_samples
+            )
+            offset = max(0, num_samples - available)
+            local = (
+                int(torch.randint(0, available, (1,), generator=rng).item()) + offset
+            )
+            flats.append(flat)
+            buffer_indices.append(local)
+
+        return self._sample_from_flat_specs(flats, buffer_indices)
+
+    def _sample_from_flat_specs(
+        self,
+        flats: list[dict],
+        buffer_indices: list[int],
+    ) -> dict[str, torch.Tensor]:
+        if not flats:
+            return {}
+        concat_flat = self._concat_flat_trajectories(flats)
+        batch = self._init_batch_from_flat(concat_flat, len(buffer_indices))
+        slot_lengths = []
+        for flat in flats:
+            max_len = 0
+            for value in flat.values():
+                if torch.is_tensor(value):
+                    max_len = max(max_len, int(value.shape[0]))
+                elif isinstance(value, dict):
+                    for nested_value in value.values():
+                        if torch.is_tensor(nested_value):
+                            max_len = max(max_len, int(nested_value.shape[0]))
+            slot_lengths.append(max_len)
+        offsets = []
+        cursor = 0
+        for slot_len, local in zip(slot_lengths, buffer_indices):
+            offsets.append(cursor + int(local))
+            cursor += int(slot_len)
+        self._fill_batch_from_buffer_indices(
+            batch,
+            concat_flat,
+            torch.as_tensor(offsets, dtype=torch.long),
+            torch.arange(len(offsets), dtype=torch.long),
+        )
+        return batch
+
+    def _ensure_return_bin_entries(self, bin_edges: list[float]) -> None:
+        edges_key = tuple(float(x) for x in bin_edges)
+        cache_version = getattr(self, "_return_bin_cache_version", None)
+        cache_edges = getattr(self, "_return_bin_cache_edges", None)
+        if cache_version == self._index_version and cache_edges == edges_key:
+            return
+
+        num_bins = max(1, len(edges_key) + 1)
+        bins: list[list[tuple[int, int]]] = [[] for _ in range(num_bins)]
+        for trajectory_id in self._trajectory_id_list:
+            info = self._trajectory_index.get(trajectory_id, None)
+            if info is None:
+                continue
+            trajectory = self._load_trajectory(trajectory_id, info["model_weights_id"])
+            self._ensure_mc_returns(trajectory)
+            mc_return = getattr(trajectory, "forward_inputs", {}).get("mc_return", None)
+            if not torch.is_tensor(mc_return):
+                continue
+            mc_flat = mc_return.float().reshape(-1)
+            for local_idx, value in enumerate(mc_flat.tolist()):
+                bin_idx = 0
+                for edge in edges_key:
+                    if float(value) > float(edge):
+                        bin_idx += 1
+                    else:
+                        break
+                bins[bin_idx].append((trajectory_id, int(local_idx)))
+
+        self._return_bin_entries = bins
+        self._return_bin_cache_edges = edges_key
+        self._return_bin_cache_version = self._index_version
+
+    def sample_return_bins(
+        self,
+        num_chunks: int,
+        bin_edges: list[float],
+        bin_weights: Optional[list[float]] = None,
+        tail_window_size: int = 0,
+    ) -> dict[str, torch.Tensor]:
+        self._ensure_return_bin_entries(bin_edges)
+        bins = [list(entries) for entries in getattr(self, "_return_bin_entries", [])]
+        non_empty_bins = [idx for idx, entries in enumerate(bins) if entries]
+        if not non_empty_bins:
+            return self.sample_chunks(num_chunks)
+
+        flats: list[dict] = []
+        buffer_indices: list[int] = []
+        rng = self.random_generator
+        weights = None
+        if bin_weights is not None:
+            raw_weights = torch.as_tensor(
+                [
+                    float(bin_weights[idx]) if idx < len(bin_weights) else 0.0
+                    for idx in non_empty_bins
+                ],
+                dtype=torch.float32,
+            )
+            if bool((raw_weights > 0.0).any().item()):
+                weights = raw_weights.clamp_min(0.0)
+                weights = weights / weights.sum()
+        start_offset = int(
+            torch.randint(0, len(non_empty_bins), (1,), generator=rng).item()
+        )
+
+        for sample_idx in range(int(num_chunks)):
+            if weights is None:
+                bin_idx = non_empty_bins[
+                    (sample_idx + start_offset) % len(non_empty_bins)
+                ]
+            else:
+                weight_pick = int(torch.multinomial(weights, 1, generator=rng).item())
+                bin_idx = non_empty_bins[weight_pick]
+            entries = bins[bin_idx]
+            pick = int(torch.randint(0, len(entries), (1,), generator=rng).item())
+            tid, local = entries[pick]
+            info = self._trajectory_index[int(tid)]
+
+            if int(tail_window_size) > 0:
+                num_samples = int(info["num_samples"])
+                offset = max(0, num_samples - min(num_samples, int(tail_window_size)))
+                attempts = 0
+                while int(local) < offset and attempts < 16:
+                    pick = int(
+                        torch.randint(0, len(entries), (1,), generator=rng).item()
+                    )
+                    tid, local = entries[pick]
+                    info = self._trajectory_index[int(tid)]
+                    num_samples = int(info["num_samples"])
+                    offset = max(
+                        0, num_samples - min(num_samples, int(tail_window_size))
+                    )
+                    attempts += 1
+                if int(local) < offset:
+                    local = offset + int(
+                        torch.randint(
+                            0, num_samples - offset, (1,), generator=rng
+                        ).item()
+                    )
+
+            trajectory = self._load_trajectory(int(tid), info["model_weights_id"])
+            flats.append(self._flatten_trajectory(trajectory))
+            buffer_indices.append(int(local))
+
+        return self._sample_from_flat_specs(flats, buffer_indices)
+
+    def sample_fixed_balanced_mc_return(
+        self, num_chunks: int, tail_window_size: int = 0
+    ) -> dict[str, torch.Tensor]:
+        """Return the same balanced batch every call for critic overfit diagnostics."""
+        cached = getattr(self, "_fixed_balanced_mc_return_batch", None)
+        cached_size = getattr(self, "_fixed_balanced_mc_return_size", None)
+        cached_tail = getattr(self, "_fixed_balanced_mc_return_tail", None)
+        if (
+            cached is None
+            or cached_size != int(num_chunks)
+            or cached_tail != int(tail_window_size)
+        ):
+            cached = self.sample_balanced_mc_return(
+                num_chunks,
+                tail_window_size=tail_window_size,
+            )
+            self._fixed_balanced_mc_return_batch = cached
+            self._fixed_balanced_mc_return_size = int(num_chunks)
+            self._fixed_balanced_mc_return_tail = int(tail_window_size)
+        return clone_dict_of_tensors(cached)
+
     def _flatten_trajectory(self, trajectory: Trajectory) -> dict:
         flat: dict[str, object] = {}
         tensor_fields = trajectory.__dataclass_fields__.keys()
         traj_len = int(trajectory.rewards.shape[0])
+        ref_actions = self._infer_ref_actions(trajectory)
 
         for field in tensor_fields:
             tensor = getattr(trajectory, field)
@@ -735,12 +1086,26 @@ class TrajectoryReplayBuffer:
             for key, tensor in trajectory.curr_obs.items():
                 if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
                     flat["curr_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+            if ref_actions is not None and "ref_action" not in flat["curr_obs"]:
+                flat["curr_obs"]["ref_action"] = ref_actions.reshape(
+                    -1, *ref_actions.shape[2:]
+                )
 
         if trajectory.next_obs:
             flat["next_obs"] = {}
             for key, tensor in trajectory.next_obs.items():
                 if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
                     flat["next_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+            if ref_actions is not None and "ref_action" not in flat["next_obs"]:
+                if ref_actions.shape[0] > 1:
+                    next_ref_actions = torch.cat(
+                        [ref_actions[1:], ref_actions[-1:]], dim=0
+                    )
+                else:
+                    next_ref_actions = ref_actions
+                flat["next_obs"]["ref_action"] = next_ref_actions.reshape(
+                    -1, *next_ref_actions.shape[2:]
+                )
 
         if trajectory.forward_inputs:
             flat["forward_inputs"] = {}
@@ -748,7 +1113,105 @@ class TrajectoryReplayBuffer:
                 if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
                     flat["forward_inputs"][key] = tensor.reshape(-1, *tensor.shape[2:])
 
+        self._add_n_step_fields(flat, trajectory)
         return flat
+
+    def _flat_done_mask(self, flat: dict, num_samples: int) -> torch.Tensor:
+        done_mask = torch.zeros(num_samples, dtype=torch.bool)
+        for field_name in ("terminations", "dones", "truncations"):
+            value = flat.get(field_name, None)
+            if not torch.is_tensor(value):
+                continue
+            value_bool = value.to(dtype=torch.bool)
+            if value_bool.dim() > 1:
+                value_bool = value_bool.reshape(value_bool.shape[0], -1).any(dim=-1)
+            done_mask = done_mask | value_bool.reshape(-1)[:num_samples]
+        return done_mask
+
+    def _add_n_step_fields(self, flat: dict, trajectory: Trajectory) -> None:
+        n_step = max(1, int(getattr(self, "n_step", 1)))
+        gamma = float(
+            getattr(self, "n_step_gamma", getattr(self, "mc_return_gamma", 1.0))
+        )
+        rewards = flat.get("rewards", None)
+        next_obs = flat.get("next_obs", None)
+        if not torch.is_tensor(rewards) or not isinstance(next_obs, dict):
+            return
+
+        T, B = trajectory.rewards.shape[:2]
+        num_samples = int(T * B)
+        rewards_f = rewards.float()
+        n_returns = torch.zeros_like(rewards_f)
+        n_discounts = torch.zeros((num_samples, 1), dtype=rewards_f.dtype)
+        n_done = torch.zeros((num_samples, 1), dtype=torch.bool)
+        n_steps = torch.zeros((num_samples, 1), dtype=torch.long)
+        bootstrap_indices = torch.zeros(num_samples, dtype=torch.long)
+        done_flat = self._flat_done_mask(flat, num_samples)
+
+        for t in range(int(T)):
+            for b in range(int(B)):
+                sample_idx = t * int(B) + b
+                ret = torch.zeros_like(rewards_f[sample_idx])
+                discount = 1.0
+                steps = 0
+                terminal = False
+                bootstrap_idx = sample_idx
+
+                for offset in range(n_step):
+                    step_t = t + offset
+                    if step_t >= int(T):
+                        terminal = True
+                        break
+
+                    idx = step_t * int(B) + b
+                    ret = ret + float(discount) * rewards_f[idx]
+                    steps += 1
+                    bootstrap_idx = idx
+
+                    if bool(done_flat[idx].item()):
+                        terminal = True
+                        break
+                    discount *= gamma
+
+                if t + steps >= int(T):
+                    terminal = True
+
+                n_returns[sample_idx] = ret
+                n_discounts[sample_idx, 0] = 0.0 if terminal else float(discount)
+                n_done[sample_idx, 0] = terminal
+                n_steps[sample_idx, 0] = max(steps, 1)
+                bootstrap_indices[sample_idx] = bootstrap_idx
+
+        flat["n_step_return"] = n_returns.to(dtype=rewards.dtype)
+        flat["n_step_discount"] = n_discounts.to(dtype=rewards_f.dtype)
+        flat["n_step_done"] = n_done
+        flat["n_step_steps"] = n_steps
+        flat["n_step_next_obs"] = {}
+        for key, value in next_obs.items():
+            if torch.is_tensor(value):
+                flat["n_step_next_obs"][key] = value.index_select(0, bootstrap_indices)
+
+    def _infer_ref_actions(self, trajectory: Trajectory) -> Optional[torch.Tensor]:
+        """Best-effort ref-action reconstruction for older saved trajectories.
+
+        New rollouts can store ``curr_obs/next_obs.ref_action`` directly. Older
+        real-world logs only have the executed behavior action. When no explicit
+        ref_action is present, use the saved forward action as the behavior
+        reference and shift it by one chunk for ``next_obs`` in _flatten_trajectory.
+        """
+        forward_inputs = getattr(trajectory, "forward_inputs", None)
+        if isinstance(forward_inputs, dict):
+            ref_actions = forward_inputs.get("ref_action", None)
+            if torch.is_tensor(ref_actions):
+                return ref_actions
+            behavior_actions = forward_inputs.get("action", None)
+            if torch.is_tensor(behavior_actions):
+                return behavior_actions
+
+        actions = getattr(trajectory, "actions", None)
+        if torch.is_tensor(actions):
+            return actions
+        return None
 
     def _extract_chunk_from_flat_trajectory(
         self, flat_trajectory: dict, idx: int

@@ -26,9 +26,28 @@ from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
+def _contains_realworld_env(cfg) -> bool:
+    env_cfg = cfg.get("env", None)
+    if env_cfg is None:
+        return False
+    env_text = OmegaConf.to_yaml(env_cfg, resolve=True).lower()
+    return any(
+        token in env_text
+        for token in ("realworld", "piper", "puppet_left", "puppet_right")
+    )
+
+
 @hydra.main(version_base="1.1", config_path="config", config_name="d4rl_iql_mujoco")
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)
+    enable_eval = cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
+    if enable_eval and _contains_realworld_env(cfg):
+        raise RuntimeError(
+            "Refusing to create real-world env/rollout workers from train_offline_rl.py. "
+            "For Piper offline RL, keep runner.val_check_interval <= 0 and "
+            "runner.only_eval=False, and inspect policy behavior via open-loop "
+            "offline_validation_visualization instead."
+        )
     if (
         cfg.algorithm.loss_type == "offline_iql"
         and cfg.actor.model.model_type == "mlp_policy"
@@ -68,7 +87,6 @@ def main(cfg) -> None:
         cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
     )
 
-    enable_eval = cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
     env_group = None
     rollout_group = None
     if enable_eval:

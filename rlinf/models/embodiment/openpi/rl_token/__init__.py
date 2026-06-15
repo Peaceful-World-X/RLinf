@@ -1,3 +1,17 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """get_model for openpi_rl_token: frozen pi05 backbone + trainable RL token heads."""
 
 import json
@@ -9,8 +23,13 @@ from omegaconf import DictConfig, OmegaConf
 
 def get_model(cfg: DictConfig, torch_dtype=None):
     from rlinf.models.embodiment.openpi import get_model as get_openpi_model
-    from rlinf.models.embodiment.openpi.openpi_action_model import OpenPi0ForRLActionPrediction
-    from rlinf.models.embodiment.openpi.rl_token_policy import OpenPiRLTokenConfig, OpenPiRLTokenPolicy
+    from rlinf.models.embodiment.openpi.openpi_action_model import (
+        OpenPi0ForRLActionPrediction,
+    )
+    from rlinf.models.embodiment.openpi.rl_token_policy import (
+        OpenPiRLTokenConfig,
+        OpenPiRLTokenPolicy,
+    )
 
     # 1. Load frozen pi05 backbone
     openpi_cfg = OmegaConf.merge(cfg, OmegaConf.create({"model_type": "openpi"}))
@@ -25,7 +44,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             rl_config_from_ckpt = json.load(f)["rl_config"]
         rl_cfg = OpenPiRLTokenConfig(
             hidden_dim=rl_config_from_ckpt["hidden_dim"],
-            rl_token_dim=rl_config_from_ckpt.get("rl_token_dim") or rl_config_from_ckpt["hidden_dim"],
+            rl_token_dim=rl_config_from_ckpt.get("rl_token_dim")
+            or rl_config_from_ckpt["hidden_dim"],
             rl_token_encoder_layers=rl_config_from_ckpt["encoder_layers"],
             rl_token_decoder_layers=rl_config_from_ckpt["decoder_layers"],
             rl_token_num_heads=rl_config_from_ckpt["num_heads"],
@@ -37,6 +57,20 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             action_horizon=cfg.get("action_horizon", cfg.get("num_action_chunks", 10)),
             action_dim=cfg.get("action_dim", 7),
             recon_loss_coef=cfg.get("recon_loss_coef", 0.1),
+            actor_output_bound=cfg.get(
+                "actor_output_bound", cfg.get("actor_output_clip", None)
+            ),
+            use_robot_state=cfg.get("use_robot_state", True),
+            critic_use_robot_state=cfg.get("critic_use_robot_state", None),
+            action_space=cfg.get("action_space", "absolute"),
+            action_norm_stats_path=cfg.get("action_norm_stats_path", None),
+            action_norm_std_floor=cfg.get("action_norm_std_floor", 1e-6),
+            critic_train_rl_token_encoder=cfg.get(
+                "critic_train_rl_token_encoder", False
+            ),
+            critic_separate_rl_token_encoder=cfg.get(
+                "critic_separate_rl_token_encoder", False
+            ),
         )
     else:
         rl_cfg = OpenPiRLTokenConfig(
@@ -55,6 +89,20 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             action_horizon=cfg.get("action_horizon", cfg.get("num_action_chunks", 10)),
             action_dim=cfg.get("action_dim", 7),
             recon_loss_coef=cfg.get("recon_loss_coef", 0.1),
+            actor_output_bound=cfg.get(
+                "actor_output_bound", cfg.get("actor_output_clip", None)
+            ),
+            use_robot_state=cfg.get("use_robot_state", True),
+            critic_use_robot_state=cfg.get("critic_use_robot_state", None),
+            action_space=cfg.get("action_space", "absolute"),
+            action_norm_stats_path=cfg.get("action_norm_stats_path", None),
+            action_norm_std_floor=cfg.get("action_norm_std_floor", 1e-6),
+            critic_train_rl_token_encoder=cfg.get(
+                "critic_train_rl_token_encoder", False
+            ),
+            critic_separate_rl_token_encoder=cfg.get(
+                "critic_separate_rl_token_encoder", False
+            ),
         )
 
     class OpenPiRLTokenPolicyWithBackbone(OpenPiRLTokenPolicy):
@@ -65,8 +113,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             processed = bb.input_transform(bb.obs_processor(obs), transpose=False)
             processed = bb.precision_processor(processed)
             observation = _model.Observation.from_dict(processed)
-            images, img_masks, lang_tokens, lang_masks, _ = (
-                bb._preprocess_observation(observation, train=False)
+            images, img_masks, lang_tokens, lang_masks, _ = bb._preprocess_observation(
+                observation, train=False
             )
             prefix_output, prefix_pad_masks, past_key_values = bb._build_prefix_cache(
                 images, img_masks, lang_tokens, lang_masks
@@ -75,7 +123,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
 
         def _get_vla_ref_action(self, obs):
             """Run VLA flow matching to get reference action ã = πvla(s)."""
-            actions, result = self.backbone.predict_action_batch(obs, mode="eval", compute_values=False)
+            actions, result = self.backbone.predict_action_batch(
+                obs, mode="eval", compute_values=False
+            )
             return actions
 
     model = OpenPiRLTokenPolicyWithBackbone(rl_cfg)
@@ -85,19 +135,49 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     # Checkpoint keys: encoder.* / decoder.*
     # Policy keys:     rl_token_autoencoder.encoder.* / rl_token_autoencoder.decoder.*
     if rl_token_path is not None:
-        raw = st.load_file(os.path.join(rl_token_path, "model.safetensors"), device="cpu")
+        raw = st.load_file(
+            os.path.join(rl_token_path, "model.safetensors"), device="cpu"
+        )
         remapped = {"rl_token_autoencoder." + k: v for k, v in raw.items()}
         missing, _ = model.load_state_dict(remapped, strict=False)
-        autoencoder_missing = [k for k in missing if "rl_token_autoencoder" in k
-                               and not k.startswith("target_")]
+        autoencoder_missing = [
+            k
+            for k in missing
+            if "rl_token_autoencoder" in k and not k.startswith("target_")
+        ]
         if autoencoder_missing:
-            raise RuntimeError(f"Failed to load RL token weights, missing: {autoencoder_missing}")
+            raise RuntimeError(
+                f"Failed to load RL token weights, missing: {autoencoder_missing}"
+            )
         # Sync target network from loaded online weights (tau=1.0)
-        import copy
         model.target_rl_token_autoencoder.load_state_dict(
             model.rl_token_autoencoder.state_dict()
         )
+        if model.critic_rl_token_encoder is not None:
+            model.critic_rl_token_encoder.load_state_dict(
+                model.rl_token_autoencoder.encoder.state_dict()
+            )
+            model.target_critic_rl_token_encoder.load_state_dict(
+                model.critic_rl_token_encoder.state_dict()
+            )
 
     model.freeze_backbone()
+    if cfg.get("freeze_rl_token", False):
+        for module in (
+            model.rl_token_autoencoder,
+            model.target_rl_token_autoencoder,
+        ):
+            for param in module.parameters():
+                param.requires_grad_(False)
+        if cfg.get("critic_train_rl_token_encoder", False):
+            critic_encoder = (
+                model.critic_rl_token_encoder
+                if model.critic_rl_token_encoder is not None
+                else model.rl_token_autoencoder.encoder
+            )
+            for param in critic_encoder.parameters():
+                param.requires_grad_(True)
+            if model.target_critic_rl_token_encoder is not None:
+                for param in model.target_critic_rl_token_encoder.parameters():
+                    param.requires_grad_(False)
     return model
-
