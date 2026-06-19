@@ -33,7 +33,7 @@ runner:
     logger_backends: ["tensorboard"]
 
   max_epochs: 100000
-  max_steps: 100000
+  max_steps: 2000
   local_update_steps: 1
 
   only_eval: False
