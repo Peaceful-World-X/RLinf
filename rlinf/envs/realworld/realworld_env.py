@@ -65,6 +65,11 @@ class RealWorldEnv(gym.Env):
         self.manual_episode_control_only = bool(
             self.override_cfg.get("manual_episode_control_only", False)
         )
+        self.break_chunk_on_intervention_change = bool(
+            cfg.get("break_chunk_on_intervention_change", False)
+            or cfg.get("break_chunk_after_intervention", False)
+        )
+        self.save_substep_obs = bool(cfg.get("save_substep_obs", False))
 
         self._init_env()
 
@@ -327,6 +332,18 @@ class RealWorldEnv(gym.Env):
 
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
+        processed = (
+            chunk_actions.clone()
+            if isinstance(chunk_actions, torch.Tensor)
+            else chunk_actions.copy()
+        )
+        for env_idx, sub_env in enumerate(self.env.envs):
+            if hasattr(sub_env, "process_action_chunk"):
+                processed[env_idx] = sub_env.process_action_chunk(
+                    chunk_actions[env_idx]
+                )
+        chunk_actions = processed
+
         chunk_size = chunk_actions.shape[1]
         obs_list = []
         infos_list = []
@@ -338,6 +355,7 @@ class RealWorldEnv(gym.Env):
 
         raw_chunk_intervene_actions = []
         raw_chunk_intervene_flag = []
+        previous_intervene_flag = None
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
@@ -348,20 +366,49 @@ class RealWorldEnv(gym.Env):
             if "intervene_action" in infos:
                 raw_chunk_intervene_actions.append(infos["intervene_action"])
                 raw_chunk_intervene_flag.append(infos["intervene_flag"])
+                current_intervene_flag = infos["intervene_flag"].to(dtype=torch.bool)
+            else:
+                current_intervene_flag = None
 
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
 
+            if (
+                self.break_chunk_on_intervention_change
+                and current_intervene_flag is not None
+                and previous_intervene_flag is not None
+                and bool((current_intervene_flag != previous_intervene_flag).any())
+            ):
+                break
+            if current_intervene_flag is not None:
+                previous_intervene_flag = current_intervene_flag.clone()
+
             if (terminations | truncations).any():
                 break
 
-        chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
-        raw_chunk_terminations = torch.stack(
-            raw_chunk_terminations, dim=1
+        valid_steps = len(chunk_rewards)
+
+        def _pad_time(tensor: torch.Tensor, fill_value=0):
+            if tensor.shape[1] >= chunk_size:
+                return tensor
+            pad_shape = (tensor.shape[0], chunk_size - tensor.shape[1])
+            pad = torch.full(
+                pad_shape,
+                fill_value=fill_value,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            return torch.cat([tensor, pad], dim=1)
+
+        chunk_rewards = _pad_time(
+            torch.stack(chunk_rewards, dim=1), fill_value=0
         )  # [num_envs, chunk_steps]
-        raw_chunk_truncations = torch.stack(
-            raw_chunk_truncations, dim=1
+        raw_chunk_terminations = _pad_time(
+            torch.stack(raw_chunk_terminations, dim=1), fill_value=False
+        )  # [num_envs, chunk_steps]
+        raw_chunk_truncations = _pad_time(
+            torch.stack(raw_chunk_truncations, dim=1), fill_value=False
         )  # [num_envs, chunk_steps]
 
         past_terminations = raw_chunk_terminations.any(dim=1)
@@ -369,11 +416,43 @@ class RealWorldEnv(gym.Env):
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
         infos_last = infos_list[-1] if infos_list else {}
+        valid_mask = torch.zeros(self.num_envs, chunk_size, dtype=torch.bool)
+        valid_mask[:, :valid_steps] = True
+        infos_last["chunk_valid_mask"] = valid_mask
+        if self.save_substep_obs:
+            infos_last["substep_obs"] = obs_list
         if raw_chunk_intervene_actions:
-            infos_last["intervene_action"] = torch.stack(
-                raw_chunk_intervene_actions, dim=1
-            ).reshape(self.num_envs, -1)
-            infos_last["intervene_flag"] = torch.stack(raw_chunk_intervene_flag, dim=1)
+            intervene_action = torch.stack(raw_chunk_intervene_actions, dim=1)
+            intervene_flag = torch.stack(raw_chunk_intervene_flag, dim=1)
+            if intervene_action.shape[1] < chunk_size:
+                pad_steps = chunk_size - intervene_action.shape[1]
+                intervene_action = torch.cat(
+                    [
+                        intervene_action,
+                        torch.zeros(
+                            intervene_action.shape[0],
+                            pad_steps,
+                            *intervene_action.shape[2:],
+                            dtype=intervene_action.dtype,
+                            device=intervene_action.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+                intervene_flag = torch.cat(
+                    [
+                        intervene_flag,
+                        torch.zeros(
+                            intervene_flag.shape[0],
+                            pad_steps,
+                            dtype=intervene_flag.dtype,
+                            device=intervene_flag.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+            infos_last["intervene_action"] = intervene_action.reshape(self.num_envs, -1)
+            infos_last["intervene_flag"] = intervene_flag
             infos_list[-1] = infos_last
 
         if past_dones.any() and self.auto_reset:
