@@ -22,3 +22,8 @@ rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
 docs/superpowers/
+train_logs/*
+tensorboard/*
+debug_actor_replay_exports/*
+checkpoints/*
+assets/piper_local_assets/*

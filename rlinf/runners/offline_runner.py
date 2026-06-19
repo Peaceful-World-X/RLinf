@@ -118,7 +118,11 @@ class OfflineRunner:
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
-        self.global_step = int(resume_dir.split("global_step_")[-1])
+        if bool(self.cfg.runner.get("reset_global_step_on_resume", False)):
+            self.global_step = 0
+            self.logger.info("Reset global_step to 0 after loading checkpoint.")
+        else:
+            self.global_step = int(resume_dir.split("global_step_")[-1])
 
     def update_rollout_weights(self):
         if self.rollout is None:

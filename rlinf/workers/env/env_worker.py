@@ -61,6 +61,17 @@ class EnvWorker(Worker):
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.warm_up_chunk_steps = self.cfg.rollout.get("warm_up_chunk_steps", 0)
+        self.vla_warmup_chunk_steps = int(
+            self.cfg.rollout.get(
+                "vla_warmup_chunk_steps",
+                self.warm_up_chunk_steps,
+            )
+        )
+        self.online_control_cfg = self.cfg.rollout.get("online_control", {})
+        self.save_online_substep_obs = bool(
+            self.online_control_cfg.get("save_substep_obs", False)
+        )
+        self._online_action_norm_cache = None
         self.stage_num = self.cfg.rollout.pipeline_stage_num
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
@@ -377,14 +388,8 @@ class EnvWorker(Worker):
             if self.enable_offload and hasattr(self.env_list[i], "offload"):
                 self.env_list[i].offload()
 
-    @Worker.timer("env_interact_step")
-    def env_interact_step(
-        self, chunk_actions: torch.Tensor, stage_id: int
-    ) -> tuple[EnvOutput, dict[str, Any]]:
-        """
-        This function is used to interact with the environment.
-        """
-        chunk_actions = prepare_actions(
+    def _prepare_env_chunk_actions(self, chunk_actions: torch.Tensor):
+        return prepare_actions(
             raw_chunk_actions=chunk_actions,
             env_type=self.cfg.env.train.env_type,
             model_type=self.cfg.actor.model.model_type,
@@ -393,6 +398,198 @@ class EnvWorker(Worker):
             policy=self.cfg.actor.model.get("policy_setup", None),
             wm_env_type=self.cfg.env.train.get("wm_env_type", None),
         )
+
+    def _pad_time_dim(
+        self,
+        tensor: torch.Tensor,
+        *,
+        dim: int,
+        target_len: int,
+        fill_value: float | bool = 0,
+        repeat_last: bool = False,
+    ) -> torch.Tensor:
+        if not torch.is_tensor(tensor) or tensor.dim() <= dim:
+            return tensor
+        if target_len <= 0 or tensor.shape[dim] >= target_len:
+            return tensor
+
+        pad_len = target_len - tensor.shape[dim]
+        if repeat_last and tensor.shape[dim] > 0:
+            index = torch.tensor(
+                [tensor.shape[dim] - 1], dtype=torch.long, device=tensor.device
+            )
+            pad = tensor.index_select(dim, index)
+            expand_shape = list(tensor.shape)
+            expand_shape[dim] = pad_len
+            pad = pad.expand(*expand_shape).clone()
+        else:
+            pad_shape = list(tensor.shape)
+            pad_shape[dim] = pad_len
+            pad = torch.full(
+                pad_shape,
+                fill_value=fill_value,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+        return torch.cat([tensor, pad], dim=dim)
+
+    def _target_chunk_steps(self) -> int:
+        return int(self.cfg.actor.model.get("num_action_chunks", 0))
+
+    def _normalize_chunk_valid_mask(self, valid_mask):
+        if valid_mask is None:
+            return None
+        if not torch.is_tensor(valid_mask):
+            valid_mask = torch.as_tensor(valid_mask)
+        valid_mask = valid_mask.cpu().to(torch.bool)
+        if valid_mask.dim() == 1:
+            valid_mask = valid_mask[None, :]
+        target_steps = self._target_chunk_steps()
+        valid_mask = self._pad_time_dim(
+            valid_mask,
+            dim=1,
+            target_len=target_steps,
+            fill_value=False,
+            repeat_last=False,
+        )
+        if target_steps > 0 and valid_mask.shape[1] > target_steps:
+            valid_mask = valid_mask[:, :target_steps]
+        return valid_mask.contiguous()
+
+    def _stack_substep_obs(self, obs_list):
+        if not self.save_online_substep_obs or not isinstance(obs_list, (list, tuple)):
+            return {}
+        if len(obs_list) == 0:
+            return {}
+        stacked = {}
+        target_steps = self._target_chunk_steps()
+        for key in ("states", "main_images", "wrist_images", "extra_view_images"):
+            values = [obs.get(key, None) for obs in obs_list if isinstance(obs, dict)]
+            if not values or values[0] is None:
+                continue
+            if all(torch.is_tensor(value) for value in values):
+                stacked_value = torch.stack([value.cpu() for value in values], dim=1)
+                stacked[f"substep_{key}"] = self._pad_time_dim(
+                    stacked_value,
+                    dim=1,
+                    target_len=target_steps,
+                    repeat_last=True,
+                )
+        return stacked
+
+    def _maybe_print_online_env_status(
+        self,
+        rollout_result: RolloutResult,
+        env_output: EnvOutput,
+        online_forward_inputs: dict[str, torch.Tensor],
+        chunk_step_idx: int,
+    ):
+        if not bool(self.online_control_cfg.get("print_status", True)):
+            return
+        interval = int(self.online_control_cfg.get("print_status_interval", 1))
+        if interval <= 0 or chunk_step_idx % interval != 0:
+            return
+        source = "unknown"
+        source_tensor = rollout_result.forward_inputs.get(
+            "rollout_control_source", None
+        )
+        if torch.is_tensor(source_tensor) and source_tensor.numel() > 0:
+            source = "ACTOR" if int(source_tensor.reshape(-1)[0].item()) == 1 else "VLA"
+        mse_tensor = rollout_result.forward_inputs.get("actor_ref_mse", None)
+        mse_text = "nan"
+        if torch.is_tensor(mse_tensor) and mse_tensor.numel() > 0:
+            mse_text = f"{float(mse_tensor.float().mean().item()):.6g}"
+        valid_mask = online_forward_inputs.get("chunk_valid_mask", None)
+        valid_steps = "?"
+        if torch.is_tensor(valid_mask) and valid_mask.numel() > 0:
+            valid_steps = str(int(valid_mask[0].to(torch.int64).sum().item()))
+        intervene_steps = 0
+        if env_output.intervene_flags is not None:
+            flags = env_output.intervene_flags
+            if flags.dim() > 1:
+                intervene_steps = int(flags[0].to(torch.int64).sum().item())
+            else:
+                intervene_steps = int(flags.to(torch.int64).sum().item())
+        reward_sum = "nan"
+        reward_last = "nan"
+        if env_output.rewards is not None:
+            reward_sum = f"{float(env_output.rewards[0].float().sum().item()):.3f}"
+            reward_last = f"{float(env_output.rewards[0, -1].float().item()):.3f}"
+        executed = "HUMAN" if intervene_steps > 0 else source
+        print(
+            "[online-env] "
+            f"chunk={chunk_step_idx} owner={source} executed={executed} "
+            f"actor_ref_mse={mse_text} valid_steps={valid_steps} "
+            f"intervene_steps={intervene_steps} reward_sum={reward_sum} reward_last={reward_last}",
+            flush=True,
+        )
+
+    def _select_train_exec_action(
+        self, rollout_result: RolloutResult, chunk_step_idx: int
+    ) -> torch.Tensor:
+        """Select an env-space action chunk for online rollout execution."""
+        if (
+            self.vla_warmup_chunk_steps > 0
+            and chunk_step_idx < self.vla_warmup_chunk_steps
+        ):
+            ref_env_action = rollout_result.forward_inputs.get(
+                "ref_env_action_absolute", None
+            )
+            if ref_env_action is not None:
+                return ref_env_action
+        return rollout_result.actions
+
+    def _force_vla_rollout_result_for_warmup(
+        self,
+        rollout_result: RolloutResult,
+        chunk_step_idx: int,
+    ) -> bool:
+        """Force per-episode VLA control before the learned last-k segment.
+
+        The policy's own gate keeps a process-local chunk counter, which does not
+        reset between episodes. For last20 actor training we need episode-local
+        control: early chunks should execute and train on the VLA reference action,
+        while only late chunks may use actor actions.
+        """
+        if (
+            self.vla_warmup_chunk_steps <= 0
+            or chunk_step_idx >= self.vla_warmup_chunk_steps
+        ):
+            return False
+        forward_inputs = rollout_result.forward_inputs
+        if not isinstance(forward_inputs, dict):
+            return False
+        ref_action = forward_inputs.get("ref_action", None)
+        ref_env_action = forward_inputs.get("ref_env_action_absolute", None)
+        if ref_action is None or ref_env_action is None:
+            return False
+
+        ref_action = ref_action.detach().cpu().contiguous()
+        ref_env_action = ref_env_action.detach().cpu().contiguous()
+        rollout_result.actions = ref_env_action
+        forward_inputs["action"] = ref_action
+        forward_inputs["executed_action"] = ref_action
+        forward_inputs["env_action_absolute"] = ref_env_action
+        forward_inputs["executed_env_action_absolute"] = ref_env_action
+        source_shape = (
+            forward_inputs["rollout_control_source"].shape
+            if torch.is_tensor(forward_inputs.get("rollout_control_source", None))
+            else (ref_action.shape[0], 1)
+        )
+        forward_inputs["rollout_control_source"] = torch.zeros(
+            source_shape,
+            dtype=torch.long,
+        )
+        return True
+
+    @Worker.timer("env_interact_step")
+    def env_interact_step(
+        self, chunk_actions: torch.Tensor, stage_id: int
+    ) -> tuple[EnvOutput, dict[str, Any], dict[str, torch.Tensor]]:
+        """
+        This function is used to interact with the environment.
+        """
+        chunk_actions = self._prepare_env_chunk_actions(chunk_actions)
         env_info = {}
 
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
@@ -437,6 +634,25 @@ class EnvWorker(Worker):
             if "intervene_action" in infos["final_info"]:
                 intervene_actions = infos["final_info"]["intervene_action"]
                 intervene_flags = infos["final_info"]["intervene_flag"]
+        online_forward_inputs = {}
+        if isinstance(infos, dict):
+            valid_mask = infos.get("chunk_valid_mask", None)
+            valid_mask = self._normalize_chunk_valid_mask(valid_mask)
+            if valid_mask is not None:
+                online_forward_inputs["chunk_valid_mask"] = valid_mask
+            online_forward_inputs.update(
+                self._stack_substep_obs(infos.get("substep_obs"))
+            )
+        if isinstance(chunk_actions, np.ndarray):
+            online_forward_inputs["executed_env_action_absolute"] = (
+                torch.from_numpy(np.asarray(chunk_actions))
+                .reshape(chunk_actions.shape[0], -1)
+                .to(torch.float32)
+            )
+        elif torch.is_tensor(chunk_actions):
+            online_forward_inputs["executed_env_action_absolute"] = (
+                chunk_actions.reshape(chunk_actions.shape[0], -1).cpu()
+            )
 
         env_output = EnvOutput(
             obs=extracted_obs,
@@ -448,7 +664,50 @@ class EnvWorker(Worker):
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
         )
-        return env_output, env_info
+        return env_output, env_info, online_forward_inputs
+
+    def _absolute_to_training_action_tensor(
+        self, actions: torch.Tensor, state: torch.Tensor | None
+    ) -> torch.Tensor:
+        action_space = str(self.cfg.actor.model.get("action_space", "absolute"))
+        if action_space != "normalized_delta":
+            return actions
+        if state is None:
+            raise ValueError("normalized_delta online action conversion requires state")
+        horizon = int(self.cfg.actor.model.num_action_chunks)
+        action_dim = int(self.cfg.actor.model.action_dim)
+        actions = actions.to(torch.float32).reshape(-1, horizon, action_dim)
+        state = state.to(torch.float32).reshape(actions.shape[0], action_dim)
+        delta = actions.clone()
+        if action_dim == 14:
+            mask = torch.tensor(
+                [True] * 6 + [False] + [True] * 6 + [False],
+                dtype=torch.bool,
+                device=delta.device,
+            )
+        else:
+            mask = torch.ones(action_dim, dtype=torch.bool, device=delta.device)
+        delta[..., mask] = delta[..., mask] - state[:, None, :][..., mask]
+        if self._online_action_norm_cache is None:
+            stats_path = self.cfg.actor.model.get("action_norm_stats_path", None)
+            if stats_path is None:
+                raise ValueError(
+                    "actor.model.action_norm_stats_path is required for normalized_delta online action conversion"
+                )
+            import json
+
+            with open(str(stats_path), "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            stats = payload.get("norm_stats", payload)["actions"]
+            mean = torch.tensor(stats["mean"][:action_dim], dtype=torch.float32)
+            std = torch.tensor(stats["std"][:action_dim], dtype=torch.float32)
+            floor = float(self.cfg.actor.model.get("action_norm_std_floor", 1e-6))
+            std = torch.where(std.abs() < floor, torch.ones_like(std), std)
+            self._online_action_norm_cache = (mean, std)
+        mean, std = self._online_action_norm_cache
+        mean = mean.to(device=delta.device, dtype=delta.dtype).reshape(1, 1, -1)
+        std = std.to(device=delta.device, dtype=delta.dtype).reshape(1, 1, -1)
+        return ((delta - mean) / (std + 1e-6)).reshape(actions.shape[0], -1)
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int
@@ -924,7 +1183,9 @@ class EnvWorker(Worker):
             )
             for _ in range(self.stage_num)
         ]
-        pending_transition: list = [None] * self.stage_num  # (curr_obs, next_obs) waiting for next visual_latent
+        pending_transition: list = [
+            None
+        ] * self.stage_num  # (curr_obs, next_obs) waiting for next visual_latent
         env_metrics = defaultdict(list)
 
         for epoch in range(self.rollout_epoch):
@@ -940,6 +1201,7 @@ class EnvWorker(Worker):
                     },
                 )
 
+            episode_done = False
             for chunk_step_idx in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
                     if cooperative_yield:
@@ -947,11 +1209,6 @@ class EnvWorker(Worker):
 
                     env_output = env_outputs[stage_id]
                     curr_obs = env_output.obs
-                    if env_output.intervene_actions is not None:
-                        self.rollout_results[stage_id].update_last_actions(
-                            env_output.intervene_actions,
-                            env_output.intervene_flags,
-                        )
 
                     reward_model_output = None
                     if reward_channel is not None and chunk_step_idx != 0:
@@ -968,6 +1225,27 @@ class EnvWorker(Worker):
                     rollout_result = self.recv_rollout_results(
                         input_channel, mode="train"
                     )
+                    self._force_vla_rollout_result_for_warmup(
+                        rollout_result, chunk_step_idx
+                    )
+                    exec_action = self._select_train_exec_action(
+                        rollout_result, chunk_step_idx
+                    )
+                    env_output, env_info, online_forward_inputs = (
+                        self.env_interact_step(exec_action, stage_id)
+                    )
+                    if online_forward_inputs:
+                        rollout_result.forward_inputs.update(online_forward_inputs)
+                    self._maybe_print_online_env_status(
+                        rollout_result,
+                        env_output,
+                        online_forward_inputs,
+                        chunk_step_idx,
+                    )
+                    if "action" in rollout_result.forward_inputs:
+                        rollout_result.forward_inputs["executed_action"] = (
+                            rollout_result.forward_inputs["action"]
+                        )
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
@@ -995,12 +1273,46 @@ class EnvWorker(Worker):
                         self.rollout_results[stage_id].mark_last_step_with_flags(
                             rollout_result.save_flags
                         )
-
-                    if self.warm_up_chunk_steps > 0 and chunk_step_idx < self.warm_up_chunk_steps:
-                        exec_action = rollout_result.forward_inputs.get("ref_action", rollout_result.actions)
-                    else:
-                        exec_action = rollout_result.actions
-                    env_output, env_info = self.env_interact_step(exec_action, stage_id)
+                    if env_output.intervene_actions is not None:
+                        intervene_train_actions = (
+                            self._absolute_to_training_action_tensor(
+                                env_output.intervene_actions,
+                                curr_obs.get("states", None)
+                                if isinstance(curr_obs, dict)
+                                else None,
+                            )
+                        )
+                        self.rollout_results[stage_id].update_last_actions(
+                            intervene_train_actions,
+                            env_output.intervene_flags,
+                        )
+                        if self.rollout_results[stage_id].forward_inputs:
+                            last_fi = self.rollout_results[stage_id].forward_inputs[-1]
+                            last_fi["intervene_env_action_absolute"] = (
+                                env_output.intervene_actions.cpu().contiguous()
+                            )
+                            exec_env = last_fi.get("executed_env_action_absolute", None)
+                            if torch.is_tensor(exec_env):
+                                horizon = int(self.cfg.actor.model.num_action_chunks)
+                                flags = env_output.intervene_flags
+                                if flags.dim() == 1:
+                                    flags = flags[:, None]
+                                flags = flags.reshape(flags.shape[0], horizon, 1)
+                                env_dim = int(self.cfg.actor.model.action_dim)
+                                human_env = env_output.intervene_actions.reshape(
+                                    flags.shape[0], horizon, env_dim
+                                )
+                                policy_env = exec_env.reshape(
+                                    flags.shape[0], horizon, env_dim
+                                )
+                                last_fi["executed_env_action_absolute"] = (
+                                    (human_env * flags + policy_env * (~flags))
+                                    .reshape(flags.shape[0], -1)
+                                    .cpu()
+                                    .contiguous()
+                                )
+                        env_output.intervene_actions = None
+                        env_output.intervene_flags = None
                     env_batch = env_output.to_dict()
                     self.send_env_batch(
                         rollout_channel,
@@ -1015,8 +1327,12 @@ class EnvWorker(Worker):
                             if env_output.dones.any() and self.cfg.env.train.auto_reset
                             else env_output.obs
                         )
-                        visual_latent = rollout_result.forward_inputs.get("visual_latent", None)
-                        ref_action = rollout_result.forward_inputs.get("ref_action", None)
+                        visual_latent = rollout_result.forward_inputs.get(
+                            "visual_latent", None
+                        )
+                        ref_action = rollout_result.forward_inputs.get(
+                            "ref_action", None
+                        )
                         if visual_latent is not None:
                             curr_obs["visual_latent"] = visual_latent
                             if ref_action is not None:
@@ -1027,21 +1343,29 @@ class EnvWorker(Worker):
                                 p_next["visual_latent"] = visual_latent
                                 if ref_action is not None:
                                     p_next["ref_action"] = ref_action
-                                self.rollout_results[stage_id].append_transitions(p_curr, p_next)
+                                self.rollout_results[stage_id].append_transitions(
+                                    p_curr, p_next
+                                )
                             pending_transition[stage_id] = (curr_obs, next_obs)
                         else:
-                            self.rollout_results[stage_id].append_transitions(curr_obs, next_obs)
+                            self.rollout_results[stage_id].append_transitions(
+                                curr_obs, next_obs
+                            )
 
                     env_outputs[stage_id] = env_output
                     self.record_env_metrics(env_metrics, env_info, epoch)
+                    if (
+                        not self.cfg.env.train.auto_reset
+                        and env_output.dones is not None
+                        and env_output.dones.any()
+                    ):
+                        episode_done = True
+                        break
+                if episode_done:
+                    break
 
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
-                if env_output.intervene_actions is not None:
-                    self.rollout_results[stage_id].update_last_actions(
-                        env_output.intervene_actions,
-                        env_output.intervene_flags,
-                    )
 
                 reward_model_output = None
                 if reward_channel is not None:
@@ -1057,19 +1381,46 @@ class EnvWorker(Worker):
                             reward_model_output.detach().float().reshape(-1).cpu()
                         )
                 rollout_result = self.recv_rollout_results(input_channel, mode="train")
-                rewards = self.compute_bootstrap_rewards(
-                    env_output, rollout_result.bootstrap_values, reward_model_output
-                )
-                chunk_step_result = ChunkStepResult(
-                    prev_values=(
-                        rollout_result.prev_values if self.collect_prev_infos else None
-                    ),
-                    dones=env_output.dones,
-                    truncations=env_output.truncations,
-                    terminations=env_output.terminations,
-                    rewards=rewards,
-                )
-                self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                if (
+                    self.collect_transitions
+                    and pending_transition[stage_id] is not None
+                ):
+                    p_curr, p_next = pending_transition[stage_id]
+                    visual_latent = rollout_result.forward_inputs.get(
+                        "visual_latent", None
+                    )
+                    ref_action = rollout_result.forward_inputs.get("ref_action", None)
+                    if visual_latent is not None:
+                        p_next["visual_latent"] = visual_latent
+                        if ref_action is not None:
+                            p_next["ref_action"] = ref_action
+                        self.rollout_results[stage_id].append_transitions(
+                            p_curr, p_next
+                        )
+                        pending_transition[stage_id] = None
+                # For transition replay buffers, the terminal chunk's reward/done has
+                # already been appended together with its action inside the main loop.
+                # The extra rollout result here is only needed to fill the pending
+                # transition's next_obs latent/ref_action. Appending another reward/done
+                # would create a length T+1 trajectory and duplicate terminal rewards.
+                if not self.collect_transitions:
+                    rewards = self.compute_bootstrap_rewards(
+                        env_output,
+                        rollout_result.bootstrap_values,
+                        reward_model_output,
+                    )
+                    chunk_step_result = ChunkStepResult(
+                        prev_values=(
+                            rollout_result.prev_values
+                            if self.collect_prev_infos
+                            else None
+                        ),
+                        dones=env_output.dones,
+                        truncations=env_output.truncations,
+                        terminations=env_output.terminations,
+                        rewards=rewards,
+                    )
+                    self.rollout_results[stage_id].append_step_result(chunk_step_result)
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()

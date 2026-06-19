@@ -135,7 +135,12 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
     def run(self):
         start_step = self.global_step
         start_time = time.time()
-        self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
+        # The first rollout must use the resumed actor/critic weights.  If this
+        # initial sync is fire-and-forget, the robot can start from randomly
+        # initialized rollout heads while the actor worker has already loaded the
+        # checkpoint.
+        self.logger.info("Performing blocking initial rollout weight sync.")
+        self.update_rollout_weights(no_wait=False)
 
         env_handle: Handle = self.env.interact(
             input_channel=self.env_channel,

@@ -43,12 +43,15 @@ from rlinf.utils.offline_td3_visualization import (
     SimpleUrdfKinematics,
     actions_to_absolute_joint_targets,
     evaluate_validation_trajectory,
+    extract_three_view_images,
     load_action_norm_stats,
+    load_key_segment_start_map,
     load_validation_trajectories,
     plot_action_chunk_segments_3d,
     plot_action_chunk_triplet_segments_3d,
     plot_action_mse_heatmaps,
     plot_boundary_trajectory_3d,
+    plot_critic_timeline_with_images,
     plot_pt_gt_reconstruction_segments_3d,
     plot_pt_state_trajectory_3d,
     plot_q_values,
@@ -367,7 +370,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             ref_action = self.get_ref_action(
                 curr_obs, sampled_actions, "curr_obs.ref_action"
             )
-            actions, _ = self.model(
+            actions, actor_aux = self.model(
                 forward_type=ForwardType.TD3,
                 mode="actor",
                 visual_feat=visual_feat,
@@ -376,6 +379,20 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 ref_action_dropout_p=0.0,
                 use_target=False,
                 compute_recon_loss=False,
+            )
+            actor_q1, actor_q2 = self.model(
+                forward_type=ForwardType.TD3,
+                mode="critic",
+                rl_state=actor_aux.get("critic_rl_state", actor_aux["rl_state"]),
+                action=actions,
+                use_target=False,
+            )
+            q_data = torch.minimum(q1.detach(), q2.detach())
+            q_actor = torch.minimum(actor_q1, actor_q2)
+            metrics["action_q_actor_mean"] = q_actor.mean().item()
+            metrics["action_gap_data_actor"] = (q_data - q_actor).mean().item()
+            metrics["action_rank_data_gt_actor"] = (
+                (q_data > q_actor).float().mean().item()
             )
             metrics["actor_action_mse"] = torch.nn.functional.mse_loss(
                 actions, sampled_actions
@@ -406,7 +423,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             visual_feat=visual_feat,
             robot_state=self.get_robot_state(curr_obs),
             ref_action=ref_action,
-            ref_action_dropout_p=0.0,
+            ref_action_dropout_p=float(self.td3_algorithm.actor_ref_action_dropout_p),
             use_target=False,
             compute_recon_loss=recon_coef > 0.0,
         )
@@ -457,10 +474,20 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             )
             fixed_debug_cfg = self.cfg.algorithm.get("fixed_debug_batch", None) or {}
             return_bin_cfg = self.cfg.algorithm.get("return_bin_sampling", None) or {}
+            paired_stage_cfg = (
+                self.cfg.algorithm.get("paired_stage_sampling", None) or {}
+            )
             if bool(fixed_debug_cfg.get("enabled", False)) and hasattr(
                 self.replay_buffer, "sample_fixed_balanced_mc_return"
             ):
                 global_batch = self.replay_buffer.sample_fixed_balanced_mc_return(
+                    global_batch_size_per_rank,
+                    tail_window_size=tail_window_size,
+                )
+            elif bool(paired_stage_cfg.get("enabled", False)) and hasattr(
+                self.replay_buffer, "sample_paired_stage_mc_return"
+            ):
+                global_batch = self.replay_buffer.sample_paired_stage_mc_return(
                     global_batch_size_per_rank,
                     tail_window_size=tail_window_size,
                 )
@@ -935,6 +962,10 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 "action_horizon", self.cfg.actor.model.num_action_chunks
             )
         )
+        key_segment_start_map = load_key_segment_start_map(
+            viz_cfg.get("key_segment_summary_path", None)
+        )
+        image_thumb_size = int(viz_cfg.get("image_thumb_size", 64))
 
         summary = {
             "global_step": int(step),
@@ -958,12 +989,22 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         was_training = self.model.training
         self.model.eval()
         minimal_viz = bool(viz_cfg.get("minimal", False))
+        timeline_only = bool(viz_cfg.get("timeline_only", False))
         for split_name, (traj_path, trajectory) in trajectories:
             traj_name = traj_path.stem
             out_dir = os.path.join(out_root, split_name, traj_name)
             os.makedirs(out_dir, exist_ok=True)
             result = evaluate_validation_trajectory(self, trajectory, chunk_count)
             chunk_indices = result["chunk_indices"]
+            key_segment_start = key_segment_start_map.get(traj_path.name, None)
+            train_mask = np.ones_like(chunk_indices, dtype=bool)
+            if key_segment_start is not None:
+                train_mask = chunk_indices >= int(key_segment_start)
+            images = extract_three_view_images(
+                trajectory,
+                chunk_indices,
+                thumb_size=image_thumb_size,
+            )
             absolute_actions_all = None
             forward_inputs = trajectory.get("forward_inputs", {})
             if isinstance(forward_inputs, dict) and torch.is_tensor(
@@ -1185,96 +1226,98 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 tip_link=tip_link,
             )
 
-            if not minimal_viz:
-                plot_trajectory_3d(
-                    os.path.join(out_dir, "trajectory_3d.png"),
-                    gt_reconstructed_tcp,
-                    actor_tcp,
-                    q_actor_dense,
-                    segment_lengths=segment_lengths,
-                )
-                plot_pt_state_trajectory_3d(
-                    os.path.join(out_dir, "pt_state_trajectory_3d.png"),
-                    state_tcp,
-                    full_pt_boundary_tcp,
-                )
-                plot_action_chunk_segments_3d(
-                    os.path.join(out_dir, "pt_action_chunks_3d.png"),
-                    state_tcp,
-                    full_pt_tcp_segments,
-                    np.arange(len(full_pt_tcp_segments), dtype=np.int64),
-                )
-                plot_boundary_trajectory_3d(
-                    os.path.join(out_dir, "trajectory_3d_state_chunks.png"),
-                    state_tcp,
-                    gt_boundary_tcp,
-                    actor_boundary_tcp,
-                    result["chunk_indices"],
-                    result["critic_q_data"],
-                    result["critic_q_actor"],
-                )
-                plot_action_chunk_segments_3d(
-                    os.path.join(out_dir, "selected_action_chunks_3d.png"),
+            if not timeline_only:
+                if not minimal_viz:
+                    plot_trajectory_3d(
+                        os.path.join(out_dir, "trajectory_3d.png"),
+                        gt_reconstructed_tcp,
+                        actor_tcp,
+                        q_actor_dense,
+                        segment_lengths=segment_lengths,
+                    )
+                    plot_pt_state_trajectory_3d(
+                        os.path.join(out_dir, "pt_state_trajectory_3d.png"),
+                        state_tcp,
+                        full_pt_boundary_tcp,
+                    )
+                    plot_action_chunk_segments_3d(
+                        os.path.join(out_dir, "pt_action_chunks_3d.png"),
+                        state_tcp,
+                        full_pt_tcp_segments,
+                        np.arange(len(full_pt_tcp_segments), dtype=np.int64),
+                    )
+                    plot_boundary_trajectory_3d(
+                        os.path.join(out_dir, "trajectory_3d_state_chunks.png"),
+                        state_tcp,
+                        gt_boundary_tcp,
+                        actor_boundary_tcp,
+                        result["chunk_indices"],
+                        result["critic_q_data"],
+                        result["critic_q_actor"],
+                    )
+                    plot_action_chunk_segments_3d(
+                        os.path.join(out_dir, "selected_action_chunks_3d.png"),
+                        state_tcp,
+                        pt_tcp_segments,
+                        result["chunk_indices"],
+                        actor_tcp_segments=actor_tcp_segments,
+                        q_data=result["critic_q_data"],
+                        q_actor=result["critic_q_actor"],
+                    )
+                plot_action_chunk_triplet_segments_3d(
+                    os.path.join(out_dir, "selected_action_chunks_triplet_3d.png"),
                     state_tcp,
                     pt_tcp_segments,
-                    result["chunk_indices"],
-                    actor_tcp_segments=actor_tcp_segments,
-                    q_data=result["critic_q_data"],
-                    q_actor=result["critic_q_actor"],
+                    gt_reconstructed_tcp_segments,
+                    actor_tcp_segments,
                 )
-            plot_action_chunk_triplet_segments_3d(
-                os.path.join(out_dir, "selected_action_chunks_triplet_3d.png"),
-                state_tcp,
-                pt_tcp_segments,
-                gt_reconstructed_tcp_segments,
-                actor_tcp_segments,
-            )
-            plot_action_chunk_triplet_segments_3d(
-                os.path.join(
-                    out_dir, "selected_pt_gt_actor_action_chunks_global_3d.png"
-                ),
-                state_tcp,
-                pt_tcp_segments,
-                gt_reconstructed_tcp_segments,
-                actor_tcp_segments,
-            )
-            plot_pt_gt_reconstruction_segments_3d(
-                os.path.join(out_dir, "pt_vs_gt_reconstruction_3d.png"),
-                state_tcp,
-                pt_tcp_segments,
-                gt_reconstructed_tcp_segments,
-                float(np.max(pt_vs_gt_reconstructed_max_abs)),
-                float(np.max(pt_vs_gt_reconstructed_mean_abs)),
-            )
+                plot_action_chunk_triplet_segments_3d(
+                    os.path.join(
+                        out_dir, "selected_pt_gt_actor_action_chunks_global_3d.png"
+                    ),
+                    state_tcp,
+                    pt_tcp_segments,
+                    gt_reconstructed_tcp_segments,
+                    actor_tcp_segments,
+                )
+                plot_pt_gt_reconstruction_segments_3d(
+                    os.path.join(out_dir, "pt_vs_gt_reconstruction_3d.png"),
+                    state_tcp,
+                    pt_tcp_segments,
+                    gt_reconstructed_tcp_segments,
+                    float(np.max(pt_vs_gt_reconstructed_max_abs)),
+                    float(np.max(pt_vs_gt_reconstructed_mean_abs)),
+                )
             full_pt_vs_gt_abs = np.asarray(full_pt_joint_chunks) - np.asarray(
                 full_gt_reconstructed_joint_chunks
             )
             full_pt_vs_gt_max_abs = float(np.max(np.abs(full_pt_vs_gt_abs)))
             full_pt_vs_gt_mean_abs = float(np.mean(np.abs(full_pt_vs_gt_abs)))
-            plot_pt_gt_reconstruction_segments_3d(
-                os.path.join(out_dir, "full_pt_vs_gt_reconstruction_3d.png"),
-                state_tcp,
-                full_pt_tcp_segments,
-                full_gt_reconstructed_tcp_segments,
-                full_pt_vs_gt_max_abs,
-                full_pt_vs_gt_mean_abs,
-            )
-            plot_action_chunk_segments_3d(
-                os.path.join(out_dir, "full_pt_action_chunks_global_3d.png"),
-                state_tcp,
-                full_pt_tcp_segments,
-                np.arange(len(full_pt_tcp_segments), dtype=np.int64),
-            )
-            if not minimal_viz:
-                plot_trajectory_3d_with_state(
-                    os.path.join(out_dir, "trajectory_3d_forecast_chunks.png"),
+            if not timeline_only:
+                plot_pt_gt_reconstruction_segments_3d(
+                    os.path.join(out_dir, "full_pt_vs_gt_reconstruction_3d.png"),
                     state_tcp,
-                    gt_reconstructed_tcp_segments,
-                    actor_tcp_segments,
-                    result["chunk_indices"],
-                    result["critic_q_data"],
-                    result["critic_q_actor"],
+                    full_pt_tcp_segments,
+                    full_gt_reconstructed_tcp_segments,
+                    full_pt_vs_gt_max_abs,
+                    full_pt_vs_gt_mean_abs,
                 )
+                plot_action_chunk_segments_3d(
+                    os.path.join(out_dir, "full_pt_action_chunks_global_3d.png"),
+                    state_tcp,
+                    full_pt_tcp_segments,
+                    np.arange(len(full_pt_tcp_segments), dtype=np.int64),
+                )
+                if not minimal_viz:
+                    plot_trajectory_3d_with_state(
+                        os.path.join(out_dir, "trajectory_3d_forecast_chunks.png"),
+                        state_tcp,
+                        gt_reconstructed_tcp_segments,
+                        actor_tcp_segments,
+                        result["chunk_indices"],
+                        result["critic_q_data"],
+                        result["critic_q_actor"],
+                    )
             plot_q_values(
                 os.path.join(out_dir, "q_values.png"),
                 result["critic_q_data"],
@@ -1283,12 +1326,32 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 chunk_indices=result["chunk_indices"],
                 mc_return=result["mc_return"],
             )
-            plot_action_mse_heatmaps(
-                os.path.join(out_dir, "action_mse_heatmaps.png"),
-                result["action_mse_matrix"],
+            plot_critic_timeline_with_images(
+                os.path.join(out_dir, "critic_timeline_with_images.png"),
                 result["chunk_indices"],
-                result["action_mse"],
+                result["critic_q_data"],
+                result["critic_q_actor"],
+                result["mc_return"],
+                rewards=result["sample_rewards"],
+                critic_mc_mse=result.get("critic_mc_mse"),
+                images=images,
+                train_mask=train_mask,
+                title=(
+                    f"{split_name}/{traj_name} critic timeline"
+                    + (
+                        f" (trained chunks >= {int(key_segment_start)})"
+                        if key_segment_start is not None
+                        else ""
+                    )
+                ),
             )
+            if not timeline_only:
+                plot_action_mse_heatmaps(
+                    os.path.join(out_dir, "action_mse_heatmaps.png"),
+                    result["action_mse_matrix"],
+                    result["chunk_indices"],
+                    result["action_mse"],
+                )
             metrics = {
                 "split": split_name,
                 "trajectory_file": str(traj_path),
@@ -1304,6 +1367,11 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 "mc_discount_per_chunk": result["mc_discount_per_chunk"],
                 "action_mse": result["action_mse"],
                 "action_mse_matrix": result["action_mse_matrix"],
+                "critic_mc_mse": result.get("critic_mc_mse"),
+                "critic_train_mask": train_mask,
+                "key_segment_start_chunk": (
+                    None if key_segment_start is None else int(key_segment_start)
+                ),
                 "start_states": result["start_states"],
                 "gt_actions": result["gt_actions"],
                 "actor_actions": result["actor_actions"],
@@ -1441,7 +1509,10 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                     "Reset TD3 critic heads after loading checkpoint."
                 )
             self._apply_configured_optimizer_lrs()
-            self.update_step = int(payload.get("update_step", 0))
+            if bool(self.cfg.algorithm.get("reset_update_step_on_resume", False)):
+                self.update_step = 0
+            else:
+                self.update_step = int(payload.get("update_step", 0))
             return
 
         self._strategy.load_checkpoint(

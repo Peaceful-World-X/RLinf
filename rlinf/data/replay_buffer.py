@@ -904,6 +904,7 @@ class TrajectoryReplayBuffer:
         self,
         flats: list[dict],
         buffer_indices: list[int],
+        sample_meta: Optional[dict[str, torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
         if not flats:
             return {}
@@ -931,6 +932,11 @@ class TrajectoryReplayBuffer:
             torch.as_tensor(offsets, dtype=torch.long),
             torch.arange(len(offsets), dtype=torch.long),
         )
+        if sample_meta:
+            forward_inputs = batch.setdefault("forward_inputs", {})
+            for key, value in sample_meta.items():
+                if torch.is_tensor(value):
+                    forward_inputs[key] = value
         return batch
 
     def _ensure_return_bin_entries(self, bin_edges: list[float]) -> None:
@@ -1058,6 +1064,88 @@ class TrajectoryReplayBuffer:
             self._fixed_balanced_mc_return_size = int(num_chunks)
             self._fixed_balanced_mc_return_tail = int(tail_window_size)
         return clone_dict_of_tensors(cached)
+
+    def sample_paired_stage_mc_return(
+        self,
+        num_chunks: int,
+        tail_window_size: int = 0,
+    ) -> dict[str, torch.Tensor]:
+        """Sample success/failure pairs at approximately the same trajectory stage."""
+        self._ensure_return_balanced_ids()
+        success_ids = list(getattr(self, "_return_balanced_success_ids", []))
+        failure_ids = list(getattr(self, "_return_balanced_failure_ids", []))
+        if not success_ids or not failure_ids or int(num_chunks) < 2:
+            return self.sample_balanced_mc_return(
+                num_chunks,
+                tail_window_size=tail_window_size,
+            )
+
+        flats: list[dict] = []
+        buffer_indices: list[int] = []
+        pair_ids: list[int] = []
+        pair_signs: list[float] = []
+        pair_stage: list[float] = []
+        rng = self.random_generator
+        num_pairs = (int(num_chunks) + 1) // 2
+
+        def _pick_traj(ids: list[int]) -> tuple[int, int]:
+            pick = int(torch.randint(0, len(ids), (1,), generator=rng).item())
+            tid = int(ids[pick])
+            info = self._trajectory_index[tid]
+            return tid, int(info["num_samples"])
+
+        for pair_idx in range(num_pairs):
+            success_tid, success_len = _pick_traj(success_ids)
+            failure_tid, failure_len = _pick_traj(failure_ids)
+            success_info = self._trajectory_index[success_tid]
+            failure_info = self._trajectory_index[failure_tid]
+
+            if int(tail_window_size) > 0:
+                s_avail = min(success_len, int(tail_window_size))
+                f_avail = min(failure_len, int(tail_window_size))
+                stage_count = max(1, min(s_avail, f_avail))
+                stage = int(torch.randint(0, stage_count, (1,), generator=rng).item())
+                success_local = max(0, success_len - s_avail) + stage
+                failure_local = max(0, failure_len - f_avail) + stage
+            else:
+                stage_count = max(1, min(success_len, failure_len))
+                stage = int(torch.randint(0, stage_count, (1,), generator=rng).item())
+                success_local = stage
+                failure_local = stage
+
+            pair_order = [
+                (success_tid, success_info, success_local, 1.0),
+                (failure_tid, failure_info, failure_local, -1.0),
+            ]
+            if bool(torch.randint(0, 2, (1,), generator=rng).item()):
+                pair_order.reverse()
+            for tid, info, local, sign in pair_order:
+                trajectory = self._load_trajectory(int(tid), info["model_weights_id"])
+                flats.append(self._flatten_trajectory(trajectory))
+                buffer_indices.append(int(local))
+                pair_ids.append(pair_idx)
+                pair_signs.append(float(sign))
+                pair_stage.append(float(stage))
+
+        flats = flats[: int(num_chunks)]
+        buffer_indices = buffer_indices[: int(num_chunks)]
+        pair_ids = pair_ids[: int(num_chunks)]
+        pair_signs = pair_signs[: int(num_chunks)]
+        pair_stage = pair_stage[: int(num_chunks)]
+
+        return self._sample_from_flat_specs(
+            flats,
+            buffer_indices,
+            sample_meta={
+                "pair_id": torch.as_tensor(pair_ids, dtype=torch.long),
+                "pair_sign": torch.as_tensor(pair_signs, dtype=torch.float32).reshape(
+                    -1, 1
+                ),
+                "pair_stage": torch.as_tensor(pair_stage, dtype=torch.float32).reshape(
+                    -1, 1
+                ),
+            },
+        )
 
     def _flatten_trajectory(self, trajectory: Trajectory) -> dict:
         flat: dict[str, object] = {}

@@ -175,6 +175,28 @@ def _print_joint_table(
         )
 
 
+def _resolve_chunk_target_source(
+    *,
+    target_source: str,
+    hybrid_prefix_source: str,
+    hybrid_switch_chunk: int | None,
+    hybrid_switch_position: int | None,
+    original_chunk: int,
+    metric_pos: int,
+) -> str:
+    if target_source != "hybrid":
+        return target_source
+    if hybrid_switch_chunk is not None:
+        return (
+            "actor" if original_chunk >= hybrid_switch_chunk else hybrid_prefix_source
+        )
+    if hybrid_switch_position is not None:
+        return "actor" if metric_pos >= hybrid_switch_position else hybrid_prefix_source
+    raise ValueError(
+        "--target-source hybrid requires --hybrid-switch-chunk or --hybrid-switch-position"
+    )
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Safely replay PT/GT/actor absolute action chunks from validation metrics."
@@ -189,9 +211,40 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-source",
-        choices=["pt", "gt", "actor", "state"],
+        choices=["pt", "gt", "actor", "state", "hybrid"],
         default="actor",
-        help="Which absolute target to dry-run/replay.",
+        help=(
+            "Which absolute target to dry-run/replay. Use hybrid to replay early "
+            "chunks with GT/PT and later chunks with actor."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-prefix-source",
+        choices=["pt", "gt"],
+        default="gt",
+        help=(
+            "For --target-source hybrid, source used before the switch point. "
+            "pt is the recorded absolute chunk; gt is the normalized-delta target "
+            "rebuilt into absolute action space."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-switch-chunk",
+        type=int,
+        default=None,
+        help=(
+            "For --target-source hybrid, start actor replay at this original "
+            "trajectory chunk index."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-switch-position",
+        type=int,
+        default=None,
+        help=(
+            "For --target-source hybrid, start actor replay at this position in "
+            "the metrics arrays. Useful when metrics only contains a sliced tail."
+        ),
     )
     parser.add_argument(
         "--chunks",
@@ -216,6 +269,34 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--precision", type=int, default=4)
     parser.add_argument(
         "--table", action="store_true", help="Print per-joint comparison table."
+    )
+    parser.add_argument(
+        "--actor-mse-gate",
+        type=float,
+        default=5e-5,
+        help=(
+            "When --target-source actor, only allow actor replay for chunks whose "
+            "execution-space mean squared error to GT rebuilt action is <= this "
+            "threshold. Use a negative value to disable."
+        ),
+    )
+    parser.add_argument(
+        "--actor-max-abs-gate",
+        type=float,
+        default=0.03,
+        help=(
+            "When --target-source actor, additionally require chunk max absolute "
+            "Actor-GT joint error <= this threshold. Use a negative value to disable."
+        ),
+    )
+    parser.add_argument(
+        "--actor-gate-mode",
+        choices=["skip", "prompt"],
+        default="skip",
+        help=(
+            "For actor chunks that fail the MSE/max-error gate: skip automatically, "
+            "or prompt before allowing manual override."
+        ),
     )
     parser.add_argument(
         "--execute", action="store_true", help="Actually command the real robot."
@@ -256,14 +337,22 @@ def main() -> int:
     np.set_printoptions(precision=args.precision, suppress=True, linewidth=220)
     os.environ.setdefault("RLINF_SKIP_ROS_CLEANUP", "1")
 
+    if args.target_source == "hybrid":
+        if (args.hybrid_switch_chunk is None) == (args.hybrid_switch_position is None):
+            raise ValueError(
+                "For --target-source hybrid, provide exactly one of "
+                "--hybrid-switch-chunk or --hybrid-switch-position."
+            )
+    elif (
+        args.hybrid_switch_chunk is not None or args.hybrid_switch_position is not None
+    ):
+        raise ValueError(
+            "--hybrid-switch-chunk/--hybrid-switch-position are only valid with "
+            "--target-source hybrid."
+        )
+
     metrics = _load_metrics(args.metrics)
     trajectory_path = args.trajectory or metrics.get("trajectory_file", None)
-    if not trajectory_path:
-        raise ValueError(
-            "--trajectory is required when metrics.json has no trajectory_file"
-        )
-    trajectory = _load_trajectory(trajectory_path)
-
     pt_chunks = _metrics_array(metrics, "full_pt_absolute_action_chunks")
     gt_chunks = _metrics_array(metrics, "gt_reconstructed_absolute_action_chunks")
     actor_chunks = _metrics_array(metrics, "actor_absolute_action_chunks")
@@ -284,22 +373,93 @@ def main() -> int:
         args.substeps, pt_chunks.shape[1], default_all=True
     )
 
-    curr_states_all = _as_numpy(trajectory["curr_obs"]["states"]).astype(np.float64)
-    if curr_states_all.ndim == 2:
-        curr_states_all = curr_states_all[:, None, :]
-    if curr_states_all.shape[1] <= args.batch_index:
-        raise IndexError(
-            f"batch_index={args.batch_index} but curr_obs.states batch dim is {curr_states_all.shape[1]}"
-        )
-    curr_states = curr_states_all[:, args.batch_index, :14]
-    rewards = _trajectory_1d(trajectory, "rewards")
-    dones = _trajectory_1d(trajectory, "dones")
-    terminations = _trajectory_1d(trajectory, "terminations")
-    truncations = _trajectory_1d(trajectory, "truncations")
+    trajectory = None
+    trajectory_loaded = False
+    trajectory_missing_reason = None
+    if trajectory_path:
+        try:
+            trajectory = _load_trajectory(trajectory_path)
+            trajectory_loaded = True
+        except FileNotFoundError as exc:
+            trajectory_missing_reason = str(exc)
+    if trajectory_loaded:
+        curr_states_all = _as_numpy(trajectory["curr_obs"]["states"]).astype(np.float64)
+        if curr_states_all.ndim == 2:
+            curr_states_all = curr_states_all[:, None, :]
+        if curr_states_all.shape[1] <= args.batch_index:
+            raise IndexError(
+                f"batch_index={args.batch_index} but curr_obs.states batch dim is {curr_states_all.shape[1]}"
+            )
+        curr_states = curr_states_all[:, args.batch_index, :14]
+        rewards = _trajectory_1d(trajectory, "rewards")
+        dones = _trajectory_1d(trajectory, "dones")
+        terminations = _trajectory_1d(trajectory, "terminations")
+        truncations = _trajectory_1d(trajectory, "truncations")
+        use_metric_position_for_state = False
+    else:
+        if "start_states" not in metrics:
+            if not trajectory_path:
+                raise ValueError(
+                    "--trajectory is required when metrics.json has no trajectory_file "
+                    "and no start_states fallback"
+                )
+            raise FileNotFoundError(
+                f"Trajectory file is not available on this machine: {trajectory_missing_reason or trajectory_path}. "
+                "Pass --trajectory with a local .pt path, or use metrics containing start_states."
+            )
+        curr_states = np.asarray(metrics["start_states"], dtype=np.float64)
+        if curr_states.ndim == 3:
+            if curr_states.shape[1] <= args.batch_index:
+                raise IndexError(
+                    f"batch_index={args.batch_index} but metrics start_states batch dim is {curr_states.shape[1]}"
+                )
+            curr_states = curr_states[:, args.batch_index, :14]
+        elif curr_states.ndim == 2:
+            curr_states = curr_states[:, :14]
+        else:
+            raise ValueError(
+                f"metrics start_states must have shape [chunks,14] or [chunks,batch,14], got {curr_states.shape}"
+            )
+        if curr_states.shape[0] != len(metric_chunk_indices):
+            raise ValueError(
+                "metrics start_states length must match metrics chunk_indices length: "
+                f"{curr_states.shape[0]} vs {len(metric_chunk_indices)}"
+            )
+        rewards = np.asarray(
+            metrics.get("sample_rewards", np.zeros(len(metric_chunk_indices))),
+            dtype=np.float64,
+        ).reshape(-1)
+        terminations = np.asarray(
+            metrics.get("sample_terminations", np.zeros(len(metric_chunk_indices))),
+            dtype=np.float64,
+        ).reshape(-1)
+        truncations = np.asarray(
+            metrics.get("sample_truncations", np.zeros(len(metric_chunk_indices))),
+            dtype=np.float64,
+        ).reshape(-1)
+        dones = np.asarray(
+            metrics.get("sample_dones", terminations), dtype=np.float64
+        ).reshape(-1)
+        use_metric_position_for_state = True
 
     print("Loaded metrics:", Path(args.metrics))
-    print("Loaded trajectory:", Path(trajectory_path))
+    if trajectory_loaded:
+        print("Loaded trajectory:", Path(trajectory_path))
+    else:
+        print(
+            "Trajectory source: metrics.start_states/sample_rewards "
+            f"(metrics trajectory_file unavailable: {trajectory_path})"
+        )
     print(f"metrics shape={pt_chunks.shape}, target_source={args.target_source}")
+    if args.target_source == "hybrid":
+        if args.hybrid_switch_chunk is not None:
+            switch_desc = f"original_chunk >= {args.hybrid_switch_chunk}"
+        else:
+            switch_desc = f"metric_pos >= {args.hybrid_switch_position}"
+        print(
+            "hybrid replay: "
+            f"{args.hybrid_prefix_source} before {switch_desc}, actor from {switch_desc}"
+        )
     print(
         f"overall PT-GT max_abs={np.max(np.abs(pt_chunks - gt_chunks)):.9g}, "
         f"Actor-GT max_abs={np.max(np.abs(actor_chunks - gt_chunks)):.9g}, "
@@ -335,7 +495,14 @@ def main() -> int:
         else:
             live = _get_live_qpos(env)
             available_states = np.stack(
-                [curr_states[metric_chunk_indices[pos]] for pos in selected_positions]
+                [
+                    curr_states[
+                        pos
+                        if use_metric_position_for_state
+                        else metric_chunk_indices[pos]
+                    ]
+                    for pos in selected_positions
+                ]
             )
             dists = np.linalg.norm(available_states - live.reshape(1, 14), axis=1)
             nearest_pos_idx = int(np.argmin(dists))
@@ -356,9 +523,14 @@ def main() -> int:
             raise ValueError("No chunks selected; cannot --go-to-start.")
         else:
             first_original = metric_chunk_indices[selected_positions[0]]
+            first_state_index = (
+                selected_positions[0]
+                if use_metric_position_for_state
+                else first_original
+            )
             _go_to_recorded_start(
                 env=env,
-                target_start=curr_states[first_original],
+                target_start=curr_states[first_state_index],
                 chunk_idx=first_original,
                 args=args,
             )
@@ -366,25 +538,36 @@ def main() -> int:
     try:
         for metric_pos in selected_positions:
             original_chunk = metric_chunk_indices[metric_pos]
-            recorded_state = curr_states[original_chunk]
-            reward = rewards[original_chunk] if original_chunk < len(rewards) else 0.0
-            done = dones[original_chunk] if original_chunk < len(dones) else 0.0
+            chunk_target_source = _resolve_chunk_target_source(
+                target_source=args.target_source,
+                hybrid_prefix_source=args.hybrid_prefix_source,
+                hybrid_switch_chunk=args.hybrid_switch_chunk,
+                hybrid_switch_position=args.hybrid_switch_position,
+                original_chunk=original_chunk,
+                metric_pos=metric_pos,
+            )
+            state_index = (
+                metric_pos if use_metric_position_for_state else original_chunk
+            )
+            recorded_state = curr_states[state_index]
+            reward_index = (
+                metric_pos if use_metric_position_for_state else original_chunk
+            )
+            reward = rewards[reward_index] if reward_index < len(rewards) else 0.0
+            done = dones[reward_index] if reward_index < len(dones) else 0.0
             term = (
-                terminations[original_chunk]
-                if original_chunk < len(terminations)
-                else 0.0
+                terminations[reward_index] if reward_index < len(terminations) else 0.0
             )
             trunc = (
-                truncations[original_chunk]
-                if original_chunk < len(truncations)
-                else 0.0
+                truncations[reward_index] if reward_index < len(truncations) else 0.0
             )
 
             print("\n" + "=" * 110)
             print(
                 f"metric_pos={metric_pos}/{len(metric_chunk_indices) - 1}, "
                 f"original_chunk={original_chunk}, reward={float(reward):.4g}, "
-                f"done={int(done)}, term={int(term)}, trunc={int(trunc)}"
+                f"done={int(done)}, term={int(term)}, trunc={int(trunc)}, "
+                f"selected_source={chunk_target_source}"
             )
             print(
                 "recorded curr_state:",
@@ -442,15 +625,99 @@ def main() -> int:
                     ],
                 )
             )
+            actor_diff = actor_chunks[metric_pos] - gt_chunks[metric_pos]
+            actor_chunk_mse = float(np.mean(actor_diff**2))
+            actor_chunk_mae = float(np.mean(np.abs(actor_diff)))
+            actor_chunk_max_abs = float(np.max(np.abs(actor_diff)))
+            actor_gate_mse_ok = args.actor_mse_gate < 0 or actor_chunk_mse <= float(
+                args.actor_mse_gate
+            )
+            actor_gate_max_ok = (
+                args.actor_max_abs_gate < 0
+                or actor_chunk_max_abs <= float(args.actor_max_abs_gate)
+            )
+            actor_gate_ok = actor_gate_mse_ok and actor_gate_max_ok
+            print(
+                "Actor gate stats: "
+                f"chunk_mse={actor_chunk_mse:.9g}, "
+                f"chunk_mae={actor_chunk_mae:.9g}, "
+                f"chunk_max_abs={actor_chunk_max_abs:.9g}, "
+                f"mse_gate={args.actor_mse_gate:g}, "
+                f"max_abs_gate={args.actor_max_abs_gate:g}, "
+                f"status={'PASS' if actor_gate_ok else 'FAIL'}"
+            )
+            if chunk_target_source == "actor" and not actor_gate_ok:
+                message = (
+                    f"Actor chunk gate FAILED for original_chunk={original_chunk}; "
+                    "this chunk is outside the low-MSE takeover region."
+                )
+                if args.actor_gate_mode == "skip":
+                    print(message + " Skipping actor execution for this chunk.")
+                    _write_log(
+                        args.log_jsonl,
+                        {
+                            "time": time.time(),
+                            "original_chunk": original_chunk,
+                            "metric_pos": metric_pos,
+                            "target_source": args.target_source,
+                            "chunk_target_source": chunk_target_source,
+                            "decision": "actor_gate_skip",
+                            "actor_chunk_mse": actor_chunk_mse,
+                            "actor_chunk_mae": actor_chunk_mae,
+                            "actor_chunk_max_abs": actor_chunk_max_abs,
+                            "actor_mse_gate": float(args.actor_mse_gate),
+                            "actor_max_abs_gate": float(args.actor_max_abs_gate),
+                        },
+                    )
+                    print(
+                        f"\nRecorded reward for original chunk {original_chunk}: "
+                        f"reward={float(reward):.4g}, done={int(done)}, term={int(term)}, "
+                        f"trunc={int(trunc)}, executed_targets=0, skipped_targets={len(substep_indices)}"
+                    )
+                    continue
 
-            if args.target_source == "state":
+                text = input(
+                    message
+                    + " Type TAKEOVER to execute this actor chunk anyway, otherwise skip > "
+                ).strip()
+                if text != "TAKEOVER":
+                    print("Skipped because TAKEOVER was not typed.")
+                    _write_log(
+                        args.log_jsonl,
+                        {
+                            "time": time.time(),
+                            "original_chunk": original_chunk,
+                            "metric_pos": metric_pos,
+                            "target_source": args.target_source,
+                            "chunk_target_source": chunk_target_source,
+                            "decision": "actor_gate_prompt_skip",
+                            "actor_chunk_mse": actor_chunk_mse,
+                            "actor_chunk_mae": actor_chunk_mae,
+                            "actor_chunk_max_abs": actor_chunk_max_abs,
+                            "actor_mse_gate": float(args.actor_mse_gate),
+                            "actor_max_abs_gate": float(args.actor_max_abs_gate),
+                        },
+                    )
+                    print(
+                        f"\nRecorded reward for original chunk {original_chunk}: "
+                        f"reward={float(reward):.4g}, done={int(done)}, term={int(term)}, "
+                        f"trunc={int(trunc)}, executed_targets=0, skipped_targets={len(substep_indices)}"
+                    )
+                    continue
+            elif chunk_target_source == "actor":
+                print(
+                    f"Actor takeover allowed for original_chunk={original_chunk} "
+                    "because the rebuilt actor action is close to GT."
+                )
+
+            if chunk_target_source == "state":
                 steps = [(None, recorded_state)]
             else:
                 source_chunks = {
                     "pt": pt_chunks,
                     "gt": gt_chunks,
                     "actor": actor_chunks,
-                }[args.target_source]
+                }[chunk_target_source]
                 steps = [
                     (substep, source_chunks[metric_pos, substep])
                     for substep in substep_indices
@@ -469,7 +736,7 @@ def main() -> int:
                         pt=pt_chunks[metric_pos, substep_idx],
                         gt=gt_chunks[metric_pos, substep_idx],
                         actor=actor_chunks[metric_pos, substep_idx],
-                        target_source=args.target_source,
+                        target_source=chunk_target_source,
                         precision=args.precision,
                     )
                     if args.table:
@@ -505,6 +772,7 @@ def main() -> int:
                             "metric_pos": metric_pos,
                             "substep": substep_idx,
                             "target_source": args.target_source,
+                            "chunk_target_source": chunk_target_source,
                             "decision": "skip",
                             "recorded_state": recorded_state,
                             "target": target,
@@ -527,6 +795,7 @@ def main() -> int:
                         "metric_pos": metric_pos,
                         "substep": substep_idx,
                         "target_source": args.target_source,
+                        "chunk_target_source": chunk_target_source,
                         "decision": "execute" if args.execute else "dry_run",
                         "recorded_state": recorded_state,
                         "pt_target": (

@@ -94,7 +94,8 @@ class Cluster:
     """A singleton class that manages the cluster resources for Ray workers."""
 
     SYS_NAME = "RLinf"
-    NAMESPACE = SYS_NAME
+    NAMESPACE_BASE = os.getenv("RLINF_RAY_NAMESPACE", SYS_NAME)
+    NAMESPACE = NAMESPACE_BASE
     LOGGING_LEVEL = os.getenv(
         f"{SYS_NAME.upper()}_{ClusterEnvVar.LOG_LEVEL.value}", "INFO"
     ).upper()
@@ -173,7 +174,9 @@ class Cluster:
                     self._logger.info(
                         f"Ray namespace conflict detected. Retrying to initialize Cluster with a new namespace (attempt {self._ray_instance_count})."
                     )
-                    Cluster.NAMESPACE = f"{Cluster.SYS_NAME}_{self._ray_instance_count}"
+                    Cluster.NAMESPACE = (
+                        f"{Cluster.NAMESPACE_BASE}_{self._ray_instance_count}"
+                    )
         else:
             try:
                 self._init_from_existing_managers()

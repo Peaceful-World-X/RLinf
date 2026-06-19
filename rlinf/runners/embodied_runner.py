@@ -37,13 +37,9 @@ if TYPE_CHECKING:
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
         AsyncEmbodiedSACFSDPPolicy,
     )
-    from rlinf.workers.actor.async_fsdp_td3_policy_worker import (
-        AsyncEmbodiedTD3FSDPPolicy,
-    )
     from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
     from rlinf.workers.actor.fsdp_nft_policy_worker import EmbodiedNFTFSDPPolicy
     from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
-    from rlinf.workers.actor.fsdp_td3_policy_worker import EmbodiedTD3FSDPPolicy
     from rlinf.workers.env.async_env_worker import AsyncEnvWorker
     from rlinf.workers.env.env_worker import EnvWorker
     from rlinf.workers.reward.reward_worker import EmbodiedRewardWorker
@@ -156,7 +152,11 @@ class EmbodiedRunner:
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
-        self.global_step = int(resume_dir.split("global_step_")[-1])
+        if bool(self.cfg.runner.get("reset_global_step_on_resume", False)):
+            self.global_step = 0
+            self.logger.info("Reset global_step to 0 after loading checkpoint.")
+        else:
+            self.global_step = int(resume_dir.split("global_step_")[-1])
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()

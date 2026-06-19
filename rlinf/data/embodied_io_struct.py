@@ -608,9 +608,26 @@ class EmbodiedRolloutResult:
             if self.forward_inputs:
                 last_fi = self.forward_inputs[-1]
                 if "action" in last_fi:
+                    if "policy_action_before_intervention" not in last_fi:
+                        last_fi["policy_action_before_intervention"] = (
+                            last_fi["action"].detach().cpu().contiguous()
+                        )
+                    if "actor_action_before_intervention" not in last_fi:
+                        actor_action = last_fi.get("actor_action", None)
+                        if torch.is_tensor(actor_action):
+                            last_fi["actor_action_before_intervention"] = (
+                                actor_action.detach().cpu().contiguous()
+                            )
+                    if "ref_action_before_intervention" not in last_fi:
+                        ref_action = last_fi.get("ref_action", None)
+                        if torch.is_tensor(ref_action):
+                            last_fi["ref_action_before_intervention"] = (
+                                ref_action.detach().cpu().contiguous()
+                            )
                     last_fi["action"] = (
                         last_full_action.reshape(bsz, -1).cpu().contiguous()
                     )
+                    last_fi["executed_action"] = last_fi["action"]
                 last_fi.pop("model_action", None)
 
     def append_transitions(self, curr_obs=None, next_obs=None):

@@ -41,6 +41,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 DELTA_MASK = np.array([True] * 6 + [False] + [True] * 6 + [False], dtype=bool)
+DEFAULT_NORM_STATS_PATH = (
+    "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert/norm_stats.json"
+)
 
 
 def _as_numpy(value: Any) -> np.ndarray:
@@ -196,6 +199,25 @@ def _choose_absolute_actions(
     if absolute.shape[-1] % 14 != 0:
         raise ValueError(f"Action last dim must be H*14, got shape={absolute.shape}")
     return absolute.reshape(absolute.shape[0], horizon, 14), source_name
+
+
+def _source_label_for_chunk(
+    *,
+    chunk_idx: int,
+    main_source_name: str,
+    hybrid_action_source: str | None,
+    hybrid_switch_chunk: int | None,
+    hybrid_switch_from_end: int | None,
+    length: int,
+) -> str:
+    if hybrid_action_source is None:
+        return main_source_name
+    switch = (
+        length - int(hybrid_switch_from_end)
+        if hybrid_switch_from_end is not None
+        else int(hybrid_switch_chunk)
+    )
+    return hybrid_action_source if chunk_idx >= switch else main_source_name
 
 
 def _load_trajectory(args: argparse.Namespace) -> dict[str, Any]:
@@ -436,9 +458,13 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-source",
-        choices=["action", "state"],
+        choices=["action", "state", "ref_action", "train_action"],
         default="action",
-        help="Replay action chunks or recorded curr_obs.states.",
+        help=(
+            "Replay action chunks or recorded curr_obs.states. "
+            "ref_action replays curr_obs.ref_action as normalized-delta; "
+            "train_action replays top-level actions as normalized-delta."
+        ),
     )
     parser.add_argument(
         "--action-key",
@@ -446,6 +472,36 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "Nested action key. Default auto-prefers forward_inputs.env_action_absolute, "
             "else actions. Example: forward_inputs.model_action_absolute"
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-action-key",
+        default=None,
+        help=(
+            "Optional second nested action key used after the hybrid switch point. "
+            "Example: forward_inputs.actor_replay_env_action_absolute."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-action-space",
+        choices=["auto", "absolute", "normalized_delta"],
+        default="auto",
+        help="How to interpret --hybrid-action-key.",
+    )
+    parser.add_argument(
+        "--hybrid-switch-chunk",
+        type=int,
+        default=None,
+        help="When --hybrid-action-key is set, start using it at this chunk index.",
+    )
+    parser.add_argument(
+        "--hybrid-switch-from-end",
+        type=int,
+        default=None,
+        help=(
+            "When --hybrid-action-key is set, start using it this many chunks from "
+            "the end. Example: 20 means first length-20 chunks use the main source, "
+            "the final 20 chunks use --hybrid-action-key."
         ),
     )
     parser.add_argument(
@@ -523,6 +579,19 @@ def main() -> int:
     args = build_argparser().parse_args()
     np.set_printoptions(precision=4, suppress=True, linewidth=180)
 
+    if args.hybrid_action_key:
+        if (args.hybrid_switch_chunk is None) == (args.hybrid_switch_from_end is None):
+            raise ValueError(
+                "--hybrid-action-key requires exactly one of "
+                "--hybrid-switch-chunk or --hybrid-switch-from-end."
+            )
+    elif (
+        args.hybrid_switch_chunk is not None or args.hybrid_switch_from_end is not None
+    ):
+        raise ValueError(
+            "--hybrid-switch-chunk/--hybrid-switch-from-end require --hybrid-action-key."
+        )
+
     trajectory = _load_trajectory(args)
     curr_states_all = _as_numpy(trajectory["curr_obs"]["states"]).astype(np.float64)
     if curr_states_all.ndim == 2:
@@ -538,6 +607,43 @@ def main() -> int:
     terminations = _trajectory_1d(trajectory, "terminations")
     truncations = _trajectory_1d(trajectory, "truncations")
 
+    if args.target_source == "ref_action":
+        if args.action_key is not None and args.action_key not in {
+            "curr_obs.ref_action",
+            "forward_inputs.ref_action",
+        }:
+            raise ValueError(
+                "--target-source ref_action uses curr_obs.ref_action or forward_inputs.ref_action; "
+                "do not pass a different --action-key."
+            )
+        curr_obs = trajectory.get("curr_obs", {})
+        forward_inputs = trajectory.get("forward_inputs", {})
+        if isinstance(curr_obs, dict) and "ref_action" in curr_obs:
+            args.action_key = "curr_obs.ref_action"
+        elif isinstance(forward_inputs, dict) and "ref_action" in forward_inputs:
+            args.action_key = "forward_inputs.ref_action"
+        else:
+            raise KeyError(
+                "--target-source ref_action requires curr_obs.ref_action or forward_inputs.ref_action"
+            )
+        args.action_space = "normalized_delta"
+    elif args.target_source == "train_action":
+        if args.action_key is not None and args.action_key != "actions":
+            raise ValueError(
+                "--target-source train_action uses top-level actions; do not pass a different --action-key."
+            )
+        args.action_key = "actions"
+        args.action_space = "normalized_delta"
+
+    if args.action_space == "normalized_delta" and not args.norm_stats:
+        if Path(DEFAULT_NORM_STATS_PATH).is_file():
+            args.norm_stats = DEFAULT_NORM_STATS_PATH
+        else:
+            raise ValueError(
+                "--norm-stats is required for normalized_delta replay; "
+                f"default not found: {DEFAULT_NORM_STATS_PATH}"
+            )
+
     norm_stats = _load_norm_stats(args.norm_stats, args.norm_std_floor)
     action_chunks, action_source = _choose_absolute_actions(
         trajectory,
@@ -546,15 +652,52 @@ def main() -> int:
         norm_stats,
         args.batch_index,
     )
+    hybrid_action_chunks = None
+    hybrid_action_source = None
+    if args.hybrid_action_key:
+        hybrid_norm_stats = norm_stats
+        if args.hybrid_action_space == "normalized_delta" and hybrid_norm_stats is None:
+            raise ValueError(
+                "--norm-stats is required when --hybrid-action-space normalized_delta"
+            )
+        hybrid_action_chunks, hybrid_action_source = _choose_absolute_actions(
+            trajectory,
+            args.hybrid_action_key,
+            args.hybrid_action_space,
+            hybrid_norm_stats,
+            args.batch_index,
+        )
+        if hybrid_action_chunks.shape != action_chunks.shape:
+            raise ValueError(
+                "Hybrid action chunks must match main action shape: "
+                f"{hybrid_action_chunks.shape} vs {action_chunks.shape}"
+            )
     horizon = int(action_chunks.shape[1])
     chunk_indices = _parse_indices(args.chunks, length)
     substep_indices = _parse_indices(args.substeps, horizon, default_all=True)
 
     print("Loaded trajectory:", Path(args.trajectory))
     print(f"length={length}, action_horizon={horizon}, action_source={action_source}")
+    if hybrid_action_chunks is not None:
+        if args.hybrid_switch_from_end is not None:
+            switch_chunk = length - int(args.hybrid_switch_from_end)
+            switch_desc = (
+                f"chunk >= {switch_chunk} "
+                f"(last {int(args.hybrid_switch_from_end)} chunks)"
+            )
+        else:
+            switch_chunk = int(args.hybrid_switch_chunk)
+            switch_desc = f"chunk >= {switch_chunk}"
+        print(
+            "hybrid action replay: "
+            f"main source before {switch_desc}; "
+            f"{hybrid_action_source} from {switch_desc}"
+        )
     print("selected chunks:", chunk_indices)
-    if args.target_source == "action":
+    if args.target_source != "state":
         print("selected substeps:", substep_indices)
+    if args.action_space == "normalized_delta":
+        print("norm_stats:", args.norm_stats)
     print(
         f"reward stats: min={float(np.min(rewards)):.4g}, max={float(np.max(rewards)):.4g}, "
         f"sum={float(np.sum(rewards)):.4g}"
@@ -609,23 +752,62 @@ def main() -> int:
     try:
         for chunk_idx in chunk_indices:
             recorded_state = curr_states[chunk_idx]
+            selected_action_chunks = action_chunks
+            selected_source = action_source
+            if hybrid_action_chunks is not None:
+                selected_source = _source_label_for_chunk(
+                    chunk_idx=chunk_idx,
+                    main_source_name=action_source,
+                    hybrid_action_source=hybrid_action_source,
+                    hybrid_switch_chunk=args.hybrid_switch_chunk,
+                    hybrid_switch_from_end=args.hybrid_switch_from_end,
+                    length=length,
+                )
+                if selected_source == hybrid_action_source:
+                    selected_action_chunks = hybrid_action_chunks
             print("\n" + "=" * 100)
             print(
                 f"chunk={chunk_idx}/{length - 1}, reward={float(rewards[chunk_idx]):.4g}, "
                 f"done={int(dones[chunk_idx])}, term={int(terminations[chunk_idx])}, "
-                f"trunc={int(truncations[chunk_idx])}"
+                f"trunc={int(truncations[chunk_idx])}, selected_source={selected_source}"
             )
             print("recorded curr_state:", _format_vec(recorded_state))
-            print("action chunk first :", _format_vec(action_chunks[chunk_idx, 0]))
-            print("action chunk last  :", _format_vec(action_chunks[chunk_idx, -1]))
+            print(
+                "action chunk first :",
+                _format_vec(selected_action_chunks[chunk_idx, 0]),
+            )
+            print(
+                "action chunk last  :",
+                _format_vec(selected_action_chunks[chunk_idx, -1]),
+            )
+            if hybrid_action_chunks is not None:
+                print("main first/last   :", _format_vec(action_chunks[chunk_idx, 0]))
+                print("                  :", _format_vec(action_chunks[chunk_idx, -1]))
+                print(
+                    "hybrid first/last :",
+                    _format_vec(hybrid_action_chunks[chunk_idx, 0]),
+                )
+                print(
+                    "                  :",
+                    _format_vec(hybrid_action_chunks[chunk_idx, -1]),
+                )
+                diff = hybrid_action_chunks[chunk_idx] - action_chunks[chunk_idx]
+                print(
+                    "hybrid-main chunk: "
+                    f"mse={float(np.mean(diff**2)):.9g}, "
+                    f"mae={float(np.mean(np.abs(diff))):.9g}, "
+                    f"max_abs={float(np.max(np.abs(diff))):.9g}"
+                )
             print(
                 _summarize_delta(
-                    "first-recorded_state", action_chunks[chunk_idx, 0] - recorded_state
+                    "first-recorded_state",
+                    selected_action_chunks[chunk_idx, 0] - recorded_state,
                 )
             )
             print(
                 _summarize_delta(
-                    "last-recorded_state", action_chunks[chunk_idx, -1] - recorded_state
+                    "last-recorded_state",
+                    selected_action_chunks[chunk_idx, -1] - recorded_state,
                 )
             )
 
@@ -633,7 +815,7 @@ def main() -> int:
                 steps = [(None, recorded_state)]
             else:
                 steps = [
-                    (substep, action_chunks[chunk_idx, substep])
+                    (substep, selected_action_chunks[chunk_idx, substep])
                     for substep in substep_indices
                 ]
 
@@ -663,6 +845,7 @@ def main() -> int:
                             "time": time.time(),
                             "chunk": chunk_idx,
                             "substep": substep_idx,
+                            "selected_source": selected_source,
                             "decision": "skip",
                             "recorded_state": recorded_state,
                             "target": target,
@@ -693,6 +876,7 @@ def main() -> int:
                         "time": time.time(),
                         "chunk": chunk_idx,
                         "substep": substep_idx,
+                        "selected_source": selected_source,
                         "decision": "execute" if args.execute else "dry_run_next",
                         "recorded_state": recorded_state,
                         "target": target,

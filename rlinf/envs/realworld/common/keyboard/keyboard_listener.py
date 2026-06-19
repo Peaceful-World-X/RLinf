@@ -37,6 +37,7 @@ class KeyboardListener:
         self.state_lock = threading.Lock()
         self.latest_data = {"key": None}
         self._pressed_keys: set[str] = set()
+        self._pending_keys: list[str] = []
         self.device = self._open_keyboard_device()
 
         self.listener = threading.Thread(
@@ -137,6 +138,8 @@ class KeyboardListener:
                     with self.state_lock:
                         self.latest_data["key"] = key
                         self._pressed_keys.add(key)
+                        if event.value == 1:
+                            self._pending_keys.append(key)
                 elif event.value == 0:
                     with self.state_lock:
                         self._pressed_keys.discard(key)
@@ -146,6 +149,7 @@ class KeyboardListener:
             with self.state_lock:
                 self.latest_data["key"] = None
                 self._pressed_keys.clear()
+                self._pending_keys.clear()
             self.device.close()
 
     def _event_to_key(self, key_code: int) -> str | None:
@@ -174,7 +178,57 @@ class KeyboardListener:
         short presses between polling cycles.
         """
         with self.state_lock:
+            if key in self._pending_keys:
+                self._pending_keys.remove(key)
+                return True
             if key in self._pressed_keys:
                 self._pressed_keys.discard(key)
                 return True
             return False
+
+    def consume_any_press(
+        self,
+        keys: tuple[str, ...] | list[str] | set[str],
+        *,
+        include_held: bool = True,
+    ) -> str | None:
+        """Returns and clears the oldest pending press among ``keys``.
+
+        Falls back to currently-held keys when ``include_held`` is true.
+        """
+        key_set = set(keys)
+        with self.state_lock:
+            for idx, pending_key in enumerate(self._pending_keys):
+                if pending_key in key_set:
+                    return self._pending_keys.pop(idx)
+            if not include_held:
+                return None
+            for pressed_key in tuple(self._pressed_keys):
+                if pressed_key in key_set:
+                    self._pressed_keys.discard(pressed_key)
+                    return pressed_key
+            return None
+
+    def clear_keys(
+        self, keys: tuple[str, ...] | list[str] | set[str] | None = None
+    ) -> None:
+        """Clear pending and currently-held keys.
+
+        ``keys=None`` clears all cached key state. Passing a key collection clears
+        only those keys.
+        """
+        with self.state_lock:
+            if keys is None:
+                self.latest_data["key"] = None
+                self._pressed_keys.clear()
+                self._pending_keys.clear()
+                return
+            key_set = set(keys)
+            self._pressed_keys.difference_update(key_set)
+            self._pending_keys = [
+                pending_key
+                for pending_key in self._pending_keys
+                if pending_key not in key_set
+            ]
+            if self.latest_data["key"] in key_set:
+                self.latest_data["key"] = None

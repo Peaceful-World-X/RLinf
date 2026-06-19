@@ -55,19 +55,315 @@ class OpenPiRLTokenConfig:
     # "image_only": use only the first num_image_tokens (image tokens)
     prefix_feature_type: str = "image_only"
     robot_state_dim: int = 14  # proprioception dimension (s_p)
+    actor_head_type: str = "mlp"
     actor_hidden_dims: tuple = (512, 256)
+    actor_transformer_dim: int = 256
+    actor_transformer_layers: int = 2
+    actor_transformer_heads: int = 8
+    actor_transformer_ffn_dim: int = 1024
+    actor_transformer_dropout: float = 0.1
     critic_hidden_dims: tuple = (512, 256)
+    critic_head_type: str = "mlp"
+    openrlt_z_proj_dim: int = 256
+    openrlt_state_proj_dim: int = 64
+    openrlt_action_proj_dim: int = 256
+    openrlt_hidden_dim: int = 256
+    openrlt_num_layers: int = 2
     action_horizon: int = 5
     action_dim: int = 7
     recon_loss_coef: float = 0.1
     actor_output_bound: float | None = None
     use_robot_state: bool = True
     critic_use_robot_state: bool | None = None
+    critic_use_ref_action: bool = True
+    critic_use_rl_token: bool = True
+    actor_ref_action_dropout_p: float = 0.0
+    actor_ref_action_mask_flag: bool = False
+    critic_block_norm: bool = False
+    critic_action_encoder_dim: int = 0
     action_space: str = "absolute"
     action_norm_stats_path: str | None = None
     action_norm_std_floor: float = 1e-6
     critic_train_rl_token_encoder: bool = False
     critic_separate_rl_token_encoder: bool = False
+
+
+class TransformerActionHead(torch.nn.Module):
+    """Action-chunk actor with attention over RL token, state, and ref-action steps."""
+
+    def __init__(
+        self,
+        *,
+        rl_token_dim: int,
+        robot_state_dim: int,
+        use_robot_state: bool,
+        action_horizon: int,
+        action_dim: int,
+        model_dim: int,
+        num_layers: int,
+        num_heads: int,
+        ffn_dim: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.rl_token_dim = int(rl_token_dim)
+        self.robot_state_dim = int(robot_state_dim)
+        self.use_robot_state = bool(use_robot_state)
+        self.action_horizon = int(action_horizon)
+        self.action_dim = int(action_dim)
+        self.model_dim = int(model_dim)
+
+        self.rl_token_proj = torch.nn.Linear(self.rl_token_dim, self.model_dim)
+        self.state_proj = (
+            torch.nn.Linear(self.robot_state_dim, self.model_dim)
+            if self.use_robot_state
+            else None
+        )
+        self.action_proj = torch.nn.Linear(self.action_dim, self.model_dim)
+        self.type_embedding = torch.nn.Embedding(3, self.model_dim)
+        self.action_pos_embedding = torch.nn.Parameter(
+            torch.zeros(1, self.action_horizon, self.model_dim)
+        )
+        encoder_layer = torch.nn.TransformerEncoderLayer(
+            d_model=self.model_dim,
+            nhead=int(num_heads),
+            dim_feedforward=int(ffn_dim),
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = torch.nn.TransformerEncoder(
+            encoder_layer, num_layers=int(num_layers)
+        )
+        self.norm = torch.nn.LayerNorm(self.model_dim)
+        self.action_out = torch.nn.Linear(self.model_dim, self.action_dim)
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+        torch.nn.init.normal_(self.type_embedding.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.action_pos_embedding, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.action_out.weight, mean=0.0, std=0.02)
+        if self.action_out.bias is not None:
+            torch.nn.init.zeros_(self.action_out.bias)
+
+    def forward(self, x):
+        batch_size = x.shape[0]
+        offset = 0
+        rl_token = x[:, offset : offset + self.rl_token_dim]
+        offset += self.rl_token_dim
+
+        tokens = [
+            self.rl_token_proj(rl_token)
+            + self.type_embedding.weight[0].to(device=x.device, dtype=x.dtype)
+        ]
+
+        if self.use_robot_state:
+            robot_state = x[:, offset : offset + self.robot_state_dim]
+            offset += self.robot_state_dim
+            tokens.append(
+                self.state_proj(robot_state)
+                + self.type_embedding.weight[1].to(device=x.device, dtype=x.dtype)
+            )
+
+        ref_action = x[:, offset:].reshape(
+            batch_size, self.action_horizon, self.action_dim
+        )
+        action_tokens = (
+            self.action_proj(ref_action)
+            + self.action_pos_embedding.to(device=x.device, dtype=x.dtype)
+            + self.type_embedding.weight[2].to(device=x.device, dtype=x.dtype)
+        )
+        seq = torch.cat([t.unsqueeze(1) for t in tokens] + [action_tokens], dim=1)
+        encoded = self.norm(self.encoder(seq))
+        action_encoded = encoded[:, -self.action_horizon :, :]
+        return self.action_out(action_encoded).reshape(batch_size, -1)
+
+
+def _layer_norm_no_params(x: Tensor, eps: float = 1e-6) -> Tensor:
+    mean = x.mean(dim=-1, keepdim=True)
+    var = torch.square(x - mean).mean(dim=-1, keepdim=True)
+    return (x - mean) / torch.sqrt(var + eps)
+
+
+class OpenRLTMLP(torch.nn.Module):
+    """Small MLP matching the openpi-RLT actor/critic trunk style."""
+
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        output_dim: int,
+    ):
+        super().__init__()
+        dims = (
+            [int(input_dim)] + [int(hidden_dim)] * int(num_layers) + [int(output_dim)]
+        )
+        layers: list[torch.nn.Module] = []
+        for idx in range(len(dims) - 2):
+            layers.append(torch.nn.Linear(dims[idx], dims[idx + 1]))
+            layers.append(torch.nn.LayerNorm(dims[idx + 1]))
+            layers.append(torch.nn.GELU())
+        layers.append(torch.nn.Linear(dims[-2], dims[-1]))
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+
+class OpenRLTActorHead(torch.nn.Module):
+    """openpi-RLT style actor: project RLT, proprio, and reference chunk separately."""
+
+    def __init__(
+        self,
+        *,
+        rl_token_dim: int,
+        robot_state_dim: int,
+        use_robot_state: bool,
+        action_horizon: int,
+        action_dim: int,
+        z_proj_dim: int,
+        state_proj_dim: int,
+        action_proj_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        has_ref_mask: bool = False,
+    ):
+        super().__init__()
+        self.rl_token_dim = int(rl_token_dim)
+        self.robot_state_dim = int(robot_state_dim)
+        self.use_robot_state = bool(use_robot_state)
+        self.action_horizon = int(action_horizon)
+        self.action_dim = int(action_dim)
+        self.ref_dim = self.action_horizon * self.action_dim
+        self.has_ref_mask = bool(has_ref_mask)
+        self.z_proj = torch.nn.Linear(self.rl_token_dim, int(z_proj_dim))
+        self.state_proj = (
+            torch.nn.Linear(self.robot_state_dim, int(state_proj_dim))
+            if self.use_robot_state
+            else None
+        )
+        self.ref_proj = torch.nn.Linear(self.ref_dim, int(action_proj_dim))
+        trunk_dim = int(z_proj_dim) + int(action_proj_dim)
+        if self.use_robot_state:
+            trunk_dim += int(state_proj_dim)
+        self.trunk = OpenRLTMLP(
+            input_dim=trunk_dim,
+            hidden_dim=int(hidden_dim),
+            num_layers=int(num_layers),
+            output_dim=self.ref_dim,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        batch_size = x.shape[0]
+        offset = 0
+        rl_token = x[:, offset : offset + self.rl_token_dim]
+        offset += self.rl_token_dim
+        parts = [_layer_norm_no_params(self.z_proj(rl_token))]
+        if self.use_robot_state:
+            robot_state = x[:, offset : offset + self.robot_state_dim]
+            offset += self.robot_state_dim
+            parts.append(
+                torch.tanh(_layer_norm_no_params(self.state_proj(robot_state)))
+            )
+        ref_flat = x[:, offset : offset + self.ref_dim].reshape(
+            batch_size, self.ref_dim
+        )
+        parts.append(torch.tanh(_layer_norm_no_params(self.ref_proj(ref_flat))))
+        return self.trunk(torch.cat(parts, dim=-1))
+
+
+class OpenRLTQHead(torch.nn.Module):
+    """openpi-RLT style Q head.
+
+    The critic intentionally receives the candidate action chunk rather than a
+    reference action. Configs should normally set critic_use_ref_action=False.
+    """
+
+    def __init__(
+        self,
+        *,
+        rl_token_dim: int,
+        robot_state_dim: int,
+        critic_use_rl_token: bool,
+        critic_use_robot_state: bool,
+        critic_use_ref_action: bool,
+        action_horizon: int,
+        action_dim: int,
+        z_proj_dim: int,
+        state_proj_dim: int,
+        action_proj_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+    ):
+        super().__init__()
+        self.rl_token_dim = int(rl_token_dim)
+        self.robot_state_dim = int(robot_state_dim)
+        self.critic_use_rl_token = bool(critic_use_rl_token)
+        self.critic_use_robot_state = bool(critic_use_robot_state)
+        self.critic_use_ref_action = bool(critic_use_ref_action)
+        self.action_horizon = int(action_horizon)
+        self.action_dim = int(action_dim)
+        self.action_flat_dim = self.action_horizon * self.action_dim
+        trunk_dim = int(action_proj_dim)
+        self.z_proj = (
+            torch.nn.Linear(self.rl_token_dim, int(z_proj_dim))
+            if self.critic_use_rl_token
+            else None
+        )
+        if self.critic_use_rl_token:
+            trunk_dim += int(z_proj_dim)
+        self.state_proj = (
+            torch.nn.Linear(self.robot_state_dim, int(state_proj_dim))
+            if self.critic_use_robot_state
+            else None
+        )
+        if self.critic_use_robot_state:
+            trunk_dim += int(state_proj_dim)
+        self.ref_proj = (
+            torch.nn.Linear(self.action_flat_dim, int(action_proj_dim))
+            if self.critic_use_ref_action
+            else None
+        )
+        if self.critic_use_ref_action:
+            trunk_dim += int(action_proj_dim)
+        self.action_proj = torch.nn.Linear(self.action_flat_dim, int(action_proj_dim))
+        self.trunk = OpenRLTMLP(
+            input_dim=trunk_dim,
+            hidden_dim=int(hidden_dim),
+            num_layers=int(num_layers),
+            output_dim=1,
+        )
+
+    def forward(self, critic_state: Tensor, action: Tensor) -> Tensor:
+        batch_size = critic_state.shape[0]
+        offset = 0
+        parts = []
+        if self.critic_use_rl_token:
+            rl_token = critic_state[:, offset : offset + self.rl_token_dim]
+            offset += self.rl_token_dim
+            parts.append(_layer_norm_no_params(self.z_proj(rl_token)))
+        if self.critic_use_robot_state:
+            robot_state = critic_state[:, offset : offset + self.robot_state_dim]
+            offset += self.robot_state_dim
+            parts.append(
+                torch.tanh(_layer_norm_no_params(self.state_proj(robot_state)))
+            )
+        if self.critic_use_ref_action:
+            ref_flat = critic_state[:, offset : offset + self.action_flat_dim]
+            offset += self.action_flat_dim
+            parts.append(torch.tanh(_layer_norm_no_params(self.ref_proj(ref_flat))))
+        if action.dim() == 3:
+            action = action.reshape(batch_size, -1)
+        parts.append(torch.tanh(_layer_norm_no_params(self.action_proj(action))))
+        return self.trunk(torch.cat(parts, dim=-1))
 
 
 class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
@@ -106,34 +402,132 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         if critic_use_robot_state is None:
             critic_use_robot_state = self.use_robot_state
         self.critic_use_robot_state = bool(critic_use_robot_state)
+        self.critic_use_ref_action = bool(
+            getattr(config, "critic_use_ref_action", True)
+        )
+        self.critic_use_rl_token = bool(getattr(config, "critic_use_rl_token", True))
+        self.actor_ref_action_mask_flag = bool(
+            getattr(config, "actor_ref_action_mask_flag", False)
+        )
+        self.critic_block_norm = bool(getattr(config, "critic_block_norm", False))
+        self.critic_action_encoder_dim = int(
+            getattr(config, "critic_action_encoder_dim", 0)
+        )
         actor_robot_state_dim = config.robot_state_dim if self.use_robot_state else 0
         critic_robot_state_dim = (
             config.robot_state_dim if self.critic_use_robot_state else 0
         )
-        actor_input_dim = config.rl_token_dim + actor_robot_state_dim + ref_action_dim
-        self.actor_head = ValueHead(
-            input_dim=actor_input_dim,
-            hidden_sizes=config.actor_hidden_dims,
-            output_dim=config.action_horizon * config.action_dim,
-            activation="relu",
-            bias_last=True,
+        critic_ref_action_dim = ref_action_dim if self.critic_use_ref_action else 0
+        actor_ref_mask_dim = 1 if self.actor_ref_action_mask_flag else 0
+        actor_input_dim = (
+            config.rl_token_dim
+            + actor_robot_state_dim
+            + ref_action_dim
+            + actor_ref_mask_dim
         )
-        critic_state_dim = config.rl_token_dim + critic_robot_state_dim + ref_action_dim
-        critic_input_dim = critic_state_dim + ref_action_dim  # state features + a_{1:C}
-        self.critic_head_1 = ValueHead(
-            input_dim=critic_input_dim,
-            hidden_sizes=config.critic_hidden_dims,
-            output_dim=1,
-            activation="relu",
-            bias_last=True,
+        actor_head_type = str(getattr(config, "actor_head_type", "mlp")).lower()
+        if actor_head_type == "mlp":
+            self.actor_head = ValueHead(
+                input_dim=actor_input_dim,
+                hidden_sizes=config.actor_hidden_dims,
+                output_dim=config.action_horizon * config.action_dim,
+                activation="relu",
+                bias_last=True,
+            )
+        elif actor_head_type == "transformer":
+            self.actor_head = TransformerActionHead(
+                rl_token_dim=config.rl_token_dim,
+                robot_state_dim=config.robot_state_dim,
+                use_robot_state=self.use_robot_state,
+                action_horizon=config.action_horizon,
+                action_dim=config.action_dim,
+                model_dim=config.actor_transformer_dim,
+                num_layers=config.actor_transformer_layers,
+                num_heads=config.actor_transformer_heads,
+                ffn_dim=config.actor_transformer_ffn_dim,
+                dropout=config.actor_transformer_dropout,
+            )
+        elif actor_head_type in {"openrlt", "openrlt_mlp"}:
+            self.actor_head = OpenRLTActorHead(
+                rl_token_dim=config.rl_token_dim,
+                robot_state_dim=config.robot_state_dim,
+                use_robot_state=self.use_robot_state,
+                action_horizon=config.action_horizon,
+                action_dim=config.action_dim,
+                z_proj_dim=config.openrlt_z_proj_dim,
+                state_proj_dim=config.openrlt_state_proj_dim,
+                action_proj_dim=config.openrlt_action_proj_dim,
+                hidden_dim=config.openrlt_hidden_dim,
+                num_layers=config.openrlt_num_layers,
+                has_ref_mask=self.actor_ref_action_mask_flag,
+            )
+        else:
+            raise ValueError(f"Unsupported actor_head_type: {actor_head_type}")
+        self.critic_head_type = str(getattr(config, "critic_head_type", "mlp")).lower()
+        critic_rl_token_dim = config.rl_token_dim if self.critic_use_rl_token else 0
+        critic_state_dim = (
+            critic_rl_token_dim + critic_robot_state_dim + critic_ref_action_dim
         )
-        self.critic_head_2 = ValueHead(
-            input_dim=critic_input_dim,
-            hidden_sizes=config.critic_hidden_dims,
-            output_dim=1,
-            activation="relu",
-            bias_last=True,
-        )
+        if critic_state_dim <= 0:
+            raise ValueError(
+                "critic state must include at least one of rl_token, robot_state, or ref_action"
+            )
+        if self.critic_head_type in {"openrlt", "openrlt_mlp"}:
+            self.critic_state_norm = None
+            self.critic_action_norm = None
+            self.critic_action_encoder = None
+            q_kwargs = {
+                "rl_token_dim": config.rl_token_dim,
+                "robot_state_dim": config.robot_state_dim,
+                "critic_use_rl_token": self.critic_use_rl_token,
+                "critic_use_robot_state": self.critic_use_robot_state,
+                "critic_use_ref_action": self.critic_use_ref_action,
+                "action_horizon": config.action_horizon,
+                "action_dim": config.action_dim,
+                "z_proj_dim": config.openrlt_z_proj_dim,
+                "state_proj_dim": config.openrlt_state_proj_dim,
+                "action_proj_dim": config.openrlt_action_proj_dim,
+                "hidden_dim": config.openrlt_hidden_dim,
+                "num_layers": config.openrlt_num_layers,
+            }
+            self.critic_head_1 = OpenRLTQHead(**q_kwargs)
+            self.critic_head_2 = OpenRLTQHead(**q_kwargs)
+        else:
+            critic_action_input_dim = (
+                self.critic_action_encoder_dim
+                if self.critic_action_encoder_dim > 0
+                else ref_action_dim
+            )
+            critic_input_dim = critic_state_dim + critic_action_input_dim
+            if self.critic_block_norm:
+                self.critic_state_norm = torch.nn.LayerNorm(critic_state_dim)
+                self.critic_action_norm = torch.nn.LayerNorm(ref_action_dim)
+            else:
+                self.critic_state_norm = None
+                self.critic_action_norm = None
+            self.critic_action_encoder = (
+                torch.nn.Sequential(
+                    torch.nn.Linear(ref_action_dim, self.critic_action_encoder_dim),
+                    torch.nn.ReLU(),
+                    torch.nn.LayerNorm(self.critic_action_encoder_dim),
+                )
+                if self.critic_action_encoder_dim > 0
+                else None
+            )
+            self.critic_head_1 = ValueHead(
+                input_dim=critic_input_dim,
+                hidden_sizes=config.critic_hidden_dims,
+                output_dim=1,
+                activation="relu",
+                bias_last=True,
+            )
+            self.critic_head_2 = ValueHead(
+                input_dim=critic_input_dim,
+                hidden_sizes=config.critic_hidden_dims,
+                output_dim=1,
+                activation="relu",
+                bias_last=True,
+            )
 
         # Target networks — worker calls soft_update_target_model to keep them in sync
         self.target_rl_token_autoencoder = copy.deepcopy(self.rl_token_autoencoder)
@@ -241,7 +635,12 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
 
     def _zero_init_critic_outputs(self):
         for head in (self.critic_head_1, self.critic_head_2):
-            last = head.mlp[-1]
+            if hasattr(head, "mlp"):
+                last = head.mlp[-1]
+            elif hasattr(head, "trunk") and hasattr(head.trunk, "net"):
+                last = head.trunk.net[-1]
+            else:
+                continue
             torch.nn.init.zeros_(last.weight)
             if last.bias is not None:
                 torch.nn.init.zeros_(last.bias)
@@ -326,14 +725,24 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
     # Target network methods (called by TD3Algorithm on unwrapped policy)
     # ------------------------------------------------------------------
 
-    def target_actor_forward(self, visual_feat, robot_state, ref_action, **kwargs):
+    def target_actor_forward(
+        self,
+        visual_feat,
+        robot_state,
+        ref_action,
+        ref_action_dropout_p: float = 0.0,
+        **kwargs,
+    ):
         # The TD3 worker calls this method on ``self.target_model``. That module's
         # ordinary heads already contain EMA target weights, so using the internal
         # target_* heads here would apply a second, stale target path.
         prefix_output = self._extract_prefix_from_visual_feat(visual_feat)
         features = self._select_prefix_features(prefix_output)
         rl_token = self.rl_token_autoencoder.encoder(features)
-        x = self._build_x(rl_token, robot_state, ref_action)
+        ref_action_for_actor, ref_action_mask = self._maybe_mask_ref_action(
+            ref_action, float(ref_action_dropout_p)
+        )
+        x = self._build_x(rl_token, robot_state, ref_action_for_actor, ref_action_mask)
         actions = self._decode_action(x, use_target=False)
         critic_rl_token = self._encode_critic_token(features, use_target=False)
         critic_state = self._build_critic_state(
@@ -344,6 +753,7 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             "rl_token": rl_token,
             "critic_rl_token": critic_rl_token,
             "critic_rl_state": critic_state,
+            "actor_ref_action_mask": ref_action_mask,
         }
 
     def target_critic_forward(self, rl_state: Tensor, action: Tensor, **kwargs):
@@ -400,7 +810,10 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         prefix_output = self._extract_prefix_from_visual_feat(visual_feat)
         features = self._select_prefix_features(prefix_output)
         rl_token = self._encode_actor_token(features, use_target=use_target)
-        x = self._build_x(rl_token, robot_state, ref_action)
+        ref_action_for_actor, ref_action_mask = self._maybe_mask_ref_action(
+            ref_action, float(ref_action_dropout_p)
+        )
+        x = self._build_x(rl_token, robot_state, ref_action_for_actor, ref_action_mask)
         actions = self._decode_action(x, use_target=use_target)
         critic_rl_token = self._encode_critic_token(features, use_target=use_target)
         critic_state = self._build_critic_state(
@@ -412,6 +825,7 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             "rl_token": rl_token,
             "critic_rl_token": critic_rl_token,
             "prefix_output": features,
+            "actor_ref_action_mask": ref_action_mask,
         }
         if compute_recon_loss:
             aux["recon_loss"] = self.compute_recon_loss(features, rl_token)
@@ -440,6 +854,20 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
     def _compute_q(self, rl_state: Tensor, action: Tensor, use_target: bool):
         if action.dim() == 3:
             action = action.reshape(action.shape[0], -1)
+        if self.critic_head_type in {"openrlt", "openrlt_mlp"}:
+            if use_target:
+                q1 = self.target_critic_head_1(rl_state, action)
+                q2 = self.target_critic_head_2(rl_state, action)
+            else:
+                q1 = self.critic_head_1(rl_state, action)
+                q2 = self.critic_head_2(rl_state, action)
+            return q1, q2
+        if self.critic_state_norm is not None:
+            rl_state = self.critic_state_norm(rl_state)
+        if self.critic_action_norm is not None:
+            action = self.critic_action_norm(action)
+        if self.critic_action_encoder is not None:
+            action = self.critic_action_encoder(action)
         critic_input = torch.cat([rl_state, action], dim=-1)
         if use_target:
             q1 = self.target_critic_head_1(critic_input)
@@ -450,7 +878,11 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         return q1, q2
 
     def _build_x(
-        self, rl_token: Tensor, robot_state: Tensor | None, ref_action: Tensor | None
+        self,
+        rl_token: Tensor,
+        robot_state: Tensor | None,
+        ref_action: Tensor | None,
+        ref_action_mask: Tensor | None = None,
     ) -> Tensor:
         parts = [rl_token]
         if self.use_robot_state and robot_state is not None:
@@ -465,25 +897,55 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
                     rl_token.shape[0], -1
                 )
             )
+        if self.actor_ref_action_mask_flag:
+            if ref_action_mask is None:
+                ref_action_mask = torch.ones(
+                    rl_token.shape[0],
+                    1,
+                    device=rl_token.device,
+                    dtype=rl_token.dtype,
+                )
+            parts.append(
+                ref_action_mask.to(
+                    device=rl_token.device, dtype=rl_token.dtype
+                ).reshape(rl_token.shape[0], -1)
+            )
         return torch.cat(parts, dim=-1)
 
     def _build_critic_state(
         self, rl_token: Tensor, robot_state: Tensor | None, ref_action: Tensor | None
     ) -> Tensor:
-        parts = [rl_token]
+        parts = []
+        if self.critic_use_rl_token:
+            parts.append(rl_token)
         if self.critic_use_robot_state and robot_state is not None:
             parts.append(
                 robot_state.to(device=rl_token.device, dtype=rl_token.dtype).reshape(
                     rl_token.shape[0], -1
                 )
             )
-        if ref_action is not None:
+        if self.critic_use_ref_action and ref_action is not None:
             parts.append(
                 ref_action.to(device=rl_token.device, dtype=rl_token.dtype).reshape(
                     rl_token.shape[0], -1
                 )
             )
         return torch.cat(parts, dim=-1)
+
+    def _maybe_mask_ref_action(self, ref_action: Tensor, dropout_p: float):
+        if ref_action is None:
+            return ref_action, None
+        batch_size = ref_action.shape[0]
+        keep_mask = torch.ones(
+            batch_size, 1, device=ref_action.device, dtype=ref_action.dtype
+        )
+        if self.training and dropout_p > 0.0:
+            keep_mask = (
+                torch.rand(batch_size, 1, device=ref_action.device) >= dropout_p
+            ).to(dtype=ref_action.dtype)
+            view_shape = [batch_size] + [1] * (ref_action.dim() - 1)
+            ref_action = ref_action * keep_mask.reshape(view_shape)
+        return ref_action, keep_mask
 
     def _select_prefix_features(self, prefix_output: Tensor) -> Tensor:
         if self.config.prefix_feature_type == "image_only":

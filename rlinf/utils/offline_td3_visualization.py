@@ -349,6 +349,241 @@ def plot_q_values(
     plt.close(fig)
 
 
+def _resize_uint8_image(image: np.ndarray, size: int) -> np.ndarray:
+    image = np.asarray(image)
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    if image.ndim == 2:
+        image = np.repeat(image[..., None], 3, axis=-1)
+    if image.shape[-1] == 1:
+        image = np.repeat(image, 3, axis=-1)
+    if image.shape[-1] > 3:
+        image = image[..., :3]
+    h, w = image.shape[:2]
+    y_idx = np.linspace(0, max(h - 1, 0), int(size)).astype(np.int64)
+    x_idx = np.linspace(0, max(w - 1, 0), int(size)).astype(np.int64)
+    return image[np.ix_(y_idx, x_idx)]
+
+
+def extract_three_view_images(
+    trajectory: dict,
+    chunk_indices: np.ndarray,
+    thumb_size: int = 64,
+) -> np.ndarray | None:
+    """Return [num_chunks, 3, thumb, thumb, 3] uint8 curr_obs images."""
+
+    curr_obs = trajectory.get("curr_obs", {})
+    if not isinstance(curr_obs, dict):
+        return None
+    main = curr_obs.get("main_images", None)
+    extra = curr_obs.get("extra_view_images", None)
+    if not torch.is_tensor(main) or not torch.is_tensor(extra):
+        return None
+    main_np = main.detach().cpu().numpy()
+    extra_np = extra.detach().cpu().numpy()
+    chunk_indices = np.asarray(chunk_indices, dtype=np.int64).reshape(-1)
+    views = []
+    for idx in chunk_indices:
+        if idx < 0 or idx >= main_np.shape[0] or idx >= extra_np.shape[0]:
+            continue
+        main_img = main_np[idx, 0]
+        extra_views = extra_np[idx, 0]
+        if extra_views.shape[0] < 2:
+            return None
+        views.append(
+            [
+                _resize_uint8_image(main_img, thumb_size),
+                _resize_uint8_image(extra_views[0], thumb_size),
+                _resize_uint8_image(extra_views[1], thumb_size),
+            ]
+        )
+    if len(views) != len(chunk_indices):
+        return None
+    return np.asarray(views, dtype=np.uint8)
+
+
+def load_key_segment_start_map(path: str | None) -> dict[str, int]:
+    if not path:
+        return {}
+    path_obj = Path(path)
+    if not path_obj.is_file():
+        return {}
+    with open(path_obj, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    out: dict[str, int] = {}
+    for item in payload.get("trajectories", []):
+        name = item.get("file", None)
+        if name is None:
+            continue
+        out[str(name)] = int(item.get("start_chunk", 0))
+    return out
+
+
+def plot_critic_timeline_with_images(
+    out_path: str,
+    chunk_indices: np.ndarray,
+    critic_q_data: np.ndarray,
+    critic_q_actor: np.ndarray,
+    mc_return: np.ndarray,
+    rewards: np.ndarray | None = None,
+    critic_mc_mse: np.ndarray | None = None,
+    images: np.ndarray | None = None,
+    train_mask: np.ndarray | None = None,
+    title: str | None = None,
+) -> None:
+    """Plot whole-trajectory critic values aligned with three camera views."""
+
+    chunk_indices = np.asarray(chunk_indices, dtype=np.int64).reshape(-1)
+    n = int(len(chunk_indices))
+    if n == 0:
+        return
+    x = np.arange(n, dtype=np.int64)
+    q_data = np.asarray(critic_q_data, dtype=np.float64).reshape(-1)[:n]
+    q_actor = np.asarray(critic_q_actor, dtype=np.float64).reshape(-1)[:n]
+    mc = np.asarray(mc_return, dtype=np.float64).reshape(-1)[:n]
+    rewards_arr = (
+        None
+        if rewards is None
+        else np.asarray(rewards, dtype=np.float64).reshape(-1)[:n]
+    )
+    loss_arr = (
+        np.square(q_data - mc)
+        if critic_mc_mse is None
+        else np.asarray(critic_mc_mse, dtype=np.float64).reshape(-1)[:n]
+    )
+    train_arr = (
+        None
+        if train_mask is None
+        else np.asarray(train_mask, dtype=bool).reshape(-1)[:n]
+    )
+
+    has_images = images is not None and len(images) == n
+    height_ratios = [2.4, 1.0] + ([0.9, 0.9, 0.9] if has_images else [])
+    width = min(max(12.0, 0.42 * n), 42.0)
+    fig, axes = plt.subplots(
+        len(height_ratios),
+        1,
+        figsize=(width, 2.0 + sum(height_ratios) * 1.15),
+        dpi=150,
+        sharex=True,
+        gridspec_kw={"height_ratios": height_ratios},
+    )
+    axes = np.asarray(axes).reshape(-1)
+
+    def shade_train_regions(ax):
+        if train_arr is None or not train_arr.any():
+            return
+        active = np.flatnonzero(train_arr)
+        start = int(active[0])
+        prev = int(active[0])
+        for idx in active[1:]:
+            idx = int(idx)
+            if idx != prev + 1:
+                ax.axvspan(start - 0.5, prev + 0.5, color="#f2c94c", alpha=0.18)
+                start = idx
+            prev = idx
+        ax.axvspan(start - 0.5, prev + 0.5, color="#f2c94c", alpha=0.18)
+
+    ax_q = axes[0]
+    shade_train_regions(ax_q)
+    ax_q.plot(x, q_data, color="#222222", linewidth=1.7, label="Q(s, data action)")
+    ax_q.plot(
+        x,
+        q_actor,
+        color="#2a6fbb",
+        linewidth=1.4,
+        linestyle="--",
+        label="Q(s, actor action)",
+    )
+    ax_q.plot(
+        x,
+        mc,
+        color="#2f8f46",
+        linewidth=1.5,
+        linestyle=":",
+        label="MC return",
+    )
+    if rewards_arr is not None and np.any(rewards_arr > 0):
+        reward_x = x[rewards_arr > 0]
+        ax_q.scatter(
+            reward_x,
+            mc[rewards_arr > 0],
+            color="#c0392b",
+            marker="*",
+            s=95,
+            zorder=5,
+            label="reward > 0",
+        )
+    ax_q.set_ylabel("Q / return")
+    ax_q.grid(True, alpha=0.25)
+    ax_q.legend(loc="best", ncol=4)
+    ax_q.set_title(title or "Critic Q timeline")
+
+    ax_loss = axes[1]
+    shade_train_regions(ax_loss)
+    ax_loss.plot(
+        x,
+        loss_arr,
+        color="#b3472f",
+        linewidth=1.4,
+        marker="o",
+        markersize=2.5,
+        label="(Q_data - MC return)^2",
+    )
+    ax_loss.set_ylabel("Q-MC MSE")
+    ax_loss.grid(True, alpha=0.25)
+    ax_loss.legend(loc="best")
+    if n <= 100:
+        finite_loss = loss_arr[np.isfinite(loss_arr)]
+        y_span = (
+            max(float(finite_loss.max() - finite_loss.min()), 1e-8)
+            if finite_loss.size
+            else 1.0
+        )
+        for pos, value in enumerate(loss_arr):
+            if not np.isfinite(value):
+                continue
+            ax_loss.text(
+                pos,
+                float(value) + 0.025 * y_span,
+                f"{float(value):.1e}",
+                fontsize=4.5,
+                rotation=90,
+                ha="center",
+                va="bottom",
+                color="#7a2f20",
+            )
+
+    if has_images:
+        view_names = ["main", "extra0", "extra1"]
+        for view_idx in range(3):
+            ax_img = axes[2 + view_idx]
+            strip = np.concatenate([images[i, view_idx] for i in range(n)], axis=1)
+            ax_img.imshow(strip, aspect="auto", extent=(-0.5, n - 0.5, 0, 1))
+            ax_img.set_yticks([])
+            ax_img.set_ylabel(
+                view_names[view_idx], rotation=0, labelpad=28, va="center"
+            )
+            for pos in range(n + 1):
+                ax_img.axvline(pos - 0.5, color="white", linewidth=0.25, alpha=0.45)
+            if train_arr is not None and train_arr.any():
+                for pos, trained in enumerate(train_arr):
+                    if trained:
+                        ax_img.axvspan(
+                            pos - 0.5, pos + 0.5, color="#f2c94c", alpha=0.12
+                        )
+
+    tick_stride = max(1, int(math.ceil(n / 18)))
+    tick_positions = x[::tick_stride]
+    tick_labels = [str(int(v)) for v in chunk_indices[::tick_stride]]
+    axes[-1].set_xticks(tick_positions)
+    axes[-1].set_xticklabels(tick_labels, rotation=0)
+    axes[-1].set_xlabel("trajectory chunk index")
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _set_equal_3d(ax, arrays: list[np.ndarray]) -> None:
     pts = np.concatenate(arrays, axis=0)
     centers = pts.mean(axis=0)
@@ -1275,13 +1510,16 @@ def evaluate_validation_trajectory(
         )
     viz_cfg = worker.cfg.runner.get("offline_validation_visualization", {})
     index_mode = str(viz_cfg.get("index_mode", "terminal_window"))
-    chunk_indices = make_validation_indices(
-        length,
-        chunk_count,
-        rewards=rewards_all,
-        terminations=terminations_all,
-        mode=index_mode,
-    )
+    if bool(viz_cfg.get("whole_trajectory", False)):
+        chunk_indices = list(range(length))
+    else:
+        chunk_indices = make_validation_indices(
+            length,
+            chunk_count,
+            rewards=rewards_all,
+            terminations=terminations_all,
+            mode=index_mode,
+        )
     mc_returns = compute_chunk_mc_returns(
         rewards_all,
         terminations_all,
@@ -1378,6 +1616,9 @@ def evaluate_validation_trajectory(
         "action_mse": mse,
         "sample_rewards": rewards.detach().float().cpu().numpy(),
         "sample_terminations": terminations.detach().float().cpu().numpy(),
+        "critic_mc_mse": np.square(
+            critic_q_data - mc_returns[np.asarray(chunk_indices, dtype=np.int64)]
+        ),
     }
 
 
@@ -1403,6 +1644,7 @@ __all__ = [
     "evaluate_validation_trajectory",
     "actions_to_absolute_joint_targets",
     "load_action_norm_stats",
+    "load_key_segment_start_map",
     "load_validation_trajectories",
     "plot_action_mse_heatmaps",
     "plot_boundary_trajectory_3d",
@@ -1410,6 +1652,7 @@ __all__ = [
     "plot_action_chunk_triplet_segments_3d",
     "plot_pt_gt_reconstruction_segments_3d",
     "plot_pt_state_trajectory_3d",
+    "plot_critic_timeline_with_images",
     "plot_q_values",
     "plot_trajectory_3d",
     "plot_trajectory_3d_with_state",
