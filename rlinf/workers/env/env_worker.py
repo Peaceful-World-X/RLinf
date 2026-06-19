@@ -568,6 +568,7 @@ class EnvWorker(Worker):
         ref_env_action = ref_env_action.detach().cpu().contiguous()
         rollout_result.actions = ref_env_action
         forward_inputs["action"] = ref_action
+        forward_inputs["model_action"] = ref_action
         forward_inputs["executed_action"] = ref_action
         forward_inputs["env_action_absolute"] = ref_env_action
         forward_inputs["executed_env_action_absolute"] = ref_env_action

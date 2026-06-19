@@ -667,14 +667,26 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         robot_state = obs.get("states", obs.get("robot_state", None))
         if robot_state is not None and not isinstance(robot_state, torch.Tensor):
             robot_state = torch.tensor(robot_state, dtype=torch.float32)
+        actor_robot_state = robot_state
+        if actor_robot_state is not None:
+            actor_robot_state = actor_robot_state.to(
+                device=rl_token.device, dtype=rl_token.dtype
+            )
         # Get VLA reference action ã = πvla(s) for actor conditioning and BC loss
-        ref_action = (
+        ref_env_action = (
             self._get_vla_ref_action(obs)
             if hasattr(self, "_get_vla_ref_action")
             else None
         )
-        if ref_action is not None:
-            ref_action = self._absolute_to_training_action(ref_action, robot_state)
+        if ref_env_action is not None:
+            ref_env_action = ref_env_action.to(
+                device=rl_token.device, dtype=rl_token.dtype
+            )
+        if robot_state is not None:
+            robot_state = robot_state.to(device=rl_token.device, dtype=rl_token.dtype)
+        ref_action = None
+        if ref_env_action is not None:
+            ref_action = self._absolute_to_training_action(ref_env_action, robot_state)
         if ref_action is None:
             ref_action_dim = self.config.action_horizon * self.config.action_dim
             ref_action = torch.zeros(
@@ -683,10 +695,16 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
                 device=rl_token.device,
                 dtype=rl_token.dtype,
             )
-        x = self._build_x(rl_token, robot_state, ref_action)
+        x = self._build_x(rl_token, actor_robot_state, ref_action)
         training_actions = self._decode_action(x, use_target=False)
         env_actions = self._training_action_to_absolute(training_actions, robot_state)
         flat_actions = training_actions.reshape(training_actions.shape[0], -1)
+        ref_for_mse = ref_action.reshape_as(training_actions)
+        actor_ref_mse = torch.mean(
+            (training_actions - ref_for_mse) ** 2,
+            dim=tuple(range(1, training_actions.dim())),
+            keepdim=False,
+        ).reshape(training_actions.shape[0], 1)
         zero_scores = training_actions.new_zeros(*training_actions.shape[:2], 1)
         result = {
             "prev_logprobs": zero_scores,
@@ -697,8 +715,19 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
                 "env_action_absolute": env_actions.reshape(
                     env_actions.shape[0], -1
                 ).cpu(),
+                "ref_env_action_absolute": (
+                    ref_env_action.reshape(ref_env_action.shape[0], -1).cpu()
+                    if ref_env_action is not None
+                    else None
+                ),
                 "visual_latent": image_features.cpu(),
                 "ref_action": ref_action.reshape(ref_action.shape[0], -1).cpu(),
+                "actor_ref_mse": actor_ref_mse.cpu(),
+                "rollout_control_source": torch.ones(
+                    training_actions.shape[0],
+                    1,
+                    dtype=torch.long,
+                ),
             },
         }
         return env_actions, result
