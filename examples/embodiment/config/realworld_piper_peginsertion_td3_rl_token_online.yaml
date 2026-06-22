@@ -1,4 +1,3 @@
-# Piper 双臂 + RLToken TD3 在线训练：VLA warm start / gated actor takeover / PageDown human intervention.
 #
 # 运行前先把 runner.resume_dir 指到离线 actor-critic checkpoint 的 global_step_xxx 目录。
 # 示例：
@@ -45,7 +44,7 @@ runner:
   reset_global_step_on_resume: True
   log_interval: 20
   weight_sync_interval: 10
-  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/train_logs/dense_lerobot_last20_direct_bc_1000_clean_20260618_060531/dense_lerobot_last20_direct_bc_1000_clean_20260618_060531/checkpoints/global_step_1000"
+  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/checkpoints/online_resume_from_offline1500_on_online122/global_step_1500"
   ckpt_path: null
 
 algorithm:
@@ -65,7 +64,7 @@ algorithm:
     min_length: 1
   adv_type: null
 
-  gamma: 0.89
+  gamma: 0.94
   n_step: 10
   tau: 0.05
   update_epoch: 1
@@ -77,7 +76,7 @@ algorithm:
   critic_target_action_source: "actor"
   behavior_action_clip: null
   bc_coef: 50.0
-  actor_q_coef: 1.0
+  actor_q_coef: 0.1
   critic_td_coef: 1.0
   critic_mc_return_coef: 0.0
   critic_train_rl_token_encoder: False
@@ -88,15 +87,41 @@ algorithm:
   eval_rollout_epoch: 1
   stage_actor_bc_only: False
   stage_freeze_actor: False
+  tail_curriculum:
+    enabled: true
+    start_window: 20
+    end_window: 20
+    hold_steps: 0
+    warmup_steps: 1
 
   replay_buffer:
     enable_cache: True
-    cache_size: 200
+    cache_size: 10
     min_buffer_size: 2
     sample_window_size: 10
     auto_save: True
+    delete_last_on_key: True
+    delete_last_key: "d"
     trajectory_format: "pt"
-    prefetch_size: 2
+    prefetch_size: 1
+    save_executor_workers: 2
+    checkpoint_executor_workers: 2
+    preload_checkpoint_path: /home/focal/shared_disk/users/kwj/RLinf/logs/20260620-14:59:15-realworld_piper_peginsertion_td3_rl_token_online/replay_buffer/rank_0
+    cache_obs_keys:
+      - visual_latent
+      - states
+      - robot_state
+      - ref_action
+    cache_forward_input_keys:
+      - action
+      - executed_action
+      - model_action
+      - ref_action
+      - mc_return
+      - tcp_distance_to_target
+    sample_forward_input_filter:
+      key: tcp_distance_to_target
+      max_value: 0.10
 
 env:
   group_name: "EnvGroup"
@@ -127,6 +152,11 @@ env:
         - /camera_r/color/image_raw
       obs_img_resolution: [224, 224]
       sliding_window_action_buffer: true
+      smooth_action_chunk: true
+      use_tcp_reset_pose_pool: true
+      tcp_reset_pose_pool_path: "/home/focal/shared_disk/users/kwj/RLinf/assets/piper_tcp_reset_poses_10cm.json"
+      tcp_reset_random_seed: 20260620
+      tcp_reset_interpolate_steps: 20
 
   eval:
     total_num_envs: 1
@@ -154,8 +184,12 @@ rollout:
   collect_transitions: true
   collect_prev_infos: false
   warm_up_chunk_steps: 0
+  vla_warmup_chunk_steps: 0
   online_control:
     save_substep_obs: true
+    print_status: true
+    print_status_actor_only: true
+    print_status_interval: 1
   model:
     model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
@@ -178,29 +212,50 @@ actor:
     critic_separate_rl_token_encoder: ${algorithm.critic_separate_rl_token_encoder}
     recon_loss_coef: 0.0
     actor_output_bound: 1.2
-    actor_head_type: "mlp"
+    actor_smooth_loss_coef: 10.0
+    actor_head_type: "openrlt_mlp"
+    critic_head_type: "openrlt_mlp"
+    openrlt_z_proj_dim: 256
+    openrlt_state_proj_dim: 64
+    openrlt_action_proj_dim: 256
+    openrlt_hidden_dim: 256
+    openrlt_num_layers: 2
     use_robot_state: True
     critic_use_robot_state: True
     critic_use_ref_action: False
+    actor_residual_ref: True
+    actor_residual_scale: 1.0
     action_space: "normalized_delta"
     action_norm_stats_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert/norm_stats.json"
     action_norm_std_floor: 1.0
-    action_dim: 14
+    # Actor/critic train only the right arm; rollout still executes full 14D
+    # absolute Piper actions by keeping the left arm on the VLA reference action.
+    action_dim: 6
+    robot_state_dim: 6
+    env_action_dim: 14
+    controlled_action_indices: [7, 8, 9, 10, 11, 12]
     num_action_chunks: 10
     num_steps: 5
     rollout_control_mode: "gate"
-    rollout_gate_mse_threshold: 5.0e-4
-    rollout_gate_disable_mse_threshold: 3.0e-4
+    rollout_gate_mse_threshold: 9.0e-3
+    rollout_gate_disable_mse_threshold: 1.2e-2
     rollout_gate_stable_chunks: 3
     rollout_gate_warmup_chunks: 3
-    rollout_status_interval: 1
+    rollout_gate_require_gripper_closed: false
+    rollout_gate_gripper_state_index: 13
+    rollout_gate_gripper_closed_threshold: 0.035
+    rollout_gate_gripper_stable_chunks: 2
+    rollout_gate_tcp_target: [0.2818035953, 0.0385303870, 0.0602531905]
+    rollout_gate_tcp_radius: 0.10
+    rollout_gate_tcp_base_offset: [0.0, -0.22, 0.0]
+    rollout_gate_tcp_urdf_path: "/home/focal/shared_disk/users/kwj/RLinf/assets/piper_local_assets/piper.urdf"
     openpi:
       config_name: "pi05_aloha_cubeinsert"
       num_images_in_input: 3
       noise_level: 0.3
       train_expert_only: True
       action_chunk: ${actor.model.num_action_chunks}
-      action_env_dim: ${actor.model.action_dim}
+      action_env_dim: ${actor.model.env_action_dim}
       num_steps: ${actor.model.num_steps}
       detach_critic_input: null
 

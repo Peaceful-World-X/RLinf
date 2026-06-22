@@ -1,4 +1,4 @@
-# Copyright 2026 The RLinf Authors.
+# Copyright 2026 The GIGA Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 import asyncio
 import queue
 import threading
+import traceback
 
 import torch
 
@@ -47,9 +48,45 @@ class AsyncEmbodiedTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
         recv_num = self._component_placement.get_world_size("actor")
         split_num = compute_split_num(send_num, recv_num)
         while not self.should_stop:
+            recv_list = []
             for _ in range(split_num):
-                trajectory = input_channel.get()
-                self._recv_queue.put(trajectory)
+                recv_list.append(input_channel.get())
+            try:
+                self._ingest_received_trajectories(recv_list)
+            except Exception:
+                print(
+                    "[online-actor] failed to ingest rollout trajectories:\n"
+                    f"{traceback.format_exc()}",
+                    flush=True,
+                )
+                for trajectory in recv_list:
+                    self._recv_queue.put(trajectory)
+
+    def _ingest_received_trajectories(self, recv_list):
+        if not recv_list:
+            return
+
+        if getattr(self, "_replay_buffer_add_lock", None) is None:
+            self._replay_buffer_add_lock = threading.RLock()
+
+        with self._replay_buffer_add_lock:
+            self.replay_buffer.add_trajectories(recv_list)
+            self._maybe_delete_last_replay_trajectory_from_keyboard()
+            if self.demo_buffer is not None:
+                intervene_list = []
+                for traj in recv_list:
+                    trajs = traj.extract_intervene_traj()
+                    if trajs is not None:
+                        intervene_list.extend(trajs)
+                if intervene_list:
+                    self.demo_buffer.add_trajectories(intervene_list)
+        print(
+            "[online-actor] ingested "
+            f"{len(recv_list)} trajectories: "
+            f"buffer_size={len(self.replay_buffer)}, "
+            f"total_samples={int(getattr(self.replay_buffer, 'total_samples', 0))}",
+            flush=True,
+        )
 
     def _drain_received_trajectories(self, max_trajectories=None):
         if getattr(self, "_recv_queue", None) is None:
@@ -66,18 +103,11 @@ class AsyncEmbodiedTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
                 break
         if not recv_list:
             return
-        self.replay_buffer.add_trajectories(recv_list)
-        if self.demo_buffer is not None:
-            intervene_list = []
-            for traj in recv_list:
-                trajs = traj.extract_intervene_traj()
-                if trajs is not None:
-                    intervene_list.extend(trajs)
-            if intervene_list:
-                self.demo_buffer.add_trajectories(intervene_list)
+        self._ingest_received_trajectories(recv_list)
 
     async def _wait_for_replay_buffer_ready(self, min_buffer_size):
         while True:
+            self._maybe_delete_last_replay_trajectory_from_keyboard()
             self._drain_received_trajectories(
                 max_trajectories=self.cfg.actor.get("recv_drain_max_trajectories", 256)
             )
@@ -110,6 +140,10 @@ class AsyncEmbodiedTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
         metrics = {}
         for _ in range(self.cfg.algorithm.get("update_epoch", 1)):
             await asyncio.sleep(0)
+            self._maybe_delete_last_replay_trajectory_from_keyboard()
+            self._drain_received_trajectories(
+                max_trajectories=self.cfg.actor.get("recv_drain_max_trajectories", 256)
+            )
             append_to_dict(metrics, self.update_one_epoch())
             self.update_step += 1
 

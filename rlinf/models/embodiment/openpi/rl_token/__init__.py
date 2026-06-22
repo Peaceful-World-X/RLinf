@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The GIGA Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -60,6 +60,12 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             actor_transformer_ffn_dim=cfg.get("actor_transformer_ffn_dim", 1024),
             actor_transformer_dropout=cfg.get("actor_transformer_dropout", 0.1),
             critic_hidden_dims=tuple(cfg.get("critic_hidden_dims", [512, 256])),
+            critic_head_type=cfg.get("critic_head_type", "mlp"),
+            openrlt_z_proj_dim=cfg.get("openrlt_z_proj_dim", 256),
+            openrlt_state_proj_dim=cfg.get("openrlt_state_proj_dim", 64),
+            openrlt_action_proj_dim=cfg.get("openrlt_action_proj_dim", 256),
+            openrlt_hidden_dim=cfg.get("openrlt_hidden_dim", 256),
+            openrlt_num_layers=cfg.get("openrlt_num_layers", 2),
             action_horizon=cfg.get("action_horizon", cfg.get("num_action_chunks", 10)),
             action_dim=cfg.get("action_dim", 7),
             recon_loss_coef=cfg.get("recon_loss_coef", 0.1),
@@ -72,11 +78,15 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             critic_use_rl_token=cfg.get("critic_use_rl_token", True),
             actor_ref_action_dropout_p=cfg.get("actor_ref_action_dropout_p", 0.0),
             actor_ref_action_mask_flag=cfg.get("actor_ref_action_mask_flag", False),
+            actor_residual_ref=cfg.get("actor_residual_ref", False),
+            actor_residual_scale=cfg.get("actor_residual_scale", 1.0),
             critic_block_norm=cfg.get("critic_block_norm", False),
             critic_action_encoder_dim=cfg.get("critic_action_encoder_dim", 0),
             action_space=cfg.get("action_space", "absolute"),
             action_norm_stats_path=cfg.get("action_norm_stats_path", None),
             action_norm_std_floor=cfg.get("action_norm_std_floor", 1e-6),
+            env_action_dim=cfg.get("env_action_dim", cfg.get("action_dim", 7)),
+            controlled_action_indices=cfg.get("controlled_action_indices", None),
             critic_train_rl_token_encoder=cfg.get(
                 "critic_train_rl_token_encoder", False
             ),
@@ -104,6 +114,12 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             actor_transformer_ffn_dim=cfg.get("actor_transformer_ffn_dim", 1024),
             actor_transformer_dropout=cfg.get("actor_transformer_dropout", 0.1),
             critic_hidden_dims=tuple(cfg.get("critic_hidden_dims", [512, 256])),
+            critic_head_type=cfg.get("critic_head_type", "mlp"),
+            openrlt_z_proj_dim=cfg.get("openrlt_z_proj_dim", 256),
+            openrlt_state_proj_dim=cfg.get("openrlt_state_proj_dim", 64),
+            openrlt_action_proj_dim=cfg.get("openrlt_action_proj_dim", 256),
+            openrlt_hidden_dim=cfg.get("openrlt_hidden_dim", 256),
+            openrlt_num_layers=cfg.get("openrlt_num_layers", 2),
             action_horizon=cfg.get("action_horizon", cfg.get("num_action_chunks", 10)),
             action_dim=cfg.get("action_dim", 7),
             recon_loss_coef=cfg.get("recon_loss_coef", 0.1),
@@ -116,11 +132,15 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             critic_use_rl_token=cfg.get("critic_use_rl_token", True),
             actor_ref_action_dropout_p=cfg.get("actor_ref_action_dropout_p", 0.0),
             actor_ref_action_mask_flag=cfg.get("actor_ref_action_mask_flag", False),
+            actor_residual_ref=cfg.get("actor_residual_ref", False),
+            actor_residual_scale=cfg.get("actor_residual_scale", 1.0),
             critic_block_norm=cfg.get("critic_block_norm", False),
             critic_action_encoder_dim=cfg.get("critic_action_encoder_dim", 0),
             action_space=cfg.get("action_space", "absolute"),
             action_norm_stats_path=cfg.get("action_norm_stats_path", None),
             action_norm_std_floor=cfg.get("action_norm_std_floor", 1e-6),
+            env_action_dim=cfg.get("env_action_dim", cfg.get("action_dim", 7)),
+            controlled_action_indices=cfg.get("controlled_action_indices", None),
             critic_train_rl_token_encoder=cfg.get(
                 "critic_train_rl_token_encoder", False
             ),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2026 The RLinf Authors.
+# Copyright 2026 The GIGA Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OpenPI-RLT style offline TD3+BC for Piper right-arm last20 chunks."""
+"""OpenPI-RLT style offline TD3+BC for Piper right-arm TCP-local chunks.
+
+The actor/critic train only the six right-arm joints. The right gripper is kept
+from the reference/VLA action during rollout and from the recorded PT action for
+visualization/FK reconstruction.
+"""
 
 from __future__ import annotations
 
@@ -40,8 +45,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from rlinf.utils.offline_td3_visualization import SimpleUrdfKinematics  # noqa: E402
 
-RIGHT_ARM = slice(7, 14)
-RIGHT_DELTA_MASK = np.array([True, True, True, True, True, True, False])
+RIGHT_ARM_FULL = slice(7, 14)
+RIGHT_ARM_JOINTS = slice(7, 13)
+RIGHT_LOCAL_JOINTS = slice(0, 6)
+RIGHT_BASE_OFFSET = np.array([0.0, -0.22, 0.0], dtype=np.float64)
+DEFAULT_TCP_TARGET = (0.2818035953, 0.0385303870, 0.0602531905)
 
 
 @dataclass
@@ -53,17 +61,23 @@ class TrainConfig:
     urdf_path: str
     max_steps: int = 5000
     batch_size: int = 256
-    gamma: float = 0.89
+    gamma: float = 0.94
     n_step: int = 10
     actor_lr: float = 1e-4
     critic_lr: float = 1e-4
-    bc_weight: float = 10.0
-    q_weight: float = 0.1
+    bc_weight: float = 20.0
+    q_weight: float = 0.0
     delta_weight: float = 10.0
+    joint_abs_weight: float = 100.0
+    tcp_weight: float = 5000.0
+    tcp_boundary_weight: float = 1000.0
+    q_warmup_steps: int = 100000000
     tau: float = 0.005
     actor_update_period: int = 2
-    fixed_std: float = 0.002
-    reference_dropout_prob: float = 0.5
+    fixed_std: float = 0.0
+    reference_dropout_prob: float = 0.0
+    actor_residual_ref: bool = True
+    actor_residual_scale: float = 1.0
     save_interval: int = 50
     log_interval: int = 10
     patience: int = 1200
@@ -72,11 +86,14 @@ class TrainConfig:
     gpu: int = 0
     viz_per_class: int = 3
     z_dim: int = 2048
-    proprio_dim: int = 7
+    proprio_dim: int = 6
     chunk_len: int = 10
-    action_dim: int = 7
+    action_dim: int = 6
     hidden_dim: int = 256
     num_layers: int = 2
+    tcp_target: tuple[float, float, float] | list[float] | None = DEFAULT_TCP_TARGET
+    tcp_radius: float = 0.10
+    tcp_filter_mode: str = "chunk_center"
 
 
 def layer_norm_no_params(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -109,12 +126,19 @@ class ChunkActor(nn.Module):
         self.cfg = cfg
         flat_action_dim = cfg.chunk_len * cfg.action_dim
         self.z_proj = nn.Linear(cfg.z_dim, 256)
-        self.proprio_proj = nn.Linear(cfg.proprio_dim, 64)
+        self.state_proj = nn.Linear(cfg.proprio_dim, 64)
         self.ref_proj = nn.Linear(flat_action_dim, 256)
         self.trunk = MLP(
             256 + 64 + 256, cfg.hidden_dim, cfg.num_layers, flat_action_dim
         )
         self.fixed_std = float(cfg.fixed_std)
+        self.residual_ref = bool(getattr(cfg, "actor_residual_ref", True))
+        self.residual_scale = float(getattr(cfg, "actor_residual_scale", 1.0))
+        if self.residual_ref:
+            last = self.trunk.net[-1]
+            if isinstance(last, nn.Linear):
+                nn.init.zeros_(last.weight)
+                nn.init.zeros_(last.bias)
 
     def encode(
         self,
@@ -125,7 +149,7 @@ class ChunkActor(nn.Module):
         bsz = z.shape[0]
         ref_flat = ref_chunk.reshape(bsz, -1)
         z_feat = layer_norm_no_params(self.z_proj(z))
-        proprio_feat = torch.tanh(layer_norm_no_params(self.proprio_proj(proprio)))
+        proprio_feat = torch.tanh(layer_norm_no_params(self.state_proj(proprio)))
         ref_feat = torch.tanh(layer_norm_no_params(self.ref_proj(ref_flat)))
         return torch.cat([z_feat, proprio_feat, ref_feat], dim=-1)
 
@@ -137,7 +161,10 @@ class ChunkActor(nn.Module):
     ) -> torch.Tensor:
         bsz = z.shape[0]
         out = self.trunk(self.encode(z, proprio, ref_chunk))
-        return out.reshape(bsz, self.cfg.chunk_len, self.cfg.action_dim)
+        out = out.reshape(bsz, self.cfg.chunk_len, self.cfg.action_dim)
+        if self.residual_ref:
+            return ref_chunk + self.residual_scale * out
+        return out
 
     def sample(
         self,
@@ -157,7 +184,7 @@ class QNetwork(nn.Module):
         super().__init__()
         flat_action_dim = cfg.chunk_len * cfg.action_dim
         self.z_proj = nn.Linear(cfg.z_dim, 256)
-        self.proprio_proj = nn.Linear(cfg.proprio_dim, 64)
+        self.state_proj = nn.Linear(cfg.proprio_dim, 64)
         self.action_proj = nn.Linear(flat_action_dim, 256)
         self.trunk = MLP(256 + 64 + 256, cfg.hidden_dim, cfg.num_layers, 1)
 
@@ -167,7 +194,7 @@ class QNetwork(nn.Module):
         bsz = z.shape[0]
         action_flat = action_chunk.reshape(bsz, -1)
         z_feat = layer_norm_no_params(self.z_proj(z))
-        proprio_feat = torch.tanh(layer_norm_no_params(self.proprio_proj(proprio)))
+        proprio_feat = torch.tanh(layer_norm_no_params(self.state_proj(proprio)))
         action_feat = torch.tanh(layer_norm_no_params(self.action_proj(action_flat)))
         return self.trunk(torch.cat([z_feat, proprio_feat, action_feat], dim=-1))
 
@@ -200,24 +227,215 @@ def load_norm_stats(path: str, std_floor: float = 1.0) -> tuple[np.ndarray, np.n
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
     stats = payload.get("norm_stats", payload)["actions"]
-    mean = np.asarray(stats["mean"][:14], dtype=np.float64)[RIGHT_ARM]
-    std = np.asarray(stats["std"][:14], dtype=np.float64)[RIGHT_ARM]
+    mean = np.asarray(stats["mean"][:14], dtype=np.float64)[RIGHT_ARM_JOINTS]
+    std = np.asarray(stats["std"][:14], dtype=np.float64)[RIGHT_ARM_JOINTS]
     std = np.where(np.abs(std) < float(std_floor), 1.0, std)
     return mean, std
 
 
-def norm_delta_to_abs_right(
+def norm_delta_to_abs_right_joints(
     norm_action: np.ndarray,
-    right_state: np.ndarray,
+    right_state_full: np.ndarray,
     mean: np.ndarray,
     std: np.ndarray,
+    gripper_chunk: np.ndarray | None = None,
 ) -> np.ndarray:
-    action = np.asarray(norm_action, dtype=np.float64).reshape(-1, 7)
-    state = np.asarray(right_state, dtype=np.float64).reshape(7)
-    delta = action * (std.reshape(1, 7) + 1e-6) + mean.reshape(1, 7)
-    absolute = delta.copy()
-    absolute[:, RIGHT_DELTA_MASK] += state[RIGHT_DELTA_MASK]
-    return absolute
+    action = np.asarray(norm_action, dtype=np.float64).reshape(-1, 6)
+    state = np.asarray(right_state_full, dtype=np.float64).reshape(7)
+    delta = action * (std.reshape(1, 6) + 1e-6) + mean.reshape(1, 6)
+    joints = delta + state[:6]
+    if gripper_chunk is None:
+        gripper = np.full((joints.shape[0], 1), state[6], dtype=np.float64)
+    else:
+        gripper = np.asarray(gripper_chunk, dtype=np.float64).reshape(-1, 1)
+    return np.concatenate([joints, gripper], axis=-1)
+
+
+def norm_delta_to_abs_joints_tensor(
+    norm_action: torch.Tensor,
+    state: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
+    delta = norm_action * (std.reshape(1, 1, -1) + 1e-6) + mean.reshape(1, 1, -1)
+    return delta + state[:, None, :6]
+
+
+def _rot_x(angle: torch.Tensor) -> torch.Tensor:
+    c = torch.cos(angle)
+    s = torch.sin(angle)
+    z = torch.zeros_like(angle)
+    o = torch.ones_like(angle)
+    return torch.stack(
+        [
+            torch.stack([o, z, z], dim=-1),
+            torch.stack([z, c, -s], dim=-1),
+            torch.stack([z, s, c], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
+def _rot_y(angle: torch.Tensor) -> torch.Tensor:
+    c = torch.cos(angle)
+    s = torch.sin(angle)
+    z = torch.zeros_like(angle)
+    o = torch.ones_like(angle)
+    return torch.stack(
+        [
+            torch.stack([c, z, s], dim=-1),
+            torch.stack([z, o, z], dim=-1),
+            torch.stack([-s, z, c], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
+def _rot_z(angle: torch.Tensor) -> torch.Tensor:
+    c = torch.cos(angle)
+    s = torch.sin(angle)
+    z = torch.zeros_like(angle)
+    o = torch.ones_like(angle)
+    return torch.stack(
+        [
+            torch.stack([c, -s, z], dim=-1),
+            torch.stack([s, c, z], dim=-1),
+            torch.stack([z, z, o], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
+def _axis_angle(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
+    axis = axis.to(device=angle.device, dtype=angle.dtype)
+    axis = axis / torch.clamp(torch.linalg.norm(axis), min=1e-12)
+    x, y, z = axis[0], axis[1], axis[2]
+    c = torch.cos(angle)
+    s = torch.sin(angle)
+    one_c = 1.0 - c
+    return torch.stack(
+        [
+            torch.stack(
+                [c + x * x * one_c, x * y * one_c - z * s, x * z * one_c + y * s],
+                dim=-1,
+            ),
+            torch.stack(
+                [y * x * one_c + z * s, c + y * y * one_c, y * z * one_c - x * s],
+                dim=-1,
+            ),
+            torch.stack(
+                [z * x * one_c - y * s, z * y * one_c + x * s, c + z * z * one_c],
+                dim=-1,
+            ),
+        ],
+        dim=-2,
+    )
+
+
+class DifferentiablePiperFK(nn.Module):
+    def __init__(
+        self,
+        urdf_path: str,
+        base_link: str = "base_link",
+        tip_link: str = "gripper",
+        base_offset: np.ndarray = RIGHT_BASE_OFFSET,
+    ):
+        super().__init__()
+        kin = SimpleUrdfKinematics(urdf_path, base_link=base_link)
+        joints = kin.chain_to(tip_link)
+        xyz = []
+        rpy = []
+        axis = []
+        is_movable = []
+        for joint in joints:
+            xyz.append(joint.xyz)
+            rpy.append(joint.rpy)
+            axis.append(joint.axis)
+            is_movable.append(
+                joint.joint_type in {"revolute", "continuous", "prismatic"}
+            )
+            if joint.joint_type == "prismatic":
+                raise ValueError(
+                    "DifferentiablePiperFK currently expects no prismatic joints."
+                )
+        self.register_buffer("xyz", torch.tensor(np.stack(xyz), dtype=torch.float32))
+        self.register_buffer("rpy", torch.tensor(np.stack(rpy), dtype=torch.float32))
+        self.register_buffer("axis", torch.tensor(np.stack(axis), dtype=torch.float32))
+        self.register_buffer("is_movable", torch.tensor(is_movable, dtype=torch.bool))
+        self.register_buffer(
+            "base_offset", torch.tensor(base_offset, dtype=torch.float32)
+        )
+
+    def _origin_rotation(
+        self, rpy: torch.Tensor, batch_shape: torch.Size
+    ) -> torch.Tensor:
+        roll, pitch, yaw = rpy[0], rpy[1], rpy[2]
+        rot = (
+            _rot_z(yaw.expand(batch_shape))
+            @ _rot_y(pitch.expand(batch_shape))
+            @ _rot_x(roll.expand(batch_shape))
+        )
+        return rot
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        orig_shape = q.shape[:-1]
+        q_flat = q.reshape(-1, q.shape[-1])
+        dtype = q_flat.dtype
+        device = q_flat.device
+        rot = (
+            torch.eye(3, device=device, dtype=dtype)
+            .expand(q_flat.shape[0], 3, 3)
+            .clone()
+        )
+        pos = torch.zeros(q_flat.shape[0], 3, device=device, dtype=dtype)
+        movable_idx = 0
+        for joint_idx in range(self.xyz.shape[0]):
+            xyz = self.xyz[joint_idx].to(device=device, dtype=dtype)
+            rpy = self.rpy[joint_idx].to(device=device, dtype=dtype)
+            origin_rot = self._origin_rotation(rpy, torch.Size([q_flat.shape[0]])).to(
+                dtype=dtype
+            )
+            pos = pos + torch.matmul(rot, xyz.reshape(1, 3, 1)).squeeze(-1)
+            rot = rot @ origin_rot
+            if bool(self.is_movable[joint_idx].item()):
+                angle = (
+                    q_flat[:, movable_idx]
+                    if movable_idx < q_flat.shape[1]
+                    else torch.zeros(q_flat.shape[0], device=device, dtype=dtype)
+                )
+                rot = rot @ _axis_angle(self.axis[joint_idx], angle).to(dtype=dtype)
+                movable_idx += 1
+        pos = pos + self.base_offset.to(device=device, dtype=dtype).reshape(1, 3)
+        return pos.reshape(*orig_shape, 3)
+
+
+def actor_execution_losses(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    state: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    fk: DifferentiablePiperFK,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+    pred_abs = norm_delta_to_abs_joints_tensor(pred, state, mean, std)
+    target_abs = norm_delta_to_abs_joints_tensor(target, state, mean, std)
+    joint_abs_loss = F.mse_loss(pred_abs, target_abs)
+    pred_tcp = fk(pred_abs)
+    target_tcp = fk(target_abs)
+    tcp_sq = (pred_tcp - target_tcp).square().sum(dim=-1)
+    tcp_loss = tcp_sq.mean()
+    tcp_boundary_loss = tcp_sq[:, 0].mean()
+    with torch.no_grad():
+        tcp_err = torch.sqrt(torch.clamp(tcp_sq, min=0.0))
+        joint_abs = (pred_abs - target_abs).abs()
+        metrics = {
+            "tcp_err_mean_m": float(tcp_err.mean().detach().cpu()),
+            "tcp_err_max_m": float(tcp_err.max().detach().cpu()),
+            "tcp_boundary_err_mean_m": float(tcp_err[:, 0].mean().detach().cpu()),
+            "joint_abs_err_mean_rad": float(joint_abs.mean().detach().cpu()),
+            "joint_abs_err_max_rad": float(joint_abs.max().detach().cpu()),
+        }
+    return joint_abs_loss, tcp_loss, tcp_boundary_loss, metrics
 
 
 def compute_mc_returns(
@@ -233,60 +451,160 @@ def compute_mc_returns(
     return out
 
 
-def reshape_right(flat: torch.Tensor | np.ndarray) -> torch.Tensor | np.ndarray:
+def reshape_right_full(flat: torch.Tensor | np.ndarray) -> torch.Tensor | np.ndarray:
     if torch.is_tensor(flat):
         return flat.reshape(flat.shape[0], 10, 14)[..., 7:14]
     return np.asarray(flat).reshape(flat.shape[0], 10, 14)[..., 7:14]
+
+
+def reshape_right_joints(flat: torch.Tensor | np.ndarray) -> torch.Tensor | np.ndarray:
+    right = reshape_right_full(flat)
+    return right[..., :6]
+
+
+def _resolve_meta_path(path: str, data_dir: str) -> str:
+    p = Path(path)
+    if p.exists():
+        return str(p)
+    candidate = Path(data_dir) / p.name
+    if candidate.exists():
+        return str(candidate)
+    return str(p)
+
+
+def _extract_success_terminal_tcp(
+    traj_paths: list[Path], kin: SimpleUrdfKinematics
+) -> np.ndarray | None:
+    terminal = []
+    for path in traj_paths:
+        traj = torch.load(path, map_location="cpu", weights_only=False)
+        rewards = traj.get("rewards", None)
+        if rewards is None or float(torch.as_tensor(rewards).sum().item()) <= 0:
+            continue
+        env_abs = traj.get("forward_inputs", {}).get("env_action_absolute", None)
+        if env_abs is None:
+            continue
+        q = reshape_right_full(env_abs[-1, 0].float().reshape(1, -1))[0][-1].numpy()
+        terminal.append(right_tcp(q, kin, RIGHT_BASE_OFFSET)[0])
+    if not terminal:
+        return None
+    return np.stack(terminal, axis=0).mean(axis=0)
+
+
+def _chunk_tcp_point(
+    state_right_full: torch.Tensor,
+    env_abs_right_full: torch.Tensor | None,
+    kin: SimpleUrdfKinematics,
+    mode: str,
+) -> np.ndarray:
+    mode = str(mode)
+    if mode == "state" or env_abs_right_full is None:
+        q = state_right_full.detach().cpu().numpy()
+        return right_tcp(q, kin, RIGHT_BASE_OFFSET)[0]
+    chunk = env_abs_right_full.detach().cpu().numpy()
+    if mode == "chunk_end":
+        q = chunk[-1]
+    else:
+        pts = right_tcp(chunk, kin, RIGHT_BASE_OFFSET)
+        return pts.mean(axis=0)
+    return right_tcp(q, kin, RIGHT_BASE_OFFSET)[0]
 
 
 def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
     cache = torch.load(cfg.feature_cache, map_location="cpu")
     metas = cache["metas"]
     z_all = cache["rltoken"].float()
+    kin = SimpleUrdfKinematics(cfg.urdf_path)
+    traj_paths = sorted(Path(cfg.data_dir).glob("*.pt"))
+    if cfg.tcp_target is None:
+        inferred = _extract_success_terminal_tcp(traj_paths, kin)
+        if inferred is None:
+            inferred = np.asarray(DEFAULT_TCP_TARGET, dtype=np.float64)
+        tcp_target = inferred
+    else:
+        tcp_target = np.asarray(cfg.tcp_target, dtype=np.float64).reshape(3)
     rows = []
     loaded: dict[str, dict] = {}
-    for row_idx, meta in enumerate(metas):
-        path = str(meta["path"])
+    skipped_radius = 0
+    skipped_missing = 0
+    for feature_idx, meta in enumerate(metas):
+        path = _resolve_meta_path(str(meta["path"]), cfg.data_dir)
         rel = int(meta["rel_chunk"])
         if path not in loaded:
+            if not Path(path).exists():
+                skipped_missing += 1
+                continue
             loaded[path] = torch.load(path, map_location="cpu", weights_only=False)
         traj = loaded[path]
-        actions = reshape_right(traj["actions"][rel, 0].float().reshape(1, -1))[0]
-        ref = traj.get("forward_inputs", {}).get("ref_action", None)
+        fwd = traj.get("forward_inputs", {})
+        action_src = fwd.get("executed_action", fwd.get("action", traj["actions"]))
+        action_flat = action_src[rel, 0].float().reshape(-1)
+        if action_flat.numel() == 60:
+            actions = action_flat.reshape(10, 6)
+        else:
+            actions = reshape_right_joints(action_flat.reshape(1, -1))[0]
+        ref = fwd.get("ref_action", None)
         if ref is None:
             ref_right = actions
         else:
-            ref_right = reshape_right(ref[rel, 0].float().reshape(1, -1))[0]
+            ref_flat = ref[rel, 0].float().reshape(-1)
+            if ref_flat.numel() == 60:
+                ref_right = ref_flat.reshape(10, 6)
+            else:
+                ref_right = reshape_right_joints(ref_flat.reshape(1, -1))[0]
         state = traj["curr_obs"]["states"][rel, 0].float()
         next_state = traj["next_obs"]["states"][rel, 0].float()
         reward = float(traj["rewards"][rel, 0].float().reshape(-1)[0].item())
+        traj_reward_sum = float(torch.as_tensor(traj["rewards"]).float().sum().item())
         done = bool(
             traj.get("dones", traj.get("terminations"))[rel, 0]
             .bool()
             .reshape(-1)[0]
             .item()
         )
-        env_abs = traj.get("forward_inputs", {}).get("env_action_absolute", None)
+        env_abs = fwd.get(
+            "executed_env_action_absolute", fwd.get("env_action_absolute", None)
+        )
         env_abs_right = None
         if env_abs is not None:
-            env_abs_right = reshape_right(env_abs[rel, 0].float().reshape(1, -1))[0]
+            env_abs_right = reshape_right_full(env_abs[rel, 0].float().reshape(1, -1))[
+                0
+            ]
+        state_right_full = state[RIGHT_ARM_FULL]
+        tcp_point = _chunk_tcp_point(
+            state_right_full, env_abs_right, kin, cfg.tcp_filter_mode
+        )
+        tcp_distance = float(np.linalg.norm(tcp_point - tcp_target))
+        if cfg.tcp_radius > 0 and tcp_distance > float(cfg.tcp_radius):
+            skipped_radius += 1
+            continue
+        row_idx = len(rows)
         rows.append(
             {
                 "idx": row_idx,
+                "feature_idx": feature_idx,
                 "path": path,
                 "rel": rel,
                 "traj_index": int(meta.get("traj_index", -1)),
-                "success": int(meta.get("success", reward > 0)),
-                "z": z_all[row_idx],
-                "state_right": state[RIGHT_ARM],
+                "success": int(meta.get("success", traj_reward_sum > 0)),
+                "z": z_all[feature_idx],
+                "state_right": state[RIGHT_ARM_JOINTS],
+                "state_right_full": state_right_full,
                 "state_full": state,
-                "next_state_right": next_state[RIGHT_ARM],
+                "next_state_right": next_state[RIGHT_ARM_JOINTS],
+                "next_state_right_full": next_state[RIGHT_ARM_FULL],
                 "action": actions,
                 "ref": ref_right,
                 "reward": reward,
                 "done": done,
                 "env_abs_right": env_abs_right,
+                "tcp_distance": tcp_distance,
             }
+        )
+    if not rows:
+        raise RuntimeError(
+            f"TCP filter kept zero rows: radius={cfg.tcp_radius}, "
+            f"target={tcp_target.tolist()}, missing_paths={skipped_missing}"
         )
 
     by_key = {(r["path"], r["rel"]): r["idx"] for r in rows}
@@ -312,9 +630,32 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
         "traj_index": torch.tensor([r["traj_index"] for r in rows], dtype=torch.long),
         "rows": rows,
         "trajectories": loaded,
+        "tcp_target": torch.tensor(tcp_target, dtype=torch.float32),
+        "tcp_radius": float(cfg.tcp_radius),
+        "skipped_radius": int(skipped_radius),
+        "skipped_missing": int(skipped_missing),
     }
     data["next_z"] = data["z"][data["next_idx"]]
     data["next_ref"] = data["ref"][data["next_idx"]]
+    summary = {
+        "num_rows": len(rows),
+        "num_trajectories": len({r["path"] for r in rows}),
+        "success_rows": int(sum(int(r["success"]) for r in rows)),
+        "failure_rows": int(sum(1 - int(r["success"]) for r in rows)),
+        "tcp_target": tcp_target.tolist(),
+        "tcp_radius": float(cfg.tcp_radius),
+        "tcp_filter_mode": str(cfg.tcp_filter_mode),
+        "tcp_distance_min": float(min(r["tcp_distance"] for r in rows)),
+        "tcp_distance_max": float(max(r["tcp_distance"] for r in rows)),
+        "tcp_distance_mean": float(np.mean([r["tcp_distance"] for r in rows])),
+        "skipped_radius": int(skipped_radius),
+        "skipped_missing": int(skipped_missing),
+    }
+    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+    (Path(cfg.output_dir) / "dataset_filter_summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+    print(json.dumps({"dataset": summary}, ensure_ascii=False), flush=True)
     return data
 
 
@@ -483,9 +824,13 @@ def plot_q(
     q_actor: np.ndarray,
     mc: np.ndarray,
     mse: np.ndarray,
+    tcp_err_m: np.ndarray | None = None,
 ) -> None:
     x = np.arange(len(q_data))
-    fig, axes = plt.subplots(2, 1, figsize=(8.5, 6.0), dpi=150, sharex=True)
+    num_rows = 3 if tcp_err_m is not None else 2
+    fig, axes = plt.subplots(
+        num_rows, 1, figsize=(8.5, 7.2 if num_rows == 3 else 6.0), dpi=150, sharex=True
+    )
     axes[0].plot(
         x, q_data, marker="o", color="#222222", label="Q(s, data right action)"
     )
@@ -497,10 +842,22 @@ def plot_q(
     axes[0].grid(True, alpha=0.3)
     axes[0].legend(loc="best")
     axes[1].plot(x, mse, marker="o", color="#b3472f", label="normalized action MSE")
-    axes[1].set_xlabel("last20 chunk index")
+    axes[1].set_xlabel("selected trajectory chunk index")
     axes[1].set_ylabel("MSE")
     axes[1].grid(True, alpha=0.3)
     axes[1].legend(loc="best")
+    if tcp_err_m is not None:
+        axes[2].plot(
+            x,
+            np.asarray(tcp_err_m) * 1000.0,
+            marker="o",
+            color="#6f2b8c",
+            label="TCP error",
+        )
+        axes[2].set_xlabel("selected trajectory chunk index")
+        axes[2].set_ylabel("TCP err (mm)")
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend(loc="best")
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
@@ -516,6 +873,22 @@ def plot_mse_heatmap(out_path: Path, mse_matrix: np.ndarray) -> None:
     ax.set_yticks(np.arange(data.shape[0]))
     ax.set_title(f"actor vs data MSE, mean={float(np.mean(mse_matrix)):.4g}")
     fig.colorbar(im, ax=ax, label="squared error")
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_tcp_error_heatmap(out_path: Path, tcp_err_m: np.ndarray) -> None:
+    data = np.asarray(tcp_err_m, dtype=np.float64).reshape(1, -1) * 1000.0
+    fig, ax = plt.subplots(figsize=(6.5, 1.8), dpi=150)
+    im = ax.imshow(data, aspect="auto", cmap="viridis")
+    ax.set_xlabel("small step")
+    ax.set_yticks([])
+    ax.set_title(
+        f"actor TCP error, mean={float(data.mean()):.2f} mm, max={float(data.max()):.2f} mm"
+    )
+    ax.set_xticks(np.arange(data.shape[1]))
+    fig.colorbar(im, ax=ax, label="mm")
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
@@ -567,36 +940,60 @@ def visualize(
         mse = ((actor_action - target) ** 2).mean(dim=(1, 2)).cpu().numpy()
 
         stem = Path(path).stem
-        traj_dir = out_root / label / stem
-        traj_dir.mkdir(parents=True, exist_ok=True)
-        plot_q(traj_dir / "q_values.png", q_data, q_actor, mc, mse)
-
         pt_chunks = []
         gt_chunks = []
         actor_chunks = []
         state_q = []
+        tcp_err_per_chunk = []
+        tcp_err_segments = []
+        joint_abs_err_segments = []
         actor_np = actor_action.cpu().numpy()
         target_np = target.cpu().numpy()
         for local, row_idx in enumerate(idxs):
             row = rows[row_idx]
-            state_right = row["state_right"].numpy()
-            state_q.append(state_right)
+            state_right_full = row["state_right_full"].numpy()
+            state_q.append(state_right_full)
             pt = row["env_abs_right"]
             if pt is None:
-                pt_abs = norm_delta_to_abs_right(
-                    target_np[local], state_right, action_mean, action_std
+                pt_abs = norm_delta_to_abs_right_joints(
+                    target_np[local], state_right_full, action_mean, action_std
                 )
             else:
                 pt_abs = pt.numpy()
-            gt_abs = norm_delta_to_abs_right(
-                target_np[local], state_right, action_mean, action_std
+            gt_abs = norm_delta_to_abs_right_joints(
+                target_np[local],
+                state_right_full,
+                action_mean,
+                action_std,
+                gripper_chunk=pt_abs[:, 6],
             )
-            actor_abs = norm_delta_to_abs_right(
-                actor_np[local], state_right, action_mean, action_std
+            actor_abs = norm_delta_to_abs_right_joints(
+                actor_np[local],
+                state_right_full,
+                action_mean,
+                action_std,
+                gripper_chunk=pt_abs[:, 6],
             )
             pt_chunks.append(pt_abs)
             gt_chunks.append(gt_abs)
             actor_chunks.append(actor_abs)
+            gt_tcp = right_tcp(gt_abs, kin, RIGHT_BASE_OFFSET)
+            actor_tcp = right_tcp(actor_abs, kin, RIGHT_BASE_OFFSET)
+            tcp_err = np.linalg.norm(actor_tcp - gt_tcp, axis=1)
+            tcp_err_segments.append(tcp_err)
+            tcp_err_per_chunk.append(float(np.mean(tcp_err)))
+            joint_abs_err_segments.append(np.abs(actor_abs[:, :6] - gt_abs[:, :6]))
+
+        traj_dir = out_root / label / stem
+        traj_dir.mkdir(parents=True, exist_ok=True)
+        plot_q(
+            traj_dir / "q_values.png",
+            q_data,
+            q_actor,
+            mc,
+            mse,
+            np.asarray(tcp_err_per_chunk),
+        )
         plot_right_chunks(
             traj_dir / "right_tcp_chunks.png",
             np.stack(state_q, axis=0),
@@ -610,6 +1007,12 @@ def visualize(
             traj_dir / f"mse_heatmap_worst_chunk_{worst:02d}.png",
             ((actor_np[worst] - target_np[worst]) ** 2),
         )
+        plot_tcp_error_heatmap(
+            traj_dir / f"tcp_error_worst_chunk_{worst:02d}.png",
+            tcp_err_segments[worst],
+        )
+        tcp_all = np.concatenate(tcp_err_segments, axis=0)
+        joint_all = np.concatenate(joint_abs_err_segments, axis=0)
         summary.append(
             {
                 "label": label,
@@ -619,6 +1022,11 @@ def visualize(
                 "mc_final": float(mc[-1]) if len(mc) else 0.0,
                 "mse_mean": float(np.mean(mse)),
                 "mse_max": float(np.max(mse)),
+                "tcp_err_mean_m": float(np.mean(tcp_all)),
+                "tcp_err_p90_m": float(np.percentile(tcp_all, 90)),
+                "tcp_err_max_m": float(np.max(tcp_all)),
+                "joint_abs_err_mean_rad": float(np.mean(joint_all)),
+                "joint_abs_err_max_rad": float(np.max(joint_all)),
             }
         )
     (out_root / "summary.json").write_text(
@@ -651,7 +1059,73 @@ def save_checkpoint(
             "actor_opt": actor_opt.state_dict(),
             "critic_opt": critic_opt.state_dict(),
         },
+        path / "actor_critic_standalone.pt",
+    )
+    model_state = {
+        **{f"actor_head.{k}": v.detach().cpu() for k, v in actor.state_dict().items()},
+        **{
+            f"critic_head_1.{k}": v.detach().cpu()
+            for k, v in critic.q1.state_dict().items()
+        },
+        **{
+            f"critic_head_2.{k}": v.detach().cpu()
+            for k, v in critic.q2.state_dict().items()
+        },
+    }
+    target_model_state = {
+        **{
+            f"actor_head.{k}": v.detach().cpu()
+            for k, v in target_actor.state_dict().items()
+        },
+        **{
+            f"critic_head_1.{k}": v.detach().cpu()
+            for k, v in target_critic.q1.state_dict().items()
+        },
+        **{
+            f"critic_head_2.{k}": v.detach().cpu()
+            for k, v in target_critic.q2.state_dict().items()
+        },
+    }
+    torch.save(
+        {
+            "format": "rlinf_td3_actor_critic_only",
+            "global_step": int(step),
+            "update_step": int(step),
+            "config": asdict(cfg),
+            "model": model_state,
+            "target_model": target_model_state,
+            "actor_optimizer": None,
+            "critic_optimizer": None,
+            "actor_lr_scheduler": None,
+            "critic_lr_scheduler": None,
+            "notes": (
+                "OpenRLT right-arm 6-joint actor/critic checkpoint. "
+                "The right gripper is not controlled by actor/critic."
+            ),
+        },
         path / "actor_critic.pt",
+    )
+    (path / "checkpoint_summary.json").write_text(
+        json.dumps(
+            {
+                "step": int(step),
+                "format": "rlinf_td3_actor_critic_only",
+                "action_dim": int(cfg.action_dim),
+                "proprio_dim": int(cfg.proprio_dim),
+                "bc_weight": float(cfg.bc_weight),
+                "q_weight": float(cfg.q_weight),
+                "delta_weight": float(cfg.delta_weight),
+                "joint_abs_weight": float(cfg.joint_abs_weight),
+                "tcp_weight": float(cfg.tcp_weight),
+                "tcp_boundary_weight": float(cfg.tcp_boundary_weight),
+                "actor_residual_ref": bool(cfg.actor_residual_ref),
+                "actor_residual_scale": float(cfg.actor_residual_scale),
+                "model_keys": sorted(model_state.keys()),
+                "target_model_keys": sorted(target_model_state.keys()),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
     )
 
 
@@ -671,15 +1145,40 @@ def main() -> int:
     )
     parser.add_argument(
         "--output-dir",
-        default="/shared_disk/users/angen.ye/code/giga_rlinf/train_logs/openrlt_right_arm/openrlt_right_arm_last20",
+        default="/shared_disk/users/angen.ye/code/giga_rlinf/train_logs/openrlt_right_arm/openrlt_right_arm_tcp10cm_6joints",
     )
     parser.add_argument("--urdf-path", default="assets/piper_local_assets/piper.urdf")
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--save-interval", type=int, default=50)
-    parser.add_argument("--gamma", type=float, default=0.89)
+    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--patience", type=int, default=1200)
+    parser.add_argument("--viz-per-class", type=int, default=3)
+    parser.add_argument("--gamma", type=float, default=0.94)
     parser.add_argument("--n-step", type=int, default=10)
+    parser.add_argument("--bc-weight", type=float, default=20.0)
+    parser.add_argument("--q-weight", type=float, default=0.0)
+    parser.add_argument("--delta-weight", type=float, default=10.0)
+    parser.add_argument("--joint-abs-weight", type=float, default=100.0)
+    parser.add_argument("--tcp-weight", type=float, default=5000.0)
+    parser.add_argument("--tcp-boundary-weight", type=float, default=1000.0)
+    parser.add_argument("--q-warmup-steps", type=int, default=100000000)
+    parser.add_argument("--fixed-std", type=float, default=0.0)
+    parser.add_argument("--reference-dropout-prob", type=float, default=0.0)
+    parser.add_argument(
+        "--actor-residual-ref", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--actor-residual-scale", type=float, default=1.0)
+    parser.add_argument("--tcp-radius", type=float, default=0.10)
+    parser.add_argument(
+        "--tcp-filter-mode",
+        choices=["chunk_center", "chunk_end", "state"],
+        default="chunk_center",
+    )
+    parser.add_argument(
+        "--tcp-target", type=float, nargs=3, default=list(DEFAULT_TCP_TARGET)
+    )
     args = parser.parse_args()
 
     cfg = TrainConfig(**vars(args))
@@ -697,6 +1196,7 @@ def main() -> int:
     action_mean, action_std = load_norm_stats(cfg.norm_stats_path)
     mean_t = torch.tensor(action_mean, device=device, dtype=torch.float32)
     std_t = torch.tensor(action_std, device=device, dtype=torch.float32)
+    fk = DifferentiablePiperFK(cfg.urdf_path).to(device)
 
     actor = ChunkActor(cfg).to(device)
     critic = TwinCritic(cfg).to(device)
@@ -745,19 +1245,46 @@ def main() -> int:
         actor_loss = torch.zeros((), device=device)
         bc_loss = torch.zeros((), device=device)
         delta_loss = torch.zeros((), device=device)
+        joint_abs_loss = torch.zeros((), device=device)
+        tcp_loss = torch.zeros((), device=device)
+        tcp_boundary_loss = torch.zeros((), device=device)
         actor_q = torch.zeros((), device=device)
+        actor_exec_metrics = {
+            "tcp_err_mean_m": 0.0,
+            "tcp_err_max_m": 0.0,
+            "tcp_boundary_err_mean_m": 0.0,
+            "joint_abs_err_mean_rad": 0.0,
+            "joint_abs_err_max_rad": 0.0,
+        }
         if step % cfg.actor_update_period == 0:
             ref_in = dropout_ref(b["ref"], cfg.reference_dropout_prob)
-            actor_action = actor.sample(b["z"], b["state"], ref_in, deterministic=False)
+            actor_action = actor.sample(b["z"], b["state"], ref_in, deterministic=True)
             bc_loss = F.mse_loss(actor_action, b["action"])
             delta_loss = smooth_delta_loss(
                 actor_action, b["action"], b["state"], mean_t, std_t
             )
+            (
+                joint_abs_loss,
+                tcp_loss,
+                tcp_boundary_loss,
+                actor_exec_metrics,
+            ) = actor_execution_losses(
+                actor_action,
+                b["action"],
+                b["state"],
+                mean_t,
+                std_t,
+                fk,
+            )
             actor_q = critic.q1(b["z"], b["state"], actor_action).mean()
+            q_weight = float(cfg.q_weight) if step >= int(cfg.q_warmup_steps) else 0.0
             actor_loss = (
                 cfg.bc_weight * bc_loss
                 + cfg.delta_weight * delta_loss
-                - cfg.q_weight * actor_q
+                + cfg.joint_abs_weight * joint_abs_loss
+                + cfg.tcp_weight * tcp_loss
+                + cfg.tcp_boundary_weight * tcp_boundary_loss
+                - q_weight * actor_q
             )
             actor_opt.zero_grad(set_to_none=True)
             actor_loss.backward()
@@ -773,6 +1300,20 @@ def main() -> int:
                 "actor_loss": float(actor_loss.detach().cpu()),
                 "bc_loss": float(bc_loss.detach().cpu()),
                 "delta_loss": float(delta_loss.detach().cpu()),
+                "joint_abs_loss": float(joint_abs_loss.detach().cpu()),
+                "tcp_loss": float(tcp_loss.detach().cpu()),
+                "tcp_boundary_loss": float(tcp_boundary_loss.detach().cpu()),
+                "tcp_err_mean_mm": float(actor_exec_metrics["tcp_err_mean_m"] * 1000.0),
+                "tcp_err_max_mm": float(actor_exec_metrics["tcp_err_max_m"] * 1000.0),
+                "tcp_boundary_err_mean_mm": float(
+                    actor_exec_metrics["tcp_boundary_err_mean_m"] * 1000.0
+                ),
+                "joint_abs_err_mean_rad": float(
+                    actor_exec_metrics["joint_abs_err_mean_rad"]
+                ),
+                "joint_abs_err_max_rad": float(
+                    actor_exec_metrics["joint_abs_err_max_rad"]
+                ),
                 "actor_q": float(actor_q.detach().cpu()),
                 "target_q_mean": float(y.detach().mean().cpu()),
             }
@@ -781,7 +1322,7 @@ def main() -> int:
         with metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
 
-        actor_metric = row["bc_loss"] + row["delta_loss"]
+        actor_metric = row["tcp_err_mean_mm"] + 100.0 * row["joint_abs_err_mean_rad"]
         if actor_metric + cfg.min_delta < best_actor_metric and row["bc_loss"] > 0:
             best_actor_metric = actor_metric
             last_improve = step

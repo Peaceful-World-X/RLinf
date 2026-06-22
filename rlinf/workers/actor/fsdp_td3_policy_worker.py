@@ -1,4 +1,4 @@
-# Copyright 2026 The RLinf Authors.
+# Copyright 2026 The GIGA Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ Mirrors EmbodiedSACFSDPPolicy but uses TD3Algorithm (deterministic policy,
 dual critics, policy delay, no entropy temperature).
 """
 
+import json
 import os
 
 import numpy as np
@@ -74,6 +75,9 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         self.critic_optimizer = None
         self.update_step = 0
         self.enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
+        self._replay_delete_keyboard = None
+        self._replay_delete_key = "d"
+        self._replay_delete_enabled = False
 
     # ------------------------------------------------------------------
     # Initialization
@@ -173,6 +177,20 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             trajectory_format=self.cfg.algorithm.replay_buffer.get(
                 "trajectory_format", "pt"
             ),
+            cache_obs_keys=list(
+                self.cfg.algorithm.replay_buffer.get("cache_obs_keys", [])
+            )
+            or None,
+            cache_forward_input_keys=list(
+                self.cfg.algorithm.replay_buffer.get("cache_forward_input_keys", [])
+            )
+            or None,
+            save_executor_workers=self.cfg.algorithm.replay_buffer.get(
+                "save_executor_workers", 20
+            ),
+            checkpoint_executor_workers=self.cfg.algorithm.replay_buffer.get(
+                "checkpoint_executor_workers", 20
+            ),
         )
         self.replay_buffer.mc_return_gamma = float(self.cfg.algorithm.gamma)
         if hasattr(self.replay_buffer, "set_n_step"):
@@ -180,6 +198,34 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 int(self.cfg.algorithm.get("n_step", 1)),
                 float(self.cfg.algorithm.gamma),
             )
+        filter_cfg = self.cfg.algorithm.replay_buffer.get(
+            "sample_forward_input_filter", None
+        )
+        if filter_cfg is not None and hasattr(
+            self.replay_buffer, "set_sample_forward_input_filter"
+        ):
+            self.replay_buffer.set_sample_forward_input_filter(
+                filter_cfg.get("key", None),
+                max_value=filter_cfg.get("max_value", None),
+                min_value=filter_cfg.get("min_value", None),
+            )
+        preload_checkpoint_path = self.cfg.algorithm.replay_buffer.get(
+            "preload_checkpoint_path", None
+        )
+        if preload_checkpoint_path:
+            preload_checkpoint_path = str(preload_checkpoint_path)
+            rank_path = os.path.join(preload_checkpoint_path, f"rank_{self._rank}")
+            if os.path.isdir(rank_path):
+                preload_checkpoint_path = rank_path
+            self.replay_buffer.load_checkpoint(preload_checkpoint_path)
+            self.log_on_first_rank(
+                "Preloaded replay buffer from {}: trajectories={} samples={}".format(
+                    preload_checkpoint_path,
+                    len(self.replay_buffer),
+                    int(getattr(self.replay_buffer, "total_samples", 0)),
+                )
+            )
+        self._setup_replay_delete_keyboard()
 
         min_demo_buffer_size = 0
         if self.cfg.algorithm.get("demo_buffer", None) is not None:
@@ -238,6 +284,67 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         )
         self.td3_algorithm.set_action_horizon(action_horizon)
         self.target_update_type = self.cfg.algorithm.get("target_update_type", "all")
+
+    def _setup_replay_delete_keyboard(self):
+        replay_cfg = self.cfg.algorithm.replay_buffer
+        self._replay_delete_enabled = bool(replay_cfg.get("delete_last_on_key", False))
+        self._replay_delete_key = str(replay_cfg.get("delete_last_key", "d"))
+        self._replay_delete_keyboard = None
+        if not self._replay_delete_enabled:
+            return
+        try:
+            from rlinf.envs.realworld.common.keyboard.keyboard_listener import (
+                KeyboardListener,
+            )
+
+            self._replay_delete_keyboard = KeyboardListener()
+            self.log_on_first_rank(
+                "Replay buffer delete hotkey enabled: "
+                f"press '{self._replay_delete_key}' to delete the last saved trajectory."
+            )
+        except Exception as exc:
+            self.log_on_first_rank(
+                "Replay buffer delete hotkey is disabled because keyboard listener "
+                f"could not start: {exc}"
+            )
+            self._replay_delete_enabled = False
+
+    def _maybe_delete_last_replay_trajectory_from_keyboard(self):
+        if (
+            not self._replay_delete_enabled
+            or self._replay_delete_keyboard is None
+            or self.replay_buffer is None
+        ):
+            return
+        key = self._replay_delete_keyboard.consume_any_press(
+            (self._replay_delete_key,), include_held=False
+        )
+        if key is None:
+            return
+        add_lock = getattr(self, "_replay_buffer_add_lock", None)
+        if add_lock is not None:
+            with add_lock:
+                result = self.replay_buffer.delete_last_trajectory()
+        else:
+            result = self.replay_buffer.delete_last_trajectory()
+        if result.get("deleted", False):
+            self.log_on_first_rank(
+                "[replay-buffer] key='{}' deleted trajectory_id={} "
+                "samples={} file_deleted={} remaining_trajectories={} "
+                "remaining_samples={} path={}".format(
+                    key,
+                    result.get("trajectory_id"),
+                    result.get("num_samples"),
+                    result.get("file_deleted"),
+                    result.get("num_trajectories"),
+                    result.get("total_samples"),
+                    result.get("path"),
+                )
+            )
+        else:
+            self.log_on_first_rank(
+                f"[replay-buffer] key='{key}' delete requested, but buffer is empty."
+            )
 
     # ------------------------------------------------------------------
     # Target network soft update (float32 shadow for bf16 precision)
@@ -339,6 +446,63 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             clip = float(clip)
             action = action.clamp(-clip, clip)
         return action
+
+    def _action_norm_tensors(self, device, dtype):
+        cache = getattr(self, "_td3_action_norm_cache", None)
+        if cache is None:
+            stats_path = self.cfg.actor.model.get("action_norm_stats_path", None)
+            if stats_path is None:
+                raise ValueError(
+                    "actor.model.action_norm_stats_path is required for actor smooth loss"
+                )
+            with open(str(stats_path), "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            stats = payload.get("norm_stats", payload)["actions"]
+            indices = list(self.cfg.actor.model.get("controlled_action_indices", []))
+            if not indices:
+                indices = list(range(int(self.cfg.actor.model.action_dim)))
+            mean = torch.tensor(
+                [stats["mean"][i] for i in indices], dtype=torch.float32
+            )
+            std = torch.tensor([stats["std"][i] for i in indices], dtype=torch.float32)
+            floor = float(self.cfg.actor.model.get("action_norm_std_floor", 1e-6))
+            std = torch.where(std.abs() < floor, torch.ones_like(std), std)
+            self._td3_action_norm_cache = (mean, std)
+            cache = self._td3_action_norm_cache
+        mean, std = cache
+        return mean.to(device=device, dtype=dtype), std.to(device=device, dtype=dtype)
+
+    def _actor_smooth_loss(self, pred_action, target_action, robot_state):
+        coef = float(self.cfg.actor.model.get("actor_smooth_loss_coef", 0.0))
+        if coef <= 0.0:
+            return pred_action.new_zeros(()), 0.0
+        if robot_state is None:
+            return pred_action.new_zeros(()), 0.0
+        mean, std = self._action_norm_tensors(pred_action.device, pred_action.dtype)
+        mean = mean.reshape(1, 1, -1)
+        std = std.reshape(1, 1, -1)
+        pred_abs = pred_action * (std + 1e-6) + mean
+        target_abs = target_action * (std + 1e-6) + mean
+        state = robot_state.to(pred_action.device, dtype=pred_action.dtype)
+        state = state.reshape(pred_action.shape[0], -1)
+        if state.shape[-1] == pred_action.shape[-1]:
+            controlled_state = state
+        else:
+            indices = list(self.cfg.actor.model.get("controlled_action_indices", []))
+            if indices and max(indices) < state.shape[-1]:
+                index = torch.tensor(indices, device=state.device, dtype=torch.long)
+                controlled_state = state.index_select(-1, index)
+            else:
+                controlled_state = state[:, : pred_action.shape[-1]]
+        if controlled_state.shape[-1] >= pred_action.shape[-1]:
+            pred_abs = pred_abs + controlled_state[:, None, : pred_action.shape[-1]]
+            target_abs = (
+                target_abs + controlled_state[:, None, : target_action.shape[-1]]
+            )
+        pred_vel = pred_abs[:, 1:, :] - pred_abs[:, :-1, :]
+        target_vel = target_abs[:, 1:, :] - target_abs[:, :-1, :]
+        loss = torch.nn.functional.mse_loss(pred_vel, target_vel)
+        return loss, coef
 
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
@@ -442,8 +606,14 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             q_pi_mean = q_pi.mean().item()
 
         bc_loss = torch.nn.functional.mse_loss(actions, sampled_actions)
+        robot_state = self.get_robot_state(curr_obs)
+        smooth_loss, smooth_coef = self._actor_smooth_loss(
+            actions, sampled_actions, robot_state
+        )
 
         actor_loss, actor_metrics = self.td3_algorithm.compose_actor_loss(q_pi, bc_loss)
+        if smooth_coef > 0.0:
+            actor_loss = actor_loss + smooth_coef * smooth_loss
 
         if recon_coef > 0.0 and "recon_loss" in actor_aux:
             recon_loss = actor_aux["recon_loss"]
@@ -451,6 +621,8 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             actor_metrics["recon_loss"] = recon_loss.item()
 
         actor_metrics["bc_loss"] = bc_loss.item()
+        actor_metrics["smooth_loss"] = smooth_loss.item()
+        actor_metrics["smooth_coef"] = smooth_coef
         actor_metrics["actor_ref_action_mse"] = torch.nn.functional.mse_loss(
             actions, ref_action
         ).item()
@@ -463,6 +635,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
 
     @Worker.timer("update_one_epoch")
     def update_one_epoch(self):
+        self._maybe_delete_last_replay_trajectory_from_keyboard()
         global_batch_size_per_rank = (
             self.cfg.actor.global_batch_size // self._world_size
         )
@@ -632,6 +805,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
 
     def add_trajectories(self, trajectories: list):
         self.replay_buffer.add_trajectories(trajectories)
+        self._maybe_delete_last_replay_trajectory_from_keyboard()
 
     async def recv_rollout_trajectories(self, input_channel: Channel):
         clear_memory(sync=False)
@@ -645,6 +819,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             recv_list.append(trajectory)
 
         self.replay_buffer.add_trajectories(recv_list)
+        self._maybe_delete_last_replay_trajectory_from_keyboard()
 
         if self.demo_buffer is not None:
             intervene_list = []
@@ -787,6 +962,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         if not state:
             return
         state = self._normalize_actor_critic_state_keys(state)
+        skipped = []
         params = {
             self._canonical_param_name(name): param
             for name, param in model.named_parameters()
@@ -799,7 +975,18 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             for name, value in state.items():
                 target = params.get(name, buffers.get(name, None))
                 if target is not None:
+                    if tuple(target.shape) != tuple(value.shape):
+                        skipped.append(
+                            f"{name}: checkpoint {tuple(value.shape)} != model {tuple(target.shape)}"
+                        )
+                        continue
                     target.copy_(value.to(device=target.device, dtype=target.dtype))
+        if skipped:
+            self.log_on_first_rank(
+                "Skipped actor/critic checkpoint tensors with incompatible shapes: "
+                + "; ".join(skipped[:20])
+                + ("; ..." if len(skipped) > 20 else "")
+            )
 
     def _normalize_actor_critic_state_keys(self, state):
         remapped = {}

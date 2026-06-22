@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The GIGA Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -71,6 +71,8 @@ class OpenPiRLTokenConfig:
     openrlt_num_layers: int = 2
     action_horizon: int = 5
     action_dim: int = 7
+    env_action_dim: int = 7
+    controlled_action_indices: tuple | list | None = None
     recon_loss_coef: float = 0.1
     actor_output_bound: float | None = None
     use_robot_state: bool = True
@@ -79,6 +81,11 @@ class OpenPiRLTokenConfig:
     critic_use_rl_token: bool = True
     actor_ref_action_dropout_p: float = 0.0
     actor_ref_action_mask_flag: bool = False
+    # Optional residual actor branch. When enabled, the OpenRLT actor head returns
+    # ref_action + residual in the configured training action space. Keep this
+    # off for direct-action checkpoints.
+    actor_residual_ref: bool = False
+    actor_residual_scale: float = 1.0
     critic_block_norm: bool = False
     critic_action_encoder_dim: int = 0
     action_space: str = "absolute"
@@ -235,6 +242,8 @@ class OpenRLTActorHead(torch.nn.Module):
         hidden_dim: int,
         num_layers: int,
         has_ref_mask: bool = False,
+        residual_ref: bool = False,
+        residual_scale: float = 1.0,
     ):
         super().__init__()
         self.rl_token_dim = int(rl_token_dim)
@@ -244,6 +253,8 @@ class OpenRLTActorHead(torch.nn.Module):
         self.action_dim = int(action_dim)
         self.ref_dim = self.action_horizon * self.action_dim
         self.has_ref_mask = bool(has_ref_mask)
+        self.residual_ref = bool(residual_ref)
+        self.residual_scale = float(residual_scale)
         self.z_proj = torch.nn.Linear(self.rl_token_dim, int(z_proj_dim))
         self.state_proj = (
             torch.nn.Linear(self.robot_state_dim, int(state_proj_dim))
@@ -260,6 +271,11 @@ class OpenRLTActorHead(torch.nn.Module):
             num_layers=int(num_layers),
             output_dim=self.ref_dim,
         )
+        if self.residual_ref:
+            last = self.trunk.net[-1]
+            if isinstance(last, torch.nn.Linear):
+                torch.nn.init.zeros_(last.weight)
+                torch.nn.init.zeros_(last.bias)
 
     def forward(self, x: Tensor) -> Tensor:
         batch_size = x.shape[0]
@@ -277,7 +293,10 @@ class OpenRLTActorHead(torch.nn.Module):
             batch_size, self.ref_dim
         )
         parts.append(torch.tanh(_layer_norm_no_params(self.ref_proj(ref_flat))))
-        return self.trunk(torch.cat(parts, dim=-1))
+        residual_or_action = self.trunk(torch.cat(parts, dim=-1))
+        if self.residual_ref:
+            return ref_flat + self.residual_scale * residual_or_action
+        return residual_or_action
 
 
 class OpenRLTQHead(torch.nn.Module):
@@ -460,6 +479,8 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
                 hidden_dim=config.openrlt_hidden_dim,
                 num_layers=config.openrlt_num_layers,
                 has_ref_mask=self.actor_ref_action_mask_flag,
+                residual_ref=bool(getattr(config, "actor_residual_ref", False)),
+                residual_scale=float(getattr(config, "actor_residual_scale", 1.0)),
             )
         else:
             raise ValueError(f"Unsupported actor_head_type: {actor_head_type}")
@@ -550,9 +571,51 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         for p in target_params:
             p.requires_grad_(False)
 
+    def _controlled_action_indices(self) -> tuple[int, ...]:
+        indices = getattr(self.config, "controlled_action_indices", None)
+        if indices is None:
+            return tuple(range(int(self.config.action_dim)))
+        return tuple(int(i) for i in indices)
+
+    def _controlled_action_index_tensor(self, device) -> Tensor:
+        return torch.tensor(
+            self._controlled_action_indices(), dtype=torch.long, device=device
+        )
+
+    def _full_delta_mask(self, device) -> Tensor:
+        env_action_dim = int(
+            getattr(self.config, "env_action_dim", self.config.action_dim)
+        )
+        if env_action_dim == 14:
+            return torch.tensor(
+                [True] * 6 + [False] + [True] * 6 + [False],
+                dtype=torch.bool,
+                device=device,
+            )
+        return torch.ones(env_action_dim, dtype=torch.bool, device=device)
+
+    def _controlled_delta_mask(self, device) -> Tensor:
+        return self._full_delta_mask(device).index_select(
+            0, self._controlled_action_index_tensor(device)
+        )
+
+    def _select_controlled_state(self, state: Tensor, device, dtype) -> Tensor:
+        state = state.to(device=device, dtype=dtype).reshape(state.shape[0], -1)
+        if state.shape[-1] == int(self.config.action_dim):
+            return state
+        index = self._controlled_action_index_tensor(device)
+        if state.shape[-1] <= int(index.max().item()):
+            raise ValueError(
+                f"robot state dim {state.shape[-1]} is too small for controlled indices "
+                f"{self._controlled_action_indices()}"
+            )
+        return state.index_select(-1, index)
+
     def _setup_action_transform(self):
-        mean = torch.zeros(self.config.action_dim, dtype=torch.float32)
-        std = torch.ones(self.config.action_dim, dtype=torch.float32)
+        action_dim = int(self.config.action_dim)
+        env_action_dim = int(getattr(self.config, "env_action_dim", action_dim))
+        mean = torch.zeros(action_dim, dtype=torch.float32)
+        std = torch.ones(action_dim, dtype=torch.float32)
         if self.action_space == "normalized_delta":
             stats_path = getattr(self.config, "action_norm_stats_path", None)
             if stats_path is None:
@@ -562,50 +625,74 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             with open(stats_path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             stats = payload.get("norm_stats", payload)["actions"]
-            mean = torch.tensor(
-                stats["mean"][: self.config.action_dim], dtype=torch.float32
-            )
-            std = torch.tensor(
-                stats["std"][: self.config.action_dim], dtype=torch.float32
-            )
+            if (
+                env_action_dim != action_dim
+                and getattr(self.config, "controlled_action_indices", None) is not None
+            ):
+                indices = list(self._controlled_action_indices())
+                mean = torch.tensor(
+                    [stats["mean"][i] for i in indices], dtype=torch.float32
+                )
+                std = torch.tensor(
+                    [stats["std"][i] for i in indices], dtype=torch.float32
+                )
+            else:
+                mean = torch.tensor(stats["mean"][:action_dim], dtype=torch.float32)
+                std = torch.tensor(stats["std"][:action_dim], dtype=torch.float32)
             floor = float(getattr(self.config, "action_norm_std_floor", 1e-6))
             std = torch.where(std.abs() < floor, torch.ones_like(std), std)
-        mask = torch.tensor(
-            [True] * 6 + [False] + [True] * 6 + [False], dtype=torch.bool
-        )
-        if self.config.action_dim != 14:
-            mask = torch.ones(self.config.action_dim, dtype=torch.bool)
         self.register_buffer("action_norm_mean", mean, persistent=False)
         self.register_buffer("action_norm_std", std, persistent=False)
         self.register_buffer(
-            "delta_action_mask", mask[: self.config.action_dim], persistent=False
+            "delta_action_mask",
+            self._controlled_delta_mask(torch.device("cpu")),
+            persistent=False,
         )
 
     def _absolute_to_training_action(
         self, actions: Tensor, state: Tensor | None
     ) -> Tensor:
         if self.action_space != "normalized_delta":
-            return actions
+            if getattr(self.config, "controlled_action_indices", None) is None:
+                return actions
+            horizon = int(self.config.action_horizon)
+            action_dim = int(self.config.action_dim)
+            env_action_dim = int(getattr(self.config, "env_action_dim", action_dim))
+            actions_3d = actions.reshape(actions.shape[0], horizon, env_action_dim)
+            index = self._controlled_action_index_tensor(actions_3d.device)
+            return actions_3d.index_select(-1, index).reshape(actions.shape[0], -1)
         if state is None:
             raise ValueError("normalized_delta action transform requires robot state")
-        orig_shape = actions.shape
-        actions = actions.reshape(
-            actions.shape[0], self.config.action_horizon, self.config.action_dim
+        horizon = int(self.config.action_horizon)
+        action_dim = int(self.config.action_dim)
+        env_action_dim = int(getattr(self.config, "env_action_dim", action_dim))
+        orig_rank = actions.dim()
+        if actions.shape[-1] == action_dim:
+            controlled_actions = actions.reshape(actions.shape[0], horizon, action_dim)
+            controlled_state = self._select_controlled_state(
+                state, controlled_actions.device, controlled_actions.dtype
+            )
+        else:
+            full_actions = actions.reshape(actions.shape[0], horizon, env_action_dim)
+            full_state = state.to(
+                device=full_actions.device, dtype=full_actions.dtype
+            ).reshape(full_actions.shape[0], env_action_dim)
+            index = self._controlled_action_index_tensor(full_actions.device)
+            controlled_actions = full_actions.index_select(-1, index)
+            controlled_state = full_state.index_select(-1, index)
+        delta = controlled_actions.clone()
+        mask = self.delta_action_mask.to(device=delta.device)
+        delta[..., mask] = delta[..., mask] - controlled_state[:, None, :][..., mask]
+        mean = self.action_norm_mean.to(device=delta.device, dtype=delta.dtype).reshape(
+            1, 1, -1
         )
-        state = state.to(device=actions.device, dtype=actions.dtype).reshape(
-            actions.shape[0], self.config.action_dim
+        std = self.action_norm_std.to(device=delta.device, dtype=delta.dtype).reshape(
+            1, 1, -1
         )
-        delta = actions.clone()
-        mask = self.delta_action_mask.to(device=actions.device)
-        delta[..., mask] = delta[..., mask] - state[:, None, :][..., mask]
-        mean = self.action_norm_mean.to(
-            device=actions.device, dtype=actions.dtype
-        ).reshape(1, 1, -1)
-        std = self.action_norm_std.to(
-            device=actions.device, dtype=actions.dtype
-        ).reshape(1, 1, -1)
         normalized = (delta - mean) / (std + 1e-6)
-        return normalized.reshape(orig_shape)
+        if orig_rank == 3 and actions.shape[-1] == action_dim:
+            return normalized
+        return normalized.reshape(actions.shape[0], -1)
 
     def _training_action_to_absolute(
         self, actions: Tensor, state: Tensor | None
@@ -614,24 +701,41 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             return actions
         if state is None:
             raise ValueError("normalized_delta action transform requires robot state")
-        orig_shape = actions.shape
-        actions = actions.reshape(
-            actions.shape[0], self.config.action_horizon, self.config.action_dim
-        )
-        state = state.to(device=actions.device, dtype=actions.dtype).reshape(
-            actions.shape[0], self.config.action_dim
-        )
+        horizon = int(self.config.action_horizon)
+        action_dim = int(self.config.action_dim)
+        env_action_dim = int(getattr(self.config, "env_action_dim", action_dim))
+        training = actions.reshape(actions.shape[0], horizon, action_dim)
         mean = self.action_norm_mean.to(
-            device=actions.device, dtype=actions.dtype
+            device=training.device, dtype=training.dtype
         ).reshape(1, 1, -1)
         std = self.action_norm_std.to(
-            device=actions.device, dtype=actions.dtype
+            device=training.device, dtype=training.dtype
         ).reshape(1, 1, -1)
-        delta = actions * (std + 1e-6) + mean
-        absolute = delta.clone()
-        mask = self.delta_action_mask.to(device=actions.device)
-        absolute[..., mask] = absolute[..., mask] + state[:, None, :][..., mask]
-        return absolute.reshape(orig_shape)
+        controlled_delta = training * (std + 1e-6) + mean
+        controlled_abs = controlled_delta.clone()
+        controlled_state = self._select_controlled_state(
+            state, training.device, training.dtype
+        )
+        mask = self.delta_action_mask.to(device=training.device)
+        controlled_abs[..., mask] = (
+            controlled_abs[..., mask] + controlled_state[:, None, :][..., mask]
+        )
+        if (
+            env_action_dim == action_dim
+            and getattr(self.config, "controlled_action_indices", None) is None
+        ):
+            return controlled_abs
+        full_state = state.to(device=training.device, dtype=training.dtype).reshape(
+            training.shape[0], env_action_dim
+        )
+        full = full_state[:, None, :].expand(-1, horizon, -1).clone()
+        index = self._controlled_action_index_tensor(training.device)
+        full.scatter_(
+            -1,
+            index.reshape(1, 1, -1).expand(training.shape[0], horizon, -1),
+            controlled_abs,
+        )
+        return full
 
     def _zero_init_critic_outputs(self):
         for head in (self.critic_head_1, self.critic_head_2):
@@ -668,13 +772,14 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         if robot_state is not None and not isinstance(robot_state, torch.Tensor):
             robot_state = torch.tensor(robot_state, dtype=torch.float32)
         # Get VLA reference action ã = πvla(s) for actor conditioning and BC loss
-        ref_action = (
+        ref_env_action = (
             self._get_vla_ref_action(obs)
             if hasattr(self, "_get_vla_ref_action")
             else None
         )
-        if ref_action is not None:
-            ref_action = self._absolute_to_training_action(ref_action, robot_state)
+        ref_action = None
+        if ref_env_action is not None:
+            ref_action = self._absolute_to_training_action(ref_env_action, robot_state)
         if ref_action is None:
             ref_action_dim = self.config.action_horizon * self.config.action_dim
             ref_action = torch.zeros(
@@ -686,20 +791,57 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         x = self._build_x(rl_token, robot_state, ref_action)
         training_actions = self._decode_action(x, use_target=False)
         env_actions = self._training_action_to_absolute(training_actions, robot_state)
+        if (
+            ref_env_action is not None
+            and getattr(self.config, "controlled_action_indices", None) is not None
+        ):
+            ref_env_3d = ref_env_action.reshape(
+                ref_env_action.shape[0],
+                self.config.action_horizon,
+                int(getattr(self.config, "env_action_dim", self.config.action_dim)),
+            ).to(device=env_actions.device, dtype=env_actions.dtype)
+            index = self._controlled_action_index_tensor(env_actions.device)
+            env_actions = ref_env_3d.clone()
+            env_actions.scatter_(
+                -1,
+                index.reshape(1, 1, -1).expand(
+                    training_actions.shape[0], self.config.action_horizon, -1
+                ),
+                self._training_action_to_absolute(
+                    training_actions, robot_state
+                ).index_select(-1, index),
+            )
         flat_actions = training_actions.reshape(training_actions.shape[0], -1)
+        ref_flat = ref_action.reshape(ref_action.shape[0], -1).to(
+            device=flat_actions.device, dtype=flat_actions.dtype
+        )
+        actor_ref_mse = torch.mean(
+            (flat_actions.detach() - ref_flat.detach()) ** 2,
+            dim=1,
+            keepdim=True,
+        )
+        rollout_source = torch.ones(
+            flat_actions.shape[0], 1, device=flat_actions.device, dtype=torch.long
+        )
         zero_scores = training_actions.new_zeros(*training_actions.shape[:2], 1)
+        forward_inputs = {
+            "action": flat_actions,
+            "model_action": flat_actions,
+            "actor_action": flat_actions,
+            "env_action_absolute": env_actions.reshape(env_actions.shape[0], -1).cpu(),
+            "visual_latent": image_features.cpu(),
+            "ref_action": ref_flat.cpu(),
+            "actor_ref_mse": actor_ref_mse.cpu(),
+            "rollout_control_source": rollout_source.cpu(),
+        }
+        if ref_env_action is not None:
+            forward_inputs["ref_env_action_absolute"] = ref_env_action.reshape(
+                ref_env_action.shape[0], -1
+            ).cpu()
         result = {
             "prev_logprobs": zero_scores,
             "prev_values": zero_scores,
-            "forward_inputs": {
-                "action": flat_actions,
-                "model_action": flat_actions,
-                "env_action_absolute": env_actions.reshape(
-                    env_actions.shape[0], -1
-                ).cpu(),
-                "visual_latent": image_features.cpu(),
-                "ref_action": ref_action.reshape(ref_action.shape[0], -1).cpu(),
-            },
+            "forward_inputs": forward_inputs,
         }
         return env_actions, result
 
@@ -844,7 +986,8 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
     def _decode_action(self, x: Tensor, use_target: bool) -> Tensor:
         head = self.target_actor_head if use_target else self.actor_head
         flat = head(x)
-        if self.config.actor_output_bound is not None:
+        residual_ref = bool(getattr(head, "residual_ref", False))
+        if self.config.actor_output_bound is not None and not residual_ref:
             bound = float(self.config.actor_output_bound)
             flat = bound * torch.tanh(flat / bound)
         return flat.reshape(
@@ -887,9 +1030,9 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         parts = [rl_token]
         if self.use_robot_state and robot_state is not None:
             parts.append(
-                robot_state.to(device=rl_token.device, dtype=rl_token.dtype).reshape(
-                    rl_token.shape[0], -1
-                )
+                self._select_controlled_state(
+                    robot_state, rl_token.device, rl_token.dtype
+                ).reshape(rl_token.shape[0], -1)
             )
         if ref_action is not None:
             parts.append(
@@ -920,9 +1063,9 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             parts.append(rl_token)
         if self.critic_use_robot_state and robot_state is not None:
             parts.append(
-                robot_state.to(device=rl_token.device, dtype=rl_token.dtype).reshape(
-                    rl_token.shape[0], -1
-                )
+                self._select_controlled_state(
+                    robot_state, rl_token.device, rl_token.dtype
+                ).reshape(rl_token.shape[0], -1)
             )
         if self.critic_use_ref_action and ref_action is not None:
             parts.append(

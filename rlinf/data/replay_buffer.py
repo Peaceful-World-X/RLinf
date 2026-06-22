@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The GIGA Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -240,6 +240,10 @@ class TrajectoryReplayBuffer:
         auto_save: bool = False,
         auto_save_path: str = "",
         trajectory_format: str = "pt",
+        cache_obs_keys: Optional[list[str]] = None,
+        cache_forward_input_keys: Optional[list[str]] = None,
+        save_executor_workers: int = 20,
+        checkpoint_executor_workers: int = 20,
     ):
         """
         Initialize trajectory-based replay buffer.
@@ -257,8 +261,19 @@ class TrajectoryReplayBuffer:
         self.enable_cache = enable_cache
         self.sample_window_size = sample_window_size
         self.sample_tail_window_size = 0
+        self.sample_forward_input_filter_key: str | None = None
+        self.sample_forward_input_filter_max: float | None = None
+        self.sample_forward_input_filter_min: float | None = None
         self.auto_save = auto_save
         self.logger = get_logger()
+        self.cache_obs_keys = (
+            {str(key) for key in cache_obs_keys} if cache_obs_keys is not None else None
+        )
+        self.cache_forward_input_keys = (
+            {str(key) for key in cache_forward_input_keys}
+            if cache_forward_input_keys is not None
+            else None
+        )
 
         if not self.auto_save:
             self.logger.warning(
@@ -293,6 +308,7 @@ class TrajectoryReplayBuffer:
         # Trajectory file path: dict mapping trajectory_id to trajectory file path
         # this enables each trajectory to be saved to or loaded from a separate file
         self._trajectory_file_path: dict[int, str] = {}
+        self._trajectory_save_futures: dict[int, object] = {}
 
         self._trajectory_counter = 0  # Next trajectory ID to use
         self._index_version = 0
@@ -303,9 +319,13 @@ class TrajectoryReplayBuffer:
         )
 
         # Async save executor for add_trajectories
-        self._save_executor = ThreadPoolExecutor(max_workers=20)
+        self._save_executor = ThreadPoolExecutor(
+            max_workers=max(1, int(save_executor_workers))
+        )
         # Separate executor for checkpoint saves
-        self._checkpoint_executor = ThreadPoolExecutor(max_workers=20)
+        self._checkpoint_executor = ThreadPoolExecutor(
+            max_workers=max(1, int(checkpoint_executor_workers))
+        )
         self._index_lock = threading.Lock()
 
         # Cached window metadata for faster sampling
@@ -397,6 +417,137 @@ class TrajectoryReplayBuffer:
     def set_sample_tail_window_size(self, tail_window_size: int) -> None:
         self.sample_tail_window_size = max(0, int(tail_window_size))
 
+    def set_sample_forward_input_filter(
+        self,
+        key: str | None,
+        *,
+        max_value: float | None = None,
+        min_value: float | None = None,
+    ) -> None:
+        self.sample_forward_input_filter_key = str(key) if key else None
+        self.sample_forward_input_filter_max = (
+            None if max_value is None else float(max_value)
+        )
+        self.sample_forward_input_filter_min = (
+            None if min_value is None else float(min_value)
+        )
+
+    def _invalidate_sampling_caches(self) -> None:
+        if self._flat_trajectory_cache is not None:
+            self._flat_trajectory_cache.clear()
+        self._window_cache_size = None
+        self._window_cache_version = None
+        self._window_cache_ids = []
+        self._window_cache_cumulative_ends = []
+        self._window_cache_cumulative_ends_tensor = None
+        self._window_cache_total_samples = 0
+        self._tail_window_cache_size = None
+        self._tail_window_cache_version = None
+        self._tail_window_cache_window_size = 0
+        self._tail_window_cache_ids = []
+        self._tail_window_cache_cumulative_ends = []
+        self._tail_window_cache_cumulative_ends_tensor = None
+        self._tail_window_cache_total_samples = 0
+
+    def delete_last_trajectory(self) -> dict[str, object]:
+        """Delete the most recently added trajectory from memory and disk."""
+        with self._index_lock:
+            if not self._trajectory_id_list:
+                return {"deleted": False, "reason": "empty"}
+
+            trajectory_id = int(self._trajectory_id_list.pop())
+            trajectory_info = self._trajectory_index.pop(trajectory_id, None)
+            model_weights_id = (
+                trajectory_info.get("model_weights_id", "")
+                if trajectory_info is not None
+                else ""
+            )
+            num_samples = (
+                int(trajectory_info.get("num_samples", 0))
+                if trajectory_info is not None
+                else 0
+            )
+            base_dir = self._trajectory_file_path.pop(
+                trajectory_id, self.auto_save_path
+            )
+            save_future = self._trajectory_save_futures.pop(trajectory_id, None)
+
+            self.size = max(0, self.size - 1)
+            self._total_samples = max(0, self._total_samples - num_samples)
+            self._trajectory_counter = (
+                max(self._trajectory_id_list) + 1 if self._trajectory_id_list else 0
+            )
+            self._index_version += 1
+            self._invalidate_sampling_caches()
+
+        if save_future is not None:
+            save_future.result()
+
+        trajectory_path = None
+        file_deleted = False
+        if self.auto_save and model_weights_id:
+            trajectory_path = self._get_trajectory_path(
+                trajectory_id,
+                str(model_weights_id),
+                base_dir=base_dir,
+            )
+            if os.path.exists(trajectory_path):
+                os.remove(trajectory_path)
+                file_deleted = True
+
+        if self.auto_save:
+            self._save_metadata()
+            self._save_trajectory_index()
+
+        return {
+            "deleted": True,
+            "trajectory_id": trajectory_id,
+            "num_samples": num_samples,
+            "path": trajectory_path,
+            "file_deleted": file_deleted,
+            "num_trajectories": self.size,
+            "total_samples": self._total_samples,
+        }
+
+    def _valid_local_indices_for_filter(
+        self, flat: dict, num_samples: int
+    ) -> torch.Tensor | None:
+        key = self.sample_forward_input_filter_key
+        if not key:
+            return None
+        forward_inputs = flat.get("forward_inputs", None)
+        if not isinstance(forward_inputs, dict):
+            return None
+        value = forward_inputs.get(key, None)
+        if not torch.is_tensor(value):
+            return None
+        value = value.reshape(value.shape[0], -1).float()
+        if value.shape[0] <= 0:
+            return torch.empty(0, dtype=torch.long)
+        mask = torch.ones(value.shape[0], dtype=torch.bool, device=value.device)
+        if self.sample_forward_input_filter_max is not None:
+            mask &= value[:, 0] <= float(self.sample_forward_input_filter_max)
+        if self.sample_forward_input_filter_min is not None:
+            mask &= value[:, 0] >= float(self.sample_forward_input_filter_min)
+        valid = torch.nonzero(mask.cpu(), as_tuple=False).reshape(-1).to(torch.long)
+        valid = valid[valid < int(num_samples)]
+        return valid
+
+    def _sample_local_from_filter(
+        self, flat: dict, num_samples: int, fallback_local: int
+    ) -> int:
+        valid = self._valid_local_indices_for_filter(flat, int(num_samples))
+        if valid is None:
+            return int(fallback_local)
+        if valid.numel() == 0:
+            return int(fallback_local)
+        pick = int(
+            torch.randint(
+                0, int(valid.numel()), (1,), generator=self.random_generator
+            ).item()
+        )
+        return int(valid[pick].item())
+
     def _init_random_generator(self, seed):
         """(Re)initialize numpy and torch RNGs from self.seed."""
         np.random.seed(seed)
@@ -483,6 +634,9 @@ class TrajectoryReplayBuffer:
             raise ValueError(f"Trajectory {trajectory_id} not found in index")
 
         trajectory_info = self._trajectory_index[trajectory_id]
+        save_future = self._trajectory_save_futures.get(trajectory_id, None)
+        if save_future is not None:
+            save_future.result()
 
         trajectory_path = self._get_trajectory_path(
             trajectory_id,
@@ -540,17 +694,28 @@ class TrajectoryReplayBuffer:
             else:
                 continue  # Skip empty trajectories
 
+            flat_trajectory = self._flatten_trajectory(trajectory)
+            flat_num_samples = self._flat_num_samples(flat_trajectory)
+            if flat_num_samples <= 0:
+                continue
+            if flat_num_samples != num_samples:
+                self.logger.warning(
+                    f"Trajectory {trajectory_id} has inconsistent tensor lengths; "
+                    f"indexing only first {flat_num_samples} samples instead of {num_samples}."
+                )
+                num_samples = min(num_samples, flat_num_samples)
+
             # Save trajectory to disk if enabled
             if self.auto_save:
                 # Save asynchronously to reduce I/O stalls
-                save_futures.append(
-                    self._save_executor.submit(
-                        self._save_trajectory,
-                        trajectory,
-                        trajectory_id,
-                        model_weights_id,
-                    )
+                save_future = self._save_executor.submit(
+                    self._save_trajectory,
+                    trajectory,
+                    trajectory_id,
+                    model_weights_id,
                 )
+                save_futures.append(save_future)
+                self._trajectory_save_futures[trajectory_id] = save_future
                 self._trajectory_file_path[trajectory_id] = self.auto_save_path
 
             # Add to index
@@ -574,7 +739,7 @@ class TrajectoryReplayBuffer:
             if self._flat_trajectory_cache is not None:
                 self._flat_trajectory_cache.put(
                     trajectory_id,
-                    self._flatten_trajectory(trajectory),
+                    flat_trajectory,
                 )
 
         # Save metadata/index after all trajectory saves finish
@@ -786,6 +951,8 @@ class TrajectoryReplayBuffer:
                 cached_mask = torch.zeros_like(traj_ids_tensor, dtype=torch.bool)
         else:
             cached_mask = torch.zeros_like(traj_ids_tensor, dtype=torch.bool)
+        if self.sample_forward_input_filter_key:
+            cached_mask = torch.zeros_like(traj_ids_tensor, dtype=torch.bool)
 
         # 1) Cache hits: gather from cache buffer.
         if torch.any(cached_mask):
@@ -818,7 +985,10 @@ class TrajectoryReplayBuffer:
                 flat_trajectory = self._flatten_trajectory(trajectory)
                 miss_flats.append(flat_trajectory)
                 traj_offsets[tid] = cursor
-                cursor += self._trajectory_index[tid]["num_samples"]
+                cursor += min(
+                    int(self._trajectory_index[tid]["num_samples"]),
+                    self._flat_num_samples(flat_trajectory),
+                )
 
             concat_flat = self._concat_flat_trajectories(miss_flats)
             if batch is None:
@@ -829,6 +999,21 @@ class TrajectoryReplayBuffer:
                 [traj_offsets[tid] for tid in miss_traj_ids_samples], dtype=torch.long
             )
             miss_local = local_sample_indices[miss_mask]
+            if self.sample_forward_input_filter_key:
+                adjusted_locals = []
+                flat_by_tid = {
+                    int(tid): flat for tid, flat in zip(miss_traj_ids, miss_flats)
+                }
+                for tid, local in zip(miss_traj_ids_samples, miss_local.tolist()):
+                    info = self._trajectory_index[int(tid)]
+                    adjusted_locals.append(
+                        self._sample_local_from_filter(
+                            flat_by_tid[int(tid)],
+                            int(info["num_samples"]),
+                            int(local),
+                        )
+                    )
+                miss_local = torch.as_tensor(adjusted_locals, dtype=torch.long)
             miss_buffer_indices = miss_offsets + miss_local
             miss_batch_indices = batch_indices_tensor[miss_mask]
             self._fill_batch_from_buffer_indices(
@@ -885,7 +1070,7 @@ class TrajectoryReplayBuffer:
             info = self._trajectory_index[tid]
             trajectory = self._load_trajectory(tid, info["model_weights_id"])
             flat = self._flatten_trajectory(trajectory)
-            num_samples = int(info["num_samples"])
+            num_samples = min(int(info["num_samples"]), self._flat_num_samples(flat))
             available = (
                 min(num_samples, int(tail_window_size))
                 if int(tail_window_size) > 0
@@ -895,10 +1080,25 @@ class TrajectoryReplayBuffer:
             local = (
                 int(torch.randint(0, available, (1,), generator=rng).item()) + offset
             )
+            local = self._sample_local_from_filter(flat, num_samples, local)
             flats.append(flat)
             buffer_indices.append(local)
 
         return self._sample_from_flat_specs(flats, buffer_indices)
+
+    def _flat_num_samples(self, flat: dict) -> int:
+        lengths: list[int] = []
+
+        def collect(obj):
+            if torch.is_tensor(obj):
+                if obj.dim() >= 1:
+                    lengths.append(int(obj.shape[0]))
+            elif isinstance(obj, dict):
+                for nested_value in obj.values():
+                    collect(nested_value)
+
+        collect(flat)
+        return min(lengths) if lengths else 0
 
     def _sample_from_flat_specs(
         self,
@@ -1154,6 +1354,8 @@ class TrajectoryReplayBuffer:
         ref_actions = self._infer_ref_actions(trajectory)
 
         for field in tensor_fields:
+            if field == "versions":
+                continue
             tensor = getattr(trajectory, field)
             if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
                 if field in ["dones", "terminations", "truncations"]:
@@ -1172,6 +1374,8 @@ class TrajectoryReplayBuffer:
         if trajectory.curr_obs:
             flat["curr_obs"] = {}
             for key, tensor in trajectory.curr_obs.items():
+                if self.cache_obs_keys is not None and key not in self.cache_obs_keys:
+                    continue
                 if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
                     flat["curr_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
             if ref_actions is not None and "ref_action" not in flat["curr_obs"]:
@@ -1182,6 +1386,8 @@ class TrajectoryReplayBuffer:
         if trajectory.next_obs:
             flat["next_obs"] = {}
             for key, tensor in trajectory.next_obs.items():
+                if self.cache_obs_keys is not None and key not in self.cache_obs_keys:
+                    continue
                 if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
                     flat["next_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
             if ref_actions is not None and "ref_action" not in flat["next_obs"]:
@@ -1198,6 +1404,11 @@ class TrajectoryReplayBuffer:
         if trajectory.forward_inputs:
             flat["forward_inputs"] = {}
             for key, tensor in trajectory.forward_inputs.items():
+                if (
+                    self.cache_forward_input_keys is not None
+                    and key not in self.cache_forward_input_keys
+                ):
+                    continue
                 if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
                     flat["forward_inputs"][key] = tensor.reshape(-1, *tensor.shape[2:])
 

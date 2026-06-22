@@ -1,4 +1,4 @@
-# Copyright 2026 The GIGA Authors.
+# Copyright 2025 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,7 +38,6 @@ from rlinf.utils.nested_dict_process import (
     split_dict,
     update_nested_cfg,
 )
-from rlinf.utils.offline_td3_visualization import SimpleUrdfKinematics
 from rlinf.utils.placement import HybridComponentPlacement
 
 
@@ -92,12 +91,6 @@ class EnvWorker(Worker):
         self.rollout_gate_warmup_chunks = int(
             actor_model_cfg.get("rollout_gate_warmup_chunks", 0)
         )
-        self.rollout_gate_min_chunk_idx = int(
-            actor_model_cfg.get("rollout_gate_min_chunk_idx", 0)
-        )
-        self.rollout_gate_reset_on_episode_start = bool(
-            actor_model_cfg.get("rollout_gate_reset_on_episode_start", True)
-        )
         self.rollout_gate_require_gripper_closed = bool(
             actor_model_cfg.get("rollout_gate_require_gripper_closed", False)
         )
@@ -107,55 +100,14 @@ class EnvWorker(Worker):
         self.rollout_gate_gripper_closed_threshold = float(
             actor_model_cfg.get("rollout_gate_gripper_closed_threshold", 0.035)
         )
-        self.rollout_gate_gripper_open_threshold = float(
-            actor_model_cfg.get("rollout_gate_gripper_open_threshold", 0.055)
-        )
-        self.rollout_gate_require_open_then_close = bool(
-            actor_model_cfg.get("rollout_gate_require_open_then_close", True)
-        )
         self.rollout_gate_gripper_stable_chunks = int(
             actor_model_cfg.get("rollout_gate_gripper_stable_chunks", 2)
         )
-        self.rollout_gate_tcp_target = actor_model_cfg.get(
-            "rollout_gate_tcp_target", None
-        )
-        self.rollout_gate_tcp_radius = float(
-            actor_model_cfg.get("rollout_gate_tcp_radius", 0.0)
-        )
-        self.rollout_gate_tcp_base_offset = np.asarray(
-            actor_model_cfg.get("rollout_gate_tcp_base_offset", [0.0, -0.22, 0.0]),
-            dtype=np.float64,
-        ).reshape(3)
-        self.rollout_gate_tcp_urdf_path = str(
-            actor_model_cfg.get("rollout_gate_tcp_urdf_path", "")
-        )
-        self._rollout_gate_tcp_kin = None
-        self._rollout_gate_tcp_error = None
-        self._rollout_gate_last_tcp_distance = None
-        self._rollout_gate_tcp_ready = self.rollout_gate_tcp_radius <= 0
-        if self.rollout_gate_tcp_radius > 0:
-            try:
-                if self.rollout_gate_tcp_target is None:
-                    raise ValueError("rollout_gate_tcp_target is not configured")
-                self.rollout_gate_tcp_target = np.asarray(
-                    self.rollout_gate_tcp_target, dtype=np.float64
-                ).reshape(3)
-                self._rollout_gate_tcp_kin = SimpleUrdfKinematics(
-                    self.rollout_gate_tcp_urdf_path
-                )
-            except Exception as exc:
-                self._rollout_gate_tcp_error = str(exc)
-                self._rollout_gate_tcp_kin = None
-                self._rollout_gate_tcp_ready = False
         self._rollout_gate_stable_count = 0
         self._rollout_gate_actor_enabled = False
         self._rollout_gate_gripper_stable_count = 0
         self._rollout_gate_gripper_ready = not self.rollout_gate_require_gripper_closed
-        self._rollout_gate_gripper_has_opened = False
         self._rollout_gate_last_gripper_value = None
-        self._rollout_gate_last_gripper_source = "none"
-        self._rollout_gate_last_chunk_step_idx = -1
-        self._rollout_gate_gripper_debug_count = 0
         self.stage_num = self.cfg.rollout.pipeline_stage_num
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
@@ -581,7 +533,6 @@ class EnvWorker(Worker):
         )
         if torch.is_tensor(source_tensor) and source_tensor.numel() > 0:
             source = "ACTOR" if int(source_tensor.reshape(-1)[0].item()) == 1 else "VLA"
-        actor_only = bool(self.online_control_cfg.get("print_status_actor_only", True))
         mse_tensor = rollout_result.forward_inputs.get("actor_ref_mse", None)
         mse_text = "nan"
         if torch.is_tensor(mse_tensor) and mse_tensor.numel() > 0:
@@ -597,8 +548,6 @@ class EnvWorker(Worker):
                 intervene_steps = int(flags[0].to(torch.int64).sum().item())
             else:
                 intervene_steps = int(flags.to(torch.int64).sum().item())
-        if actor_only and source != "ACTOR" and intervene_steps <= 0:
-            return
         reward_sum = "nan"
         reward_last = "nan"
         if env_output.rewards is not None:
@@ -620,28 +569,15 @@ class EnvWorker(Worker):
             gripper_text = "nan" if gripper_value is None else f"{gripper_value:.5g}"
             gripper_gate_text = (
                 f" gripper_ready={int(bool(self._rollout_gate_gripper_ready))}"
-                f" gripper_opened={int(bool(self._rollout_gate_gripper_has_opened))}"
                 f" gripper={gripper_text}"
-                f" gripper_source={self._rollout_gate_last_gripper_source}"
                 f" gripper_stable={int(self._rollout_gate_gripper_stable_count)}"
             )
-        tcp_gate_text = ""
-        if self.rollout_gate_tcp_radius > 0:
-            tcp_dist = self._rollout_gate_last_tcp_distance
-            tcp_dist_text = "nan" if tcp_dist is None else f"{tcp_dist:.4f}"
-            tcp_gate_text = (
-                f" tcp_ready={int(bool(self._rollout_gate_tcp_ready))}"
-                f" tcp_dist={tcp_dist_text}"
-                f" tcp_radius={float(self.rollout_gate_tcp_radius):.4f}"
-            )
-            if self._rollout_gate_tcp_error is not None:
-                tcp_gate_text += f" tcp_error={self._rollout_gate_tcp_error}"
         print(
             "[online-env] "
             f"chunk={chunk_step_idx} owner={source} executed={executed} "
             f"actor_ref_mse={mse_text} valid_steps={valid_steps} "
             f"intervene_steps={intervene_steps} reward_sum={reward_sum} reward_last={reward_last}"
-            f"{action_stats_text}{gripper_gate_text}{tcp_gate_text}",
+            f"{action_stats_text}{gripper_gate_text}",
             flush=True,
         )
 
@@ -651,118 +587,31 @@ class EnvWorker(Worker):
             return None
         return float(mse_tensor.detach().float().mean().item())
 
-    def _current_gripper_value(self, obs_source=None) -> float | None:
+    def _current_gripper_value(self) -> float | None:
+        if not self.last_obs_list:
+            return None
+        obs = self.last_obs_list[0]
+        if isinstance(obs, (list, tuple)):
+            obs = obs[0] if obs else None
+        if not isinstance(obs, dict):
+            return None
+        states = obs.get("states", None)
+        if not torch.is_tensor(states):
+            return None
+        flat = states.detach().float().reshape(-1)
         index = int(self.rollout_gate_gripper_state_index)
-        flat = self._current_flat_robot_state(obs_source)
-        if flat is not None and 0 <= index < flat.numel():
-            return float(flat[index].item())
-        return None
-
-    def _iter_obs_candidates(self, obj):
-        if obj is None:
-            return
-        if isinstance(obj, (list, tuple)):
-            for item in obj:
-                yield from self._iter_obs_candidates(item)
-            return
-        if isinstance(obj, dict):
-            yield obj
-
-    def _coerce_flat_state(self, value):
-        if value is None:
+        if index < 0 or index >= flat.numel():
             return None
-        if torch.is_tensor(value):
-            return value.detach().float().reshape(-1)
-        try:
-            return torch.as_tensor(np.asarray(value), dtype=torch.float32).reshape(-1)
-        except Exception:
-            return None
+        return float(flat[index].item())
 
-    def _current_flat_robot_state(self, obs_source=None) -> torch.Tensor | None:
-        obs_sources = (
-            [obs_source]
-            if obs_source is not None
-            else list(reversed(self.last_obs_list))
-        )
-        if not obs_sources:
-            return None
-        state_keys = (
-            "states",
-            "robot_state",
-            "state",
-            "observation/state",
-            "observation_state",
-        )
-        for obs_source in obs_sources:
-            for obs in self._iter_obs_candidates(obs_source):
-                for key in state_keys:
-                    flat = self._coerce_flat_state(obs.get(key, None))
-                    if flat is not None and flat.numel() >= 14:
-                        return flat
-        return None
-
-    def _update_tcp_gate(self, obs_source=None) -> bool:
-        if self.rollout_gate_tcp_radius <= 0:
-            self._rollout_gate_tcp_ready = True
-            return True
-        self._rollout_gate_tcp_ready = False
-        self._rollout_gate_last_tcp_distance = None
-        if self._rollout_gate_tcp_kin is None:
-            return False
-        state = self._current_flat_robot_state(obs_source)
-        if state is None or state.numel() < 14:
-            return False
-        try:
-            q = state[7:14].detach().cpu().numpy().astype(np.float64)
-            links, _ = self._rollout_gate_tcp_kin.fk_positions(q, tip_link="gripper")
-            tcp = (
-                np.asarray(links[-1], dtype=np.float64)
-                + self.rollout_gate_tcp_base_offset
-            )
-            distance = float(np.linalg.norm(tcp - self.rollout_gate_tcp_target))
-        except Exception as exc:
-            self._rollout_gate_tcp_error = str(exc)
-            return False
-        self._rollout_gate_last_tcp_distance = distance
-        self._rollout_gate_tcp_ready = distance <= float(self.rollout_gate_tcp_radius)
-        return self._rollout_gate_tcp_ready
-
-    def _tcp_distance_tensor(self, obs_source=None) -> torch.Tensor | None:
-        if self.rollout_gate_tcp_radius <= 0:
-            return None
-        if self._rollout_gate_last_tcp_distance is None:
-            self._update_tcp_gate(obs_source)
-        if self._rollout_gate_last_tcp_distance is None:
-            return None
-        return torch.as_tensor(
-            [[float(self._rollout_gate_last_tcp_distance)]], dtype=torch.float32
-        )
-
-    def _apply_gripper_gate_value(
-        self, gripper_value: float | None, source: str = "obs"
-    ) -> bool:
+    def _update_gripper_gate(self) -> bool:
         if not self.rollout_gate_require_gripper_closed:
             self._rollout_gate_gripper_ready = True
             return True
 
+        gripper_value = self._current_gripper_value()
         self._rollout_gate_last_gripper_value = gripper_value
         if gripper_value is None:
-            self._rollout_gate_last_gripper_source = "none"
-            self._rollout_gate_gripper_stable_count = 0
-            self._rollout_gate_gripper_ready = False
-            return False
-        self._rollout_gate_last_gripper_source = source
-
-        if gripper_value >= self.rollout_gate_gripper_open_threshold:
-            self._rollout_gate_gripper_has_opened = True
-            self._rollout_gate_gripper_stable_count = 0
-            self._rollout_gate_gripper_ready = False
-            return False
-
-        if (
-            self.rollout_gate_require_open_then_close
-            and not self._rollout_gate_gripper_has_opened
-        ):
             self._rollout_gate_gripper_stable_count = 0
             self._rollout_gate_gripper_ready = False
             return False
@@ -779,107 +628,24 @@ class EnvWorker(Worker):
             self._rollout_gate_gripper_ready = True
         return self._rollout_gate_gripper_ready
 
-    def _update_gripper_gate(self, obs_source=None) -> bool:
-        gripper_value = self._current_gripper_value(obs_source)
-        if gripper_value is None:
-            return self._rollout_gate_gripper_ready
-        return self._apply_gripper_gate_value(gripper_value, source="obs")
-
-    def _update_gripper_gate_from_action_chunk(self, chunk_actions) -> None:
-        if not self.rollout_gate_require_gripper_closed:
-            return
-        if chunk_actions is None:
-            return
-        try:
-            if torch.is_tensor(chunk_actions):
-                actions = chunk_actions.detach().float().cpu().numpy()
-            else:
-                actions = np.asarray(chunk_actions, dtype=np.float32)
-            action_dim = int(self.cfg.actor.model.get("env_action_dim", 14))
-            actions = actions.reshape(actions.shape[0], -1, action_dim)
-            index = int(self.rollout_gate_gripper_state_index)
-            if not (0 <= index < action_dim):
-                return
-            values = actions[0, :, index].reshape(-1)
-        except Exception:
-            return
-        saw_open = False
-        for value in values:
-            gripper_value = float(value)
-            self._rollout_gate_last_gripper_value = gripper_value
-            self._rollout_gate_last_gripper_source = "action"
-            if gripper_value >= self.rollout_gate_gripper_open_threshold:
-                saw_open = True
-                self._rollout_gate_gripper_has_opened = True
-                self._rollout_gate_gripper_stable_count = 0
-                self._rollout_gate_gripper_ready = False
-
-        if (
-            self.rollout_gate_require_open_then_close
-            and not self._rollout_gate_gripper_has_opened
-        ):
-            self._rollout_gate_gripper_stable_count = 0
-            self._rollout_gate_gripper_ready = False
-            return
-
-        last_value = float(values[-1])
-        if (
-            self._rollout_gate_gripper_has_opened
-            and last_value <= self.rollout_gate_gripper_closed_threshold
-        ):
-            self._rollout_gate_gripper_stable_count += 1
-        elif not saw_open:
-            self._rollout_gate_gripper_stable_count = 0
-            self._rollout_gate_gripper_ready = False
-
-        if self._rollout_gate_gripper_stable_count >= max(
-            1, self.rollout_gate_gripper_stable_chunks
-        ):
-            self._rollout_gate_gripper_ready = True
-
     def _reset_actor_gate(self) -> None:
         self._rollout_gate_stable_count = 0
         self._rollout_gate_actor_enabled = False
 
-    def _reset_rollout_gate(self) -> None:
-        self._reset_actor_gate()
-        self._rollout_gate_gripper_stable_count = 0
-        self._rollout_gate_gripper_ready = not self.rollout_gate_require_gripper_closed
-        self._rollout_gate_gripper_has_opened = False
-        self._rollout_gate_last_gripper_value = None
-        self._rollout_gate_last_gripper_source = "none"
-
     def _should_force_vla_rollout(
-        self,
-        rollout_result: RolloutResult,
-        chunk_step_idx: int,
-        obs_source=None,
+        self, rollout_result: RolloutResult, chunk_step_idx: int
     ) -> bool:
-        if (
-            self.rollout_gate_reset_on_episode_start
-            and chunk_step_idx <= self._rollout_gate_last_chunk_step_idx
-        ):
-            self._reset_rollout_gate()
-        self._rollout_gate_last_chunk_step_idx = int(chunk_step_idx)
         if self.rollout_control_mode != "gate":
             return (
                 self.vla_warmup_chunk_steps > 0
                 and chunk_step_idx < self.vla_warmup_chunk_steps
             )
         mse_value = self._actor_ref_mse_value(rollout_result)
-        warmup_chunks = max(
-            self.vla_warmup_chunk_steps, self.rollout_gate_warmup_chunks
-        )
+        warmup_chunks = max(self.vla_warmup_chunk_steps, self.rollout_gate_warmup_chunks)
         if chunk_step_idx < warmup_chunks:
             self._reset_actor_gate()
             return True
-        if chunk_step_idx < self.rollout_gate_min_chunk_idx:
-            self._reset_actor_gate()
-            return True
-        if not self._update_gripper_gate(obs_source):
-            self._reset_actor_gate()
-            return True
-        if not self._update_tcp_gate(obs_source):
+        if not self._update_gripper_gate():
             self._reset_actor_gate()
             return True
         if mse_value is None:
@@ -887,22 +653,17 @@ class EnvWorker(Worker):
             return True
         if mse_value <= self.rollout_gate_mse_threshold:
             self._rollout_gate_stable_count += 1
-            if self._rollout_gate_stable_count >= max(
-                1, self.rollout_gate_stable_chunks
-            ):
+            if self._rollout_gate_stable_count >= max(1, self.rollout_gate_stable_chunks):
                 self._rollout_gate_actor_enabled = True
         elif mse_value >= self.rollout_gate_disable_mse_threshold:
             self._reset_actor_gate()
         return not self._rollout_gate_actor_enabled
 
     def _select_train_exec_action(
-        self,
-        rollout_result: RolloutResult,
-        chunk_step_idx: int,
-        obs_source=None,
+        self, rollout_result: RolloutResult, chunk_step_idx: int
     ) -> torch.Tensor:
         """Select an env-space action chunk for online rollout execution."""
-        if self._should_force_vla_rollout(rollout_result, chunk_step_idx, obs_source):
+        if self._should_force_vla_rollout(rollout_result, chunk_step_idx):
             ref_env_action = rollout_result.forward_inputs.get(
                 "ref_env_action_absolute", None
             )
@@ -913,7 +674,9 @@ class EnvWorker(Worker):
     def _reshape_env_action_chunk(self, action: torch.Tensor) -> torch.Tensor:
         horizon = int(self.cfg.actor.model.num_action_chunks)
         env_dim = int(
-            self.cfg.actor.model.get("env_action_dim", self.cfg.actor.model.action_dim)
+            self.cfg.actor.model.get(
+                "env_action_dim", self.cfg.actor.model.action_dim
+            )
         )
         if torch.is_tensor(action):
             return action.reshape(action.shape[0], horizon, env_dim)
@@ -923,7 +686,6 @@ class EnvWorker(Worker):
         self,
         rollout_result: RolloutResult,
         chunk_step_idx: int,
-        obs_source=None,
     ) -> bool:
         """Force per-episode VLA control before the learned last-k segment.
 
@@ -932,9 +694,7 @@ class EnvWorker(Worker):
         control: early chunks should execute and train on the VLA reference action,
         while only late chunks may use actor actions.
         """
-        if not self._should_force_vla_rollout(
-            rollout_result, chunk_step_idx, obs_source
-        ):
+        if not self._should_force_vla_rollout(rollout_result, chunk_step_idx):
             return False
         forward_inputs = rollout_result.forward_inputs
         if not isinstance(forward_inputs, dict):
@@ -993,9 +753,7 @@ class EnvWorker(Worker):
         if env_action is None:
             env_action = fallback_env_action
         if torch.is_tensor(env_action):
-            env_action = (
-                env_action.detach().cpu().reshape(env_action.shape[0], -1).contiguous()
-            )
+            env_action = env_action.detach().cpu().reshape(env_action.shape[0], -1).contiguous()
         elif isinstance(env_action, np.ndarray):
             env_action = (
                 torch.from_numpy(env_action)
@@ -1010,7 +768,9 @@ class EnvWorker(Worker):
                 forward_inputs.get("executed_env_action_absolute", None)
             ):
                 forward_inputs["executed_env_action_absolute"] = env_action
-            if not torch.is_tensor(forward_inputs.get("ref_env_action_absolute", None)):
+            if not torch.is_tensor(
+                forward_inputs.get("ref_env_action_absolute", None)
+            ):
                 forward_inputs["ref_env_action_absolute"] = env_action
 
         action = forward_inputs.get("action", None)
@@ -1078,60 +838,6 @@ class EnvWorker(Worker):
                     ref_action = action
                 forward_inputs["ref_action_before_intervention"] = ref_action
 
-    def _training_action_from_env_action(
-        self,
-        env_action: torch.Tensor | np.ndarray,
-        curr_obs: dict[str, Any] | None,
-    ) -> torch.Tensor:
-        state = None
-        if isinstance(curr_obs, dict):
-            state = curr_obs.get("states", None)
-        if isinstance(state, np.ndarray):
-            state = torch.from_numpy(state)
-        if torch.is_tensor(state):
-            state = state.detach().cpu()
-        if isinstance(env_action, np.ndarray):
-            env_action = torch.from_numpy(env_action).to(torch.float32)
-        return (
-            self._absolute_to_training_action_tensor(
-                self._reshape_env_action_chunk(env_action),
-                state,
-            )
-            .detach()
-            .cpu()
-            .contiguous()
-        )
-
-    def _sync_last_executed_training_action(
-        self,
-        stage_id: int,
-        curr_obs: dict[str, Any] | None,
-        executed_env_action: torch.Tensor | np.ndarray,
-        flags: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        executed_train_action = self._training_action_from_env_action(
-            executed_env_action, curr_obs
-        )
-        self.rollout_results[stage_id].update_last_actions(executed_train_action, flags)
-        if self.rollout_results[stage_id].forward_inputs:
-            last_fi = self.rollout_results[stage_id].forward_inputs[-1]
-            if isinstance(executed_env_action, np.ndarray):
-                executed_env_tensor = torch.from_numpy(executed_env_action).to(
-                    torch.float32
-                )
-            else:
-                executed_env_tensor = (
-                    executed_env_action.detach().cpu().to(torch.float32)
-                )
-            last_fi["executed_env_action_absolute"] = (
-                executed_env_tensor.reshape(executed_env_tensor.shape[0], -1)
-                .cpu()
-                .contiguous()
-            )
-            last_fi["action"] = executed_train_action
-            last_fi["executed_action"] = executed_train_action
-        return executed_train_action
-
     def _executed_action_stats(self, chunk_actions) -> dict[str, float]:
         if torch.is_tensor(chunk_actions):
             actions = chunk_actions.detach().float().cpu().numpy()
@@ -1147,20 +853,13 @@ class EnvWorker(Worker):
         return {
             "left_span": float(np.max(np.abs(left[-1] - left[0]))),
             "right_span": float(np.max(np.abs(right[-1] - right[0]))),
-            "left_step": float(np.max(np.abs(np.diff(left, axis=0))))
-            if len(left) > 1
-            else 0.0,
-            "right_step": float(np.max(np.abs(np.diff(right, axis=0))))
-            if len(right) > 1
-            else 0.0,
+            "left_step": float(np.max(np.abs(np.diff(left, axis=0)))) if len(left) > 1 else 0.0,
+            "right_step": float(np.max(np.abs(np.diff(right, axis=0)))) if len(right) > 1 else 0.0,
         }
 
     @Worker.timer("env_interact_step")
     def env_interact_step(
-        self,
-        chunk_actions: torch.Tensor,
-        stage_id: int,
-        curr_obs: dict[str, Any] | None = None,
+        self, chunk_actions: torch.Tensor, stage_id: int
     ) -> tuple[EnvOutput, dict[str, Any], dict[str, torch.Tensor]]:
         """
         This function is used to interact with the environment.
@@ -1219,32 +918,19 @@ class EnvWorker(Worker):
             online_forward_inputs.update(
                 self._stack_substep_obs(infos.get("substep_obs"))
             )
-        executed_chunk_actions = (
-            infos.get("executed_chunk_actions", None)
-            if isinstance(infos, dict)
-            else None
-        )
-        if executed_chunk_actions is None:
-            executed_chunk_actions = chunk_actions
-        if isinstance(executed_chunk_actions, np.ndarray):
+        if isinstance(chunk_actions, np.ndarray):
             online_forward_inputs["executed_env_action_absolute"] = (
-                torch.from_numpy(np.asarray(executed_chunk_actions))
-                .reshape(executed_chunk_actions.shape[0], -1)
+                torch.from_numpy(np.asarray(chunk_actions))
+                .reshape(chunk_actions.shape[0], -1)
                 .to(torch.float32)
             )
-        elif torch.is_tensor(executed_chunk_actions):
+        elif torch.is_tensor(chunk_actions):
             online_forward_inputs["executed_env_action_absolute"] = (
-                executed_chunk_actions.reshape(
-                    executed_chunk_actions.shape[0], -1
-                ).cpu()
+                chunk_actions.reshape(chunk_actions.shape[0], -1).cpu()
             )
         online_forward_inputs["executed_action_stats"] = self._executed_action_stats(
-            executed_chunk_actions
+            chunk_actions
         )
-        tcp_distance = self._tcp_distance_tensor(curr_obs)
-        if tcp_distance is not None:
-            online_forward_inputs["tcp_distance_to_target"] = tcp_distance
-        self._update_gripper_gate_from_action_chunk(chunk_actions)
 
         env_output = EnvOutput(
             obs=extracted_obs,
@@ -1291,9 +977,7 @@ class EnvWorker(Worker):
                 payload = json.load(f)
             stats = payload.get("norm_stats", payload)["actions"]
             indices = list(self._controlled_action_indices())
-            mean = torch.tensor(
-                [stats["mean"][i] for i in indices], dtype=torch.float32
-            )
+            mean = torch.tensor([stats["mean"][i] for i in indices], dtype=torch.float32)
             std = torch.tensor([stats["std"][i] for i in indices], dtype=torch.float32)
             floor = float(self.cfg.actor.model.get("action_norm_std_floor", 1e-6))
             std = torch.where(std.abs() < floor, torch.ones_like(std), std)
@@ -1319,7 +1003,9 @@ class EnvWorker(Worker):
 
     def _controlled_delta_mask(self, device) -> torch.Tensor:
         env_action_dim = int(
-            self.cfg.actor.model.get("env_action_dim", self.cfg.actor.model.action_dim)
+            self.cfg.actor.model.get(
+                "env_action_dim", self.cfg.actor.model.action_dim
+            )
         )
         if env_action_dim == 14:
             full_mask = torch.tensor(
@@ -1329,7 +1015,9 @@ class EnvWorker(Worker):
             )
         else:
             full_mask = torch.ones(env_action_dim, dtype=torch.bool, device=device)
-        return full_mask.index_select(0, self._controlled_action_index_tensor(device))
+        return full_mask.index_select(
+            0, self._controlled_action_index_tensor(device)
+        )
 
     def _select_controlled_env_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         action_dim = int(self.cfg.actor.model.action_dim)
@@ -1858,14 +1546,12 @@ class EnvWorker(Worker):
                     rollout_result = self.recv_rollout_results(
                         input_channel, mode="train"
                     )
-                    self._force_vla_rollout_result_for_warmup(
-                        rollout_result,
-                        chunk_step_idx,
-                        curr_obs,
+                    force_vla = self._force_vla_rollout_result_for_warmup(
+                        rollout_result, chunk_step_idx
                     )
                     exec_action = rollout_result.actions
                     env_output, env_info, online_forward_inputs = (
-                        self.env_interact_step(exec_action, stage_id, curr_obs)
+                        self.env_interact_step(exec_action, stage_id)
                     )
                     self._maybe_print_online_env_status(
                         rollout_result,
@@ -1917,7 +1603,18 @@ class EnvWorker(Worker):
                             rollout_result.save_flags
                         )
                     if env_output.intervene_actions is not None:
-                        executed_env_action = env_output.intervene_actions
+                        intervene_train_actions = (
+                            self._absolute_to_training_action_tensor(
+                                env_output.intervene_actions,
+                                curr_obs.get("states", None)
+                                if isinstance(curr_obs, dict)
+                                else None,
+                            )
+                        )
+                        self.rollout_results[stage_id].update_last_actions(
+                            intervene_train_actions,
+                            env_output.intervene_flags,
+                        )
                         if self.rollout_results[stage_id].forward_inputs:
                             last_fi = self.rollout_results[stage_id].forward_inputs[-1]
                             last_fi["intervene_env_action_absolute"] = (
@@ -1942,15 +1639,12 @@ class EnvWorker(Worker):
                                 policy_env = exec_env.reshape(
                                     flags.shape[0], horizon, env_dim
                                 )
-                                executed_env_action = human_env * flags + policy_env * (
-                                    ~flags
+                                last_fi["executed_env_action_absolute"] = (
+                                    (human_env * flags + policy_env * (~flags))
+                                    .reshape(flags.shape[0], -1)
+                                    .cpu()
+                                    .contiguous()
                                 )
-                        self._sync_last_executed_training_action(
-                            stage_id,
-                            curr_obs,
-                            executed_env_action,
-                            env_output.intervene_flags,
-                        )
                         env_output.intervene_actions = None
                         env_output.intervene_flags = None
                     env_batch = env_output.to_dict()

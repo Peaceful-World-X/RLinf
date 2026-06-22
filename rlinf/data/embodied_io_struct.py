@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The GIGA Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -532,6 +532,61 @@ class EmbodiedRolloutResult:
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
 
+    def _zeros_like_value(self, value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return torch.zeros_like(value).cpu().contiguous()
+        if isinstance(value, dict):
+            return {
+                key: self._zeros_like_value(sub_value)
+                for key, sub_value in value.items()
+            }
+        return None
+
+    def _align_dict_keys(
+        self, existing_items: list[dict[str, Any]], new_item: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Keep optional tensor fields stackable across online control branches."""
+        new_item = dict(new_item)
+        if not existing_items:
+            return new_item
+
+        existing_templates: dict[str, Any] = {}
+        for item in existing_items:
+            for key, value in item.items():
+                if key not in existing_templates and (
+                    isinstance(value, torch.Tensor) or isinstance(value, dict)
+                ):
+                    existing_templates[key] = value
+
+        for key, value in new_item.items():
+            if key not in existing_templates and (
+                isinstance(value, torch.Tensor) or isinstance(value, dict)
+            ):
+                existing_templates[key] = value
+                zero_value = self._zeros_like_value(value)
+                for item in existing_items:
+                    item[key] = zero_value
+
+        for key, template in existing_templates.items():
+            if key not in new_item:
+                new_item[key] = self._zeros_like_value(template)
+
+        return new_item
+
+    def _align_forward_input_keys(
+        self, forward_inputs: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Keep optional online forward_inputs stackable across control branches."""
+        return self._align_dict_keys(self.forward_inputs, forward_inputs)
+
+    def _align_curr_obs_keys(self, curr_obs: dict[str, Any]) -> dict[str, Any]:
+        """Keep optional online curr_obs fields stackable across chunks."""
+        return self._align_dict_keys(self.curr_obs, curr_obs)
+
+    def _align_next_obs_keys(self, next_obs: dict[str, Any]) -> dict[str, Any]:
+        """Keep optional online next_obs fields stackable across chunks."""
+        return self._align_dict_keys(self.next_obs, next_obs)
+
     def append_step_result(self, result: ChunkStepResult):
         if result.actions is not None:
             self.actions.append(result.actions)
@@ -553,7 +608,9 @@ class EmbodiedRolloutResult:
         if result.versions is not None:
             self.versions.append(result.versions)
         if result.forward_inputs:
-            self.forward_inputs.append(result.forward_inputs)
+            self.forward_inputs.append(
+                self._align_forward_input_keys(result.forward_inputs)
+            )
 
     def mark_last_step_with_flags(self, save_flags: torch.Tensor):
         if not self.intervene_flags:
@@ -628,7 +685,6 @@ class EmbodiedRolloutResult:
                         last_full_action.reshape(bsz, -1).cpu().contiguous()
                     )
                     last_fi["executed_action"] = last_fi["action"]
-                last_fi.pop("model_action", None)
 
     def append_transitions(self, curr_obs=None, next_obs=None):
         assert curr_obs is not None and next_obs is not None
@@ -638,8 +694,8 @@ class EmbodiedRolloutResult:
             curr_obs.pop("task_descriptions")
         if "task_descriptions" in next_obs:
             next_obs.pop("task_descriptions")
-        self.curr_obs.append(curr_obs)
-        self.next_obs.append(next_obs)
+        self.curr_obs.append(self._align_curr_obs_keys(curr_obs))
+        self.next_obs.append(self._align_next_obs_keys(next_obs))
 
     def to_trajectory(self) -> Trajectory:
         # return [trajectory_length, B, ...]

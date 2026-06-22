@@ -1,4 +1,4 @@
-# Copyright 2026 The RLinf Authors.
+# Copyright 2026 The GIGA Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -387,8 +387,6 @@ class RealWorldEnv(gym.Env):
             if (terminations | truncations).any():
                 break
 
-        valid_steps = len(chunk_rewards)
-
         def _pad_time(tensor: torch.Tensor, fill_value=0):
             if tensor.shape[1] >= chunk_size:
                 return tensor
@@ -417,8 +415,11 @@ class RealWorldEnv(gym.Env):
 
         infos_last = infos_list[-1] if infos_list else {}
         valid_mask = torch.zeros(self.num_envs, chunk_size, dtype=torch.bool)
-        valid_mask[:, :valid_steps] = True
+        valid_mask[:, : len(obs_list)] = True
         infos_last["chunk_valid_mask"] = valid_mask
+        infos_last["executed_chunk_actions"] = torch.as_tensor(
+            chunk_actions, dtype=torch.float32
+        )
         if self.save_substep_obs:
             infos_last["substep_obs"] = obs_list
         if raw_chunk_intervene_actions:

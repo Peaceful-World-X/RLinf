@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The GIGA Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ import threading
 class KeyboardListener:
     """Headless keyboard listener backed by Linux evdev input devices."""
 
-    REQUIRED_KEY_NAMES = ("KEY_A", "KEY_B", "KEY_C", "KEY_Q")
+    REQUIRED_KEY_NAMES = ("KEY_A", "KEY_B", "KEY_C", "KEY_D", "KEY_Q")
 
     def __init__(self):
         try:

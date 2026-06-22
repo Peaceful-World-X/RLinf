@@ -35,9 +35,11 @@ Architecture aligned with ``rlinf.envs.realworld.franka.franka_env.FrankaEnv``.
 """
 
 import copy
+import json
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 import cv2
@@ -186,6 +188,11 @@ class PiperRobotConfig:
     # None or <=0: wait indefinitely until teleop releases.
     teleop_release_reset_timeout_sec: Optional[float] = None
     wait_enter_after_reset: bool = False
+    use_tcp_reset_pose_pool: bool = False
+    tcp_reset_pose_pool_path: str = ""
+    tcp_reset_random_seed: int = 1234
+    tcp_reset_interpolate_steps: int = 20
+    tcp_reset_interpolate_sleep: Optional[float] = None
 
     # ---- ZMQ inference service (reserved) ----
     inference_host: str = "127.0.0.1"
@@ -252,7 +259,16 @@ class PiperEnv(gym.Env):
         self._num_steps = 0
         self._success_hold_counter = 0
         self._sliding_window_action_buffer = None
+        self._last_teleop_active = False
         self._ensure_reward_config_arrays()
+        self._tcp_reset_rng = np.random.default_rng(
+            int(getattr(config, "tcp_reset_random_seed", 1234))
+        )
+        self._tcp_reset_pose_pool: list[dict[str, Any]] = []
+        if getattr(config, "use_tcp_reset_pose_pool", False):
+            self._tcp_reset_pose_pool = self._load_tcp_reset_pose_pool(
+                getattr(config, "tcp_reset_pose_pool_path", "")
+            )
 
         # ---- Initialize controller ----
         if not self.config.is_dummy:
@@ -426,6 +442,81 @@ class PiperEnv(gym.Env):
                 "Cannot wait for Enter in this process (%s). Continuing policy execution.",
                 exc,
             )
+
+    def _load_tcp_reset_pose_pool(self, path: str) -> list[dict[str, Any]]:
+        if not path:
+            self._logger.warning(
+                "use_tcp_reset_pose_pool=True but tcp_reset_pose_pool_path is empty; "
+                "falling back to zero reset."
+            )
+            return []
+        pool_path = Path(path).expanduser()
+        if not pool_path.exists():
+            self._logger.warning(
+                "TCP reset pose pool does not exist at %s; falling back to zero reset.",
+                pool_path,
+            )
+            return []
+        with open(pool_path, "r") as f:
+            data = json.load(f)
+        raw_poses = data.get("poses", data if isinstance(data, list) else [])
+        metadata = data.get("metadata", [{} for _ in raw_poses])
+        pool: list[dict[str, Any]] = []
+        for idx, pose in enumerate(raw_poses):
+            arr = np.asarray(pose, dtype=np.float64).reshape(-1)
+            if arr.shape[0] < 14:
+                self._logger.warning(
+                    "Skipping TCP reset pose %d from %s: expected >=14 values, got %d.",
+                    idx,
+                    pool_path,
+                    arr.shape[0],
+                )
+                continue
+            item_meta = metadata[idx] if idx < len(metadata) else {}
+            pool.append({"pose": arr[:14].copy(), "metadata": item_meta})
+        self._logger.info(
+            "Loaded %d TCP reset poses from %s.", len(pool), str(pool_path)
+        )
+        return pool
+
+    def _sample_reset_pose(self) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        if self._tcp_reset_pose_pool:
+            idx = int(self._tcp_reset_rng.integers(0, len(self._tcp_reset_pose_pool)))
+            item = self._tcp_reset_pose_pool[idx]
+            pose = np.asarray(item["pose"], dtype=np.float64).reshape(14)
+            meta = dict(item.get("metadata", {}))
+            meta["pool_index"] = idx
+            left_reset = pose[:7].copy()
+            right_reset = pose[7:14].copy()
+            return left_reset, right_reset, meta
+
+        left_reset = np.zeros(7, dtype=np.float64)
+        right_reset = np.zeros(7, dtype=np.float64)
+        return left_reset, right_reset, {"pool_index": None}
+
+    def _move_to_reset_pose(
+        self, left_reset: np.ndarray, right_reset: np.ndarray
+    ) -> None:
+        if self._controller is None:
+            return
+
+        steps = max(1, int(getattr(self.config, "tcp_reset_interpolate_steps", 1)))
+        sleep_sec = getattr(self.config, "tcp_reset_interpolate_sleep", None)
+        if sleep_sec is None:
+            sleep_sec = 1.0 / max(float(self.config.step_frequency), 1.0)
+        sleep_sec = max(0.0, float(sleep_sec))
+
+        target = np.concatenate([left_reset, right_reset]).astype(np.float64)
+        current = np.asarray(self._controller.get_qpos(), dtype=np.float64)
+        if current.shape[0] < 14 or steps <= 1:
+            self._controller.move_arm(left_reset, right_reset)
+            return
+
+        for alpha in np.linspace(1.0 / steps, 1.0, steps):
+            waypoint = current + alpha * (target - current)
+            self._controller.move_arm(waypoint[:7], waypoint[7:14])
+            if sleep_sec > 0.0:
+                time.sleep(sleep_sec)
 
     # ==================================================================
     # Action / observation spaces
@@ -671,6 +762,7 @@ class PiperEnv(gym.Env):
         teleop_active = not self.config.is_dummy and rospy.get_param(
             "/enable_message_publish", False
         )
+        self._last_teleop_active = bool(teleop_active)
 
         # ---- Publish control command ----
         # Skip move_arm during teleoperation: the ROS node drives the puppet arms
@@ -743,6 +835,7 @@ class PiperEnv(gym.Env):
         self._num_steps = 0
         self._success_hold_counter = 0
         self._sliding_window_action_buffer = None
+        self._last_teleop_active = False
 
         if self.config.is_dummy:
             observation = self._get_observation()
@@ -754,10 +847,19 @@ class PiperEnv(gym.Env):
         self._controller.enable_arm()
         time.sleep(0.5)
 
-        # ---- Go to reset pose: left arm all zeros, right arm preset pose ----
-        left_reset = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
-        right_reset = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
-        self._controller.move_arm(left_reset, right_reset)
+        # ---- Go to reset pose: either a sampled TCP-near pose or zero pose ----
+        left_reset, right_reset, reset_meta = self._sample_reset_pose()
+        if reset_meta.get("pool_index") is not None:
+            self._logger.info(
+                "PiperEnv reset sampled TCP pose pool_index=%s source=%s "
+                "chunk=%s substep=%s tcp_distance=%.4f.",
+                reset_meta.get("pool_index"),
+                reset_meta.get("trajectory", ""),
+                reset_meta.get("chunk_index", ""),
+                reset_meta.get("substep_index", ""),
+                float(reset_meta.get("tcp_distance", -1.0)),
+            )
+        self._move_to_reset_pose(left_reset, right_reset)
 
         # ---- Wait for joints to reach reset pose ----
         self._controller._wait_for_joint(
