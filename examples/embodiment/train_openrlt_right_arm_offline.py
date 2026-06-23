@@ -39,7 +39,15 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
+def _find_repo_root(start: Path) -> Path:
+    for path in [start, *start.parents]:
+        if (path / "rlinf").is_dir() and (path / "examples").is_dir():
+            return path
+    raise RuntimeError(f"Could not find RLinf repo root from {start}")
+
+
+REPO_ROOT = _find_repo_root(Path(__file__).resolve().parent)
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
