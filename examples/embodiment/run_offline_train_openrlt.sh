@@ -10,7 +10,7 @@
 #
 # Config names are resolved under examples/embodiment/config/, matching
 # run_piper_online_td3.sh. The YAML must contain `online_log_dir` and
-# `output_name`; the script derives:
+# `output_name`. Unless explicitly set in YAML, the script derives:
 #   --data-dir       <online_log_dir>/replay_buffer/rank_0
 #   --feature-cache  <online_log_dir>/online_rltoken_features.pt
 #   --output-dir     <online_log_dir>/<output_name>
@@ -83,9 +83,28 @@ if output_name is None:
     raise KeyError("Config must define `output_name`.")
 
 online_log_dir = pathlib.Path(os.path.expanduser(str(online_log_dir)))
-cfg["data_dir"] = str(online_log_dir / "replay_buffer" / "rank_0")
-cfg["feature_cache"] = str(online_log_dir / "online_rltoken_features.pt")
-cfg["output_dir"] = str(online_log_dir / str(output_name))
+
+def expand_path(value):
+    return str(pathlib.Path(os.path.expanduser(str(value))))
+
+data_dir = cfg.pop("data_dir", None)
+feature_cache = cfg.pop("feature_cache", None)
+output_dir = cfg.pop("output_dir", None)
+cfg["data_dir"] = (
+    expand_path(data_dir)
+    if data_dir is not None
+    else str(online_log_dir / "replay_buffer" / "rank_0")
+)
+cfg["feature_cache"] = (
+    expand_path(feature_cache)
+    if feature_cache is not None
+    else str(online_log_dir / "online_rltoken_features.pt")
+)
+cfg["output_dir"] = (
+    expand_path(output_dir)
+    if output_dir is not None
+    else str(online_log_dir / str(output_name))
+)
 
 cmd = [sys.executable, str(train_script)]
 for k, v in cfg.items():

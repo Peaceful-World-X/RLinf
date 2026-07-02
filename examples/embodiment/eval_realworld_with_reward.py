@@ -44,6 +44,237 @@ from rlinf.scheduler import Worker
 mp.set_start_method("spawn", force=True)
 
 
+def _to_cpu_tensor(value):
+    if isinstance(value, np.ndarray):
+        value = torch.from_numpy(value)
+    if torch.is_tensor(value):
+        return value.cpu().clone()
+    return None
+
+
+def _pad_substep_tensor(value: torch.Tensor, target_steps: int) -> torch.Tensor:
+    if value.shape[1] >= target_steps:
+        return value[:, :target_steps].contiguous()
+    pad_steps = target_steps - value.shape[1]
+    pad = value[:, -1:].expand(value.shape[0], pad_steps, *value.shape[2:])
+    return torch.cat([value, pad], dim=1).contiguous()
+
+
+def build_substep_forward_inputs(
+    *,
+    obs_list,
+    chunk_actions,
+    target_steps: int,
+    chunk_valid_mask=None,
+):
+    """Build online-compatible per-executed-action observation fields."""
+    if not torch.is_tensor(chunk_actions):
+        chunk_actions = torch.as_tensor(chunk_actions)
+    chunk_actions = chunk_actions.cpu().to(torch.float32)
+    batch_size = int(chunk_actions.shape[0])
+    executed_steps = min(len(obs_list), int(target_steps))
+
+    if chunk_valid_mask is None:
+        chunk_valid_mask = torch.zeros(batch_size, target_steps, dtype=torch.bool)
+        if executed_steps > 0:
+            chunk_valid_mask[:, :executed_steps] = True
+    else:
+        chunk_valid_mask = torch.as_tensor(chunk_valid_mask, dtype=torch.bool).cpu()
+        if chunk_valid_mask.dim() == 1:
+            chunk_valid_mask = chunk_valid_mask[None, :]
+        if chunk_valid_mask.shape[1] < target_steps:
+            pad = torch.zeros(
+                chunk_valid_mask.shape[0],
+                target_steps - chunk_valid_mask.shape[1],
+                dtype=torch.bool,
+            )
+            chunk_valid_mask = torch.cat([chunk_valid_mask, pad], dim=1)
+        chunk_valid_mask = chunk_valid_mask[:, :target_steps].contiguous()
+
+    forward_inputs = {
+        "chunk_valid_mask": chunk_valid_mask,
+        "executed_env_action_absolute": chunk_actions.reshape(batch_size, -1),
+    }
+
+    for obs_key, out_key in (
+        ("main_images", "substep_main_images"),
+        ("extra_view_images", "substep_extra_view_images"),
+        ("states", "substep_states"),
+    ):
+        values = []
+        for obs in obs_list[:target_steps]:
+            if not isinstance(obs, dict) or obs_key not in obs:
+                continue
+            value = _to_cpu_tensor(obs[obs_key])
+            if value is not None:
+                values.append(value)
+        if values:
+            stacked = torch.stack(values, dim=1)
+            forward_inputs[out_key] = _pad_substep_tensor(stacked, target_steps)
+
+    return forward_inputs
+
+
+def apply_intervention_to_rollout_step(
+    rollout: EmbodiedRolloutResult,
+    infos_last: dict,
+) -> None:
+    """Apply human intervention action/flags to the last appended rollout step."""
+    if not isinstance(infos_last, dict):
+        return
+    if "intervene_action" not in infos_last or "intervene_flag" not in infos_last:
+        return
+
+    intervene_action = (
+        torch.as_tensor(infos_last["intervene_action"]).cpu().to(torch.float32)
+    )
+    intervene_flag = torch.as_tensor(infos_last["intervene_flag"]).cpu().to(torch.bool)
+    if intervene_flag.dim() == 1:
+        intervene_flag = intervene_flag[:, None]
+    if intervene_action.numel() == 0 or intervene_flag.numel() == 0:
+        return
+    if not rollout.actions:
+        return
+
+    last_action = rollout.actions[-1]
+    if not torch.is_tensor(last_action) or last_action.dim() != 2:
+        return
+    batch_size = int(last_action.shape[0])
+    executed_chunks = int(intervene_flag.shape[1])
+    if intervene_action.shape[0] != batch_size:
+        return
+    action_dim = int(intervene_action.shape[-1] // max(executed_chunks, 1))
+    if action_dim <= 0:
+        return
+    full_chunks = int(last_action.shape[-1] // action_dim)
+    if full_chunks <= 0:
+        return
+    if executed_chunks < full_chunks:
+        pad_chunks = full_chunks - executed_chunks
+        intervene_flag = torch.cat(
+            [
+                intervene_flag,
+                torch.zeros(batch_size, pad_chunks, dtype=torch.bool),
+            ],
+            dim=1,
+        )
+        intervene_action_chunks = intervene_action.reshape(
+            batch_size, executed_chunks, action_dim
+        )
+        intervene_action = torch.cat(
+            [
+                intervene_action_chunks,
+                torch.zeros(batch_size, pad_chunks, action_dim, dtype=torch.float32),
+            ],
+            dim=1,
+        ).reshape(batch_size, -1)
+    else:
+        intervene_flag = intervene_flag[:, :full_chunks].contiguous()
+        intervene_action = (
+            intervene_action.reshape(batch_size, executed_chunks, action_dim)[
+                :, :full_chunks
+            ]
+            .reshape(batch_size, -1)
+            .contiguous()
+        )
+
+    rollout.update_last_actions(intervene_action, intervene_flag)
+
+    if not rollout.forward_inputs:
+        return
+    last_fi = rollout.forward_inputs[-1]
+    exec_env_action = last_fi.get("executed_env_action_absolute", None)
+    if not torch.is_tensor(exec_env_action):
+        return
+    batch_size, num_action_chunks = intervene_flag.shape[:2]
+    flags = intervene_flag.reshape(batch_size, num_action_chunks, 1)
+    human_env_action = intervene_action.reshape(batch_size, num_action_chunks, -1)
+    policy_env_action = exec_env_action.reshape(batch_size, num_action_chunks, -1)
+    executed_env_action = human_env_action * flags + policy_env_action * (~flags)
+    last_fi["executed_env_action_absolute"] = (
+        executed_env_action.reshape(batch_size, -1).cpu().contiguous()
+    )
+
+
+def maybe_delete_last_saved_rollout(
+    *,
+    keyboard,
+    buffer,
+    saved: int,
+    progress_bar,
+    log_fn,
+    delete_key: str = "d",
+    preconsumed_key: str | None = None,
+) -> int:
+    key = preconsumed_key
+    if key is None:
+        key = keyboard.consume_any_press((delete_key,), include_held=False)
+    if key is None:
+        return saved
+
+    result = buffer.delete_last_trajectory()
+    if not result.get("deleted", False):
+        log_fn(f"[eval-with-reward] key='{key}' delete ignored: {result.get('reason')}")
+        return saved
+
+    saved = max(0, saved - 1)
+    progress_bar.n = saved
+    progress_bar.set_postfix({"saved": saved})
+    progress_bar.refresh()
+    log_fn(
+        "[eval-with-reward] key='{}' deleted trajectory_id={} samples={} "
+        "file_deleted={} remaining_trajectories={} remaining_samples={} path={}".format(
+            key,
+            result.get("trajectory_id"),
+            result.get("num_samples"),
+            result.get("file_deleted"),
+            result.get("num_trajectories"),
+            result.get("total_samples"),
+            result.get("path"),
+        )
+    )
+    return saved
+
+
+def wait_for_rollout_start_or_delete(
+    *,
+    keyboard,
+    buffer,
+    saved: int,
+    progress_bar,
+    log_fn,
+    total_rollouts: int,
+    delete_key: str = "d",
+    sleep_fn=time.sleep,
+    prompt_fn=print,
+) -> int:
+    prompt_fn(
+        f"[Rollout {saved + 1}/{total_rollouts}] "
+        "Press ENTER to start, or press d to delete last saved rollout...",
+        flush=True,
+    )
+    while True:
+        key = keyboard.consume_any_press(("Key.enter", delete_key), include_held=False)
+        if key == "Key.enter":
+            return saved
+        if key == delete_key:
+            saved = maybe_delete_last_saved_rollout(
+                keyboard=keyboard,
+                buffer=buffer,
+                saved=saved,
+                progress_bar=progress_bar,
+                log_fn=log_fn,
+                delete_key=delete_key,
+                preconsumed_key=key,
+            )
+            prompt_fn(
+                f"[Rollout {saved + 1}/{total_rollouts}] "
+                "Press ENTER to start, or press d to delete last saved rollout...",
+                flush=True,
+            )
+        sleep_fn(0.05)
+
+
 class EvalWithRewardCollector(Worker):
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -109,7 +340,8 @@ class EvalWithRewardCollector(Worker):
 
     def _wait_enter(self, rollout_idx: int):
         print(
-            f"[Rollout {rollout_idx + 1}/{self.num_rollouts}] Press ENTER to start...",
+            f"[Rollout {rollout_idx + 1}/{self.num_rollouts}] "
+            "Press ENTER to start, or press d to delete last saved rollout...",
             flush=True,
         )
         while not self._keyboard.consume_press("Key.enter"):
@@ -186,10 +418,29 @@ class EvalWithRewardCollector(Worker):
 
     def run(self):
         saved = 0
-        progress_bar = tqdm(range(self.num_rollouts), desc="Eval rollouts with reward:")
+        rollout_attempt = 0
+        progress_bar = tqdm(
+            total=self.num_rollouts,
+            desc="Eval rollouts with reward:",
+        )
+        progress_bar.set_postfix({"saved": saved})
 
-        for rollout_idx in range(self.num_rollouts):
-            self._wait_enter(rollout_idx)
+        while saved < self.num_rollouts:
+            saved = maybe_delete_last_saved_rollout(
+                keyboard=self._keyboard,
+                buffer=self.buffer,
+                saved=saved,
+                progress_bar=progress_bar,
+                log_fn=self.log_info,
+            )
+            saved = wait_for_rollout_start_or_delete(
+                keyboard=self._keyboard,
+                buffer=self.buffer,
+                saved=saved,
+                progress_bar=progress_bar,
+                log_fn=self.log_info,
+                total_rollouts=self.num_rollouts,
+            )
 
             obs, _ = self.env.reset()
             current_obs = self._process_obs(obs)
@@ -238,6 +489,32 @@ class EvalWithRewardCollector(Worker):
                 action_tensor = torch.as_tensor(
                     actions.reshape(1, -1).cpu().numpy(), dtype=torch.float32
                 )
+                infos_last = infos_list[-1] if infos_list else {}
+                substep_obs_list = (
+                    infos_last.get("substep_obs", None)
+                    if isinstance(infos_last, dict)
+                    else None
+                )
+                if not isinstance(substep_obs_list, (list, tuple)):
+                    substep_obs_list = obs_list
+                processed_substep_obs = [
+                    self._process_obs(dict(substep_obs))
+                    for substep_obs in substep_obs_list
+                    if isinstance(substep_obs, dict)
+                ]
+                forward_inputs = {
+                    "action": action_tensor,
+                    **build_substep_forward_inputs(
+                        obs_list=processed_substep_obs,
+                        chunk_actions=torch.as_tensor(chunk_actions),
+                        target_steps=self.num_action_chunks,
+                        chunk_valid_mask=(
+                            infos_last.get("chunk_valid_mask", None)
+                            if isinstance(infos_last, dict)
+                            else None
+                        ),
+                    ),
+                }
 
                 step = ChunkStepResult(
                     actions=action_tensor,
@@ -245,9 +522,10 @@ class EvalWithRewardCollector(Worker):
                     dones=done_tensor,
                     terminations=terminated_tensor,
                     truncations=truncated_tensor,
-                    forward_inputs={"action": action_tensor},
+                    forward_inputs=forward_inputs,
                 )
                 rollout.append_step_result(step)
+                apply_intervention_to_rollout_step(rollout, infos_last)
                 rollout.append_transitions(
                     curr_obs=current_obs, next_obs=next_obs_processed
                 )
@@ -260,9 +538,22 @@ class EvalWithRewardCollector(Worker):
             trajectory = rollout.to_trajectory()
             self.buffer.add_trajectories([trajectory])
             saved += 1
-            progress_bar.update(1)
-            self.log_info(f"Saved rollout {rollout_idx + 1} (total saved: {saved})")
+            rollout_attempt += 1
+            progress_bar.n = saved
+            progress_bar.set_postfix({"saved": saved})
+            progress_bar.refresh()
+            self.log_info(
+                f"Saved rollout attempt {rollout_attempt} (total saved: {saved})"
+            )
+            saved = maybe_delete_last_saved_rollout(
+                keyboard=self._keyboard,
+                buffer=self.buffer,
+                saved=saved,
+                progress_bar=progress_bar,
+                log_fn=self.log_info,
+            )
 
+        progress_bar.close()
         self.buffer.close()
         self.log_info(
             f"Finished. {saved} rollouts saved to: "

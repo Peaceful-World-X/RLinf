@@ -158,7 +158,7 @@ actor:
   enable_offload: false
 
   model:
-    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert"
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert"
     num_action_chunks: 10
     action_dim: 14
     add_value_head: false

@@ -855,6 +855,11 @@ class EnvWorker(Worker):
         chunk_step_idx: int,
         obs_source=None,
     ) -> bool:
+        if self.rollout_control_mode == "warmup":
+            return (
+                self.vla_warmup_chunk_steps > 0
+                and chunk_step_idx < self.vla_warmup_chunk_steps
+            )
         if (
             self.rollout_gate_reset_on_episode_start
             and chunk_step_idx <= self._rollout_gate_last_chunk_step_idx
@@ -919,6 +924,69 @@ class EnvWorker(Worker):
             return action.reshape(action.shape[0], horizon, env_dim)
         return np.asarray(action).reshape(action.shape[0], horizon, env_dim)
 
+    def _mix_actor_right_arm_with_vla_env_action(
+        self,
+        actor_env_action: torch.Tensor | np.ndarray,
+        vla_env_action: torch.Tensor | np.ndarray,
+    ) -> torch.Tensor:
+        actor_chunk = self._reshape_env_action_chunk(actor_env_action)
+        vla_chunk = self._reshape_env_action_chunk(vla_env_action)
+        if isinstance(actor_chunk, np.ndarray):
+            actor_chunk = torch.from_numpy(actor_chunk).to(torch.float32)
+        else:
+            actor_chunk = actor_chunk.detach().cpu().to(torch.float32)
+        if isinstance(vla_chunk, np.ndarray):
+            mixed = torch.from_numpy(vla_chunk).to(torch.float32)
+        else:
+            mixed = vla_chunk.detach().cpu().to(torch.float32).clone()
+        indices = self._controlled_action_index_tensor(mixed.device)
+        mixed.scatter_(
+            -1,
+            indices.reshape(1, 1, -1).expand(
+                actor_chunk.shape[0], actor_chunk.shape[1], -1
+            ),
+            actor_chunk.index_select(-1, indices),
+        )
+        return mixed
+
+    def _set_rollout_result_executed_action(
+        self,
+        rollout_result: RolloutResult,
+        env_action: torch.Tensor | np.ndarray,
+        source_value: int,
+        train_action: torch.Tensor | np.ndarray | None = None,
+    ) -> None:
+        forward_inputs = rollout_result.forward_inputs
+        env_action = self._reshape_env_action_chunk(env_action)
+        if isinstance(env_action, np.ndarray):
+            env_action = torch.from_numpy(env_action).to(torch.float32)
+        else:
+            env_action = env_action.detach().cpu().to(torch.float32)
+        rollout_result.actions = env_action
+        env_action_flat = env_action.reshape(env_action.shape[0], -1).contiguous()
+        if train_action is None:
+            train_action = self._select_controlled_env_tensor(env_action)
+        elif isinstance(train_action, np.ndarray):
+            train_action = torch.from_numpy(train_action).to(torch.float32)
+        else:
+            train_action = train_action.detach().cpu().to(torch.float32)
+        train_action = train_action.reshape(train_action.shape[0], -1).contiguous()
+        forward_inputs["action"] = train_action
+        forward_inputs["model_action"] = train_action
+        forward_inputs["executed_action"] = train_action
+        forward_inputs["env_action_absolute"] = env_action_flat
+        forward_inputs["executed_env_action_absolute"] = env_action_flat
+        source_shape = (
+            forward_inputs["rollout_control_source"].shape
+            if torch.is_tensor(forward_inputs.get("rollout_control_source", None))
+            else (train_action.shape[0], 1)
+        )
+        forward_inputs["rollout_control_source"] = torch.full(
+            source_shape,
+            int(source_value),
+            dtype=torch.long,
+        )
+
     def _force_vla_rollout_result_for_warmup(
         self,
         rollout_result: RolloutResult,
@@ -932,35 +1000,52 @@ class EnvWorker(Worker):
         control: early chunks should execute and train on the VLA reference action,
         while only late chunks may use actor actions.
         """
-        if not self._should_force_vla_rollout(
-            rollout_result, chunk_step_idx, obs_source
-        ):
-            return False
         forward_inputs = rollout_result.forward_inputs
         if not isinstance(forward_inputs, dict):
             return False
-        ref_action = forward_inputs.get("ref_action", None)
         ref_env_action = forward_inputs.get("ref_env_action_absolute", None)
-        if ref_action is None or ref_env_action is None:
+        if ref_env_action is None:
             return False
 
-        ref_action = ref_action.detach().cpu().contiguous()
-        ref_env_action = ref_env_action.detach().cpu().contiguous()
-        rollout_result.actions = self._reshape_env_action_chunk(ref_env_action)
-        forward_inputs["action"] = ref_action
-        forward_inputs["model_action"] = ref_action
-        forward_inputs["executed_action"] = ref_action
-        forward_inputs["env_action_absolute"] = ref_env_action
-        forward_inputs["executed_env_action_absolute"] = ref_env_action
-        source_shape = (
-            forward_inputs["rollout_control_source"].shape
-            if torch.is_tensor(forward_inputs.get("rollout_control_source", None))
-            else (ref_action.shape[0], 1)
-        )
-        forward_inputs["rollout_control_source"] = torch.zeros(
-            source_shape,
-            dtype=torch.long,
-        )
+        if self._should_force_vla_rollout(rollout_result, chunk_step_idx, obs_source):
+            ref_action = forward_inputs.get("ref_action", None)
+            self._set_rollout_result_executed_action(
+                rollout_result,
+                self._reshape_env_action_chunk(ref_env_action),
+                source_value=0,
+                train_action=ref_action,
+            )
+            return True
+
+        if self.rollout_control_mode == "warmup":
+            mixed_action = self._mix_actor_right_arm_with_vla_env_action(
+                rollout_result.actions,
+                ref_env_action,
+            )
+            actor_action = forward_inputs.get("actor_action", None)
+            if actor_action is None:
+                actor_action = forward_inputs.get("model_action", None)
+            if actor_action is None:
+                actor_action = forward_inputs.get("action", None)
+            self._set_rollout_result_executed_action(
+                rollout_result,
+                mixed_action,
+                source_value=1,
+                train_action=actor_action,
+            )
+        return False
+
+    def _append_step_result_if_trainable(
+        self,
+        rollout_store: EmbodiedRolloutResult,
+        *,
+        forced_vla: bool,
+        result: ChunkStepResult,
+        save_flags: torch.Tensor | None = None,
+    ) -> bool:
+        rollout_store.append_step_result(result)
+        if save_flags is not None:
+            rollout_store.mark_last_step_with_flags(save_flags)
         return True
 
     def _ensure_online_action_fields(
@@ -1858,7 +1943,7 @@ class EnvWorker(Worker):
                     rollout_result = self.recv_rollout_results(
                         input_channel, mode="train"
                     )
-                    self._force_vla_rollout_result_for_warmup(
+                    forced_vla = self._force_vla_rollout_result_for_warmup(
                         rollout_result,
                         chunk_step_idx,
                         curr_obs,
@@ -1911,12 +1996,13 @@ class EnvWorker(Worker):
                         terminations=env_output.terminations,
                         rewards=rewards,
                     )
-                    self.rollout_results[stage_id].append_step_result(chunk_step_result)
-                    if rollout_result.save_flags is not None:
-                        self.rollout_results[stage_id].mark_last_step_with_flags(
-                            rollout_result.save_flags
-                        )
-                    if env_output.intervene_actions is not None:
+                    stored_chunk = self._append_step_result_if_trainable(
+                        self.rollout_results[stage_id],
+                        forced_vla=forced_vla,
+                        result=chunk_step_result,
+                        save_flags=rollout_result.save_flags,
+                    )
+                    if stored_chunk and env_output.intervene_actions is not None:
                         executed_env_action = env_output.intervene_actions
                         if self.rollout_results[stage_id].forward_inputs:
                             last_fi = self.rollout_results[stage_id].forward_inputs[-1]
@@ -1961,7 +2047,7 @@ class EnvWorker(Worker):
                             "final_obs": env_batch["final_obs"],
                         },
                     )
-                    if self.collect_transitions:
+                    if stored_chunk and self.collect_transitions:
                         next_obs = (
                             env_output.final_obs
                             if env_output.dones.any() and self.cfg.env.train.auto_reset

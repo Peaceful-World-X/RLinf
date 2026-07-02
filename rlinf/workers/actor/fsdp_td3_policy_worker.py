@@ -198,17 +198,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 int(self.cfg.algorithm.get("n_step", 1)),
                 float(self.cfg.algorithm.gamma),
             )
-        filter_cfg = self.cfg.algorithm.replay_buffer.get(
-            "sample_forward_input_filter", None
-        )
-        if filter_cfg is not None and hasattr(
-            self.replay_buffer, "set_sample_forward_input_filter"
-        ):
-            self.replay_buffer.set_sample_forward_input_filter(
-                filter_cfg.get("key", None),
-                max_value=filter_cfg.get("max_value", None),
-                min_value=filter_cfg.get("min_value", None),
-            )
+        self._configure_replay_buffer_sample_filter()
         preload_checkpoint_path = self.cfg.algorithm.replay_buffer.get(
             "preload_checkpoint_path", None
         )
@@ -284,6 +274,31 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         )
         self.td3_algorithm.set_action_horizon(action_horizon)
         self.target_update_type = self.cfg.algorithm.get("target_update_type", "all")
+
+    def _configure_replay_buffer_sample_filter(self):
+        if not hasattr(self.replay_buffer, "set_sample_forward_input_filter"):
+            return
+
+        filter_cfg = self.cfg.algorithm.replay_buffer.get(
+            "sample_forward_input_filter", None
+        )
+        if filter_cfg is not None:
+            self.replay_buffer.set_sample_forward_input_filter(
+                filter_cfg.get("key", None),
+                max_value=filter_cfg.get("max_value", None),
+                min_value=filter_cfg.get("min_value", None),
+            )
+            return
+
+        if bool(
+            self.cfg.algorithm.replay_buffer.get(
+                "exclude_warmup_chunks_from_training", False
+            )
+        ):
+            self.replay_buffer.set_sample_forward_input_filter(
+                "rollout_control_source",
+                min_value=1,
+            )
 
     def _setup_replay_delete_keyboard(self):
         replay_cfg = self.cfg.algorithm.replay_buffer

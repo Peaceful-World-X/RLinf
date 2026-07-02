@@ -44,7 +44,7 @@ runner:
   reset_global_step_on_resume: True
   log_interval: 20
   weight_sync_interval: 10
-  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/checkpoints/online_resume_from_offline1500_on_online122/global_step_1500"
+  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/logs/20260626-07:51:18-realworld_piper_peginsertion_td3_rl_token_online/replay_buffer/rank_0/offline_train_on_online122_residual_q010_new/checkpoints/global_step_1500"
   ckpt_path: null
 
 algorithm:
@@ -106,7 +106,8 @@ algorithm:
     prefetch_size: 1
     save_executor_workers: 2
     checkpoint_executor_workers: 2
-    preload_checkpoint_path: /home/focal/shared_disk/users/kwj/RLinf/logs/20260620-14:59:15-realworld_piper_peginsertion_td3_rl_token_online/replay_buffer/rank_0
+    exclude_warmup_chunks_from_training: true
+    preload_checkpoint_path: null
     cache_obs_keys:
       - visual_latent
       - states
@@ -118,10 +119,7 @@ algorithm:
       - model_action
       - ref_action
       - mc_return
-      - tcp_distance_to_target
-    sample_forward_input_filter:
-      key: tcp_distance_to_target
-      max_value: 0.10
+      - rollout_control_source
 
 env:
   group_name: "EnvGroup"
@@ -134,7 +132,7 @@ env:
     break_chunk_after_intervention: true
     break_chunk_on_intervention_change: true
     save_substep_obs: true
-    max_steps_per_rollout_epoch: 5000
+    max_steps_per_rollout_epoch: 4995
     max_episode_steps: 5000
     override_cfg:
       is_dummy: false
@@ -153,7 +151,7 @@ env:
       obs_img_resolution: [224, 224]
       sliding_window_action_buffer: true
       smooth_action_chunk: true
-      use_tcp_reset_pose_pool: true
+      use_tcp_reset_pose_pool: false
       tcp_reset_pose_pool_path: "/home/focal/shared_disk/users/kwj/RLinf/assets/piper_tcp_reset_poses_10cm.json"
       tcp_reset_random_seed: 20260620
       tcp_reset_interpolate_steps: 20
@@ -183,8 +181,8 @@ rollout:
   pipeline_stage_num: 1
   collect_transitions: true
   collect_prev_infos: false
-  warm_up_chunk_steps: 0
-  vla_warmup_chunk_steps: 0
+  warm_up_chunk_steps: 16
+  vla_warmup_chunk_steps: 16
   online_control:
     save_substep_obs: true
     print_status: true
@@ -205,8 +203,8 @@ actor:
   recv_drain_max_trajectories: 64
 
   model:
-    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert"
-    rl_token_path: "/home/focal/shared_disk/users/kwj/weight/rltoken/pi05_cube_insert/pi05_cube_insert/10000"
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert"
+    rl_token_path: "/home/focal/shared_disk/users/kwj/weight/rltoken/pi05_charge_insert/10000"
     freeze_rl_token: True
     critic_train_rl_token_encoder: ${algorithm.critic_train_rl_token_encoder}
     critic_separate_rl_token_encoder: ${algorithm.critic_separate_rl_token_encoder}
@@ -226,7 +224,7 @@ actor:
     actor_residual_ref: True
     actor_residual_scale: 1.0
     action_space: "normalized_delta"
-    action_norm_stats_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert/norm_stats.json"
+    action_norm_stats_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert/norm_stats.json"
     action_norm_std_floor: 1.0
     # Actor/critic train only the right arm; rollout still executes full 14D
     # absolute Piper actions by keeping the left arm on the VLA reference action.
@@ -234,9 +232,9 @@ actor:
     robot_state_dim: 6
     env_action_dim: 14
     controlled_action_indices: [7, 8, 9, 10, 11, 12]
-    num_action_chunks: 10
+    num_action_chunks: 15
     num_steps: 5
-    rollout_control_mode: "gate"
+    rollout_control_mode: "warmup"
     rollout_gate_mse_threshold: 9.0e-3
     rollout_gate_disable_mse_threshold: 1.2e-2
     rollout_gate_stable_chunks: 3
@@ -245,10 +243,6 @@ actor:
     rollout_gate_gripper_state_index: 13
     rollout_gate_gripper_closed_threshold: 0.035
     rollout_gate_gripper_stable_chunks: 2
-    rollout_gate_tcp_target: [0.2818035953, 0.0385303870, 0.0602531905]
-    rollout_gate_tcp_radius: 0.10
-    rollout_gate_tcp_base_offset: [0.0, -0.22, 0.0]
-    rollout_gate_tcp_urdf_path: "/home/focal/shared_disk/users/kwj/RLinf/assets/piper_local_assets/piper.urdf"
     openpi:
       config_name: "pi05_aloha_cubeinsert"
       num_images_in_input: 3

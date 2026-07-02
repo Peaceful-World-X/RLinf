@@ -147,16 +147,26 @@ class EmbodiedRunner:
             return
 
         self.logger.info(f"Resuming training from checkpoint directory {resume_dir}.")
-        actor_checkpoint_path = os.path.join(resume_dir, "actor")
-        assert os.path.exists(actor_checkpoint_path), (
-            f"resume_dir {actor_checkpoint_path} does not exist."
-        )
+        actor_checkpoint_path = self._resolve_actor_checkpoint_path(resume_dir)
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
         if bool(self.cfg.runner.get("reset_global_step_on_resume", False)):
             self.global_step = 0
             self.logger.info("Reset global_step to 0 after loading checkpoint.")
         else:
             self.global_step = int(resume_dir.split("global_step_")[-1])
+
+    @staticmethod
+    def _resolve_actor_checkpoint_path(resume_dir: str) -> str:
+        actor_checkpoint_path = os.path.join(resume_dir, "actor")
+        actor_critic_path = os.path.join(resume_dir, "actor_critic.pt")
+        if os.path.exists(actor_critic_path):
+            return resume_dir
+        if os.path.exists(actor_checkpoint_path):
+            return actor_checkpoint_path
+        raise FileNotFoundError(
+            "resume_dir does not contain a supported actor checkpoint. "
+            f"Expected either {actor_checkpoint_path} or {actor_critic_path}."
+        )
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()

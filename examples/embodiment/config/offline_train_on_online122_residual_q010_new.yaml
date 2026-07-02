@@ -1,30 +1,39 @@
 # Offline TD3+BC training on online trajectory data
-# Source: 20260620-14:59:15-realworld_piper_peginsertion_td3_rl_token_online
+# Source: 20260625-09:42:44-realworld_piper_cubeinsert_pi05_eval_with_reward
 # Experiment: residual actor, q_weight=0.1, bc_weight=50
 #
 # Run like other embodiment examples:
 #   bash examples/embodiment/run_offline_train_openrlt.sh offline_train_on_online122_residual_q010_new
 
-# --- Path roots (data_dir, feature_cache, output_dir derived automatically) ---
-online_log_dir: /home/focal/shared_disk/users/kwj/RLinf/logs/20260620-14:59:15-realworld_piper_peginsertion_td3_rl_token_online # need change
+# --- Path roots ---
+online_log_dir: /home/focal/shared_disk/users/kwj/RLinf/logs/20260630-06:47:23-realworld_piper_cubeinsert_pi05_eval_with_reward/demos
 output_name: offline_train_on_online122_residual_q010_new
+data_dir: /home/focal/shared_disk/users/kwj/RLinf/logs/20260630-06:47:23-realworld_piper_cubeinsert_pi05_eval_with_reward/demos
+feature_cache: null
+generate_feature_cache_if_missing: true
+feature_cache_batch_size: 8
+feature_cache_task_description: "peg and insertion"
+feature_cache_model_config: /home/focal/shared_disk/users/kwj/RLinf/examples/embodiment/config/realworld_piper_cubeinsert_pi05_eval_with_reward.yaml
 
 # --- Fixed paths ---
-norm_stats_path: /home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert/norm_stats.json # need change
-urdf_path: /home/focal/shared_disk/users/kwj/RLinf/assets/piper_local_assets/piper.urdf # need change
+norm_stats_path: /home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert/norm_stats.json
+urdf_path: /home/focal/shared_disk/users/kwj/RLinf/assets/piper_local_assets/piper.urdf
+model_path: /home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert
+rl_token_path: /home/focal/shared_disk/users/kwj/weight/rltoken/pi05_charge_insert/10000
 
 # --- Training schedule ---
-max_steps: 1500
+max_steps: 5000
 batch_size: 256
 gpu: 0
 save_interval: 50
 log_interval: 10
 patience: 700
 viz_per_class: 5
+chunk_len: 15
 
 # --- RL hyper-parameters ---
 gamma: 0.94
-n_step: 10
+n_step: 40
 bc_weight: 50.0
 q_weight: 0.1
 q_warmup_steps: 0
@@ -37,7 +46,10 @@ tcp_boundary_weight: 1000.0
 actor_residual_ref: true
 actor_residual_scale: 1.0
 
-# --- TCP geometry ---
-tcp_radius: 0.10
+# --- Dataset sampling ---
+warm_up_chunks: 16
+
+# --- TCP geometry (disabled when radius <= 0) ---
+tcp_radius: 0.0
 tcp_filter_mode: chunk_center   # choices: chunk_center | chunk_end | state
 tcp_target: [0.2818035953, 0.0385303870, 0.0602531905]

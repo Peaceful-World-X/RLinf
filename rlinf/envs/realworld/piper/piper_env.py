@@ -126,13 +126,14 @@ class PiperRobotConfig:
     chunk_size: int = 50
     smooth_action_chunk: bool = True
     action_smooth_cutoff_freq: float = 1.0
-    action_smooth_sampling_freq: float = 15.0
+    action_smooth_sampling_freq: float = 25.0
     action_smooth_order: int = 2
     sliding_window_action_buffer: bool = True
     sliding_window_inference_trigger_remaining: int = 10
     sliding_window_max_action_execute_horizon: int = 35
     sliding_window_distance_thresh: float = 0.5
     sliding_window_latency_steps: int = 0
+    sliding_window_boundary_blend_steps: int = 5
     gripper_action_threshold: Optional[float] = 0.03
     gripper_action_scale: float = 1.1
 
@@ -150,8 +151,7 @@ class PiperRobotConfig:
             -2.967,
             -1.745,
             -1.22,
-            -2.0944,
-            0.0,
+            -2.7925,
             0.0,
         ]
     )
@@ -162,9 +162,8 @@ class PiperRobotConfig:
             0.0,
             1.745,
             1.22,
-            2.0944,
-            1.0,
-            1.0,
+            2.7925,
+            0.07,
         ]
     )
 
@@ -593,16 +592,18 @@ class PiperEnv(gym.Env):
         execute_steps = actions.shape[0]
         trigger_remaining = int(self.config.sliding_window_inference_trigger_remaining)
         latency_steps = max(0, int(self.config.sliding_window_latency_steps))
+        previous_action = None
 
         if self._sliding_window_action_buffer is None or trigger_remaining <= 0:
             smoothed_actions = self._smooth_action_sequence(actions)
         else:
             old_tail_count = min(
-                max(1, execute_steps // 5),
+                max(1, execute_steps // 2),
                 trigger_remaining,
                 self._sliding_window_action_buffer.shape[0],
             )
             old_tail = self._sliding_window_action_buffer[-old_tail_count:]
+            previous_action = old_tail[-1].copy()
             adaptive_horizon = self._calculate_adaptive_horizon(actions)
             new_start = min(latency_steps, max(0, adaptive_horizon - 1))
             new_end = min(max(adaptive_horizon, execute_steps), actions.shape[0])
@@ -623,8 +624,38 @@ class PiperEnv(gym.Env):
         smoothed_actions = smoothed_actions[:execute_steps]
         processed_actions = actions.copy()
         processed_actions[: smoothed_actions.shape[0]] = smoothed_actions
+        processed_actions = self._blend_action_chunk_start(
+            processed_actions,
+            previous_action,
+        )
         self._sliding_window_action_buffer = processed_actions.copy()
         return processed_actions
+
+    def _blend_action_chunk_start(
+        self, actions: np.ndarray, previous_action: np.ndarray | None
+    ) -> np.ndarray:
+        if previous_action is None or actions.shape[-1] < 14:
+            return actions
+        blend_steps = int(
+            getattr(self.config, "sliding_window_boundary_blend_steps", 0)
+        )
+        if blend_steps <= 0:
+            return actions
+        blend_steps = min(blend_steps, actions.shape[0])
+        ramp = np.linspace(
+            1.0 / (blend_steps + 1),
+            blend_steps / (blend_steps + 1),
+            blend_steps,
+            dtype=np.float64,
+        ).reshape(blend_steps, 1)
+        joint_mask = np.ones(actions.shape[-1], dtype=bool)
+        joint_mask[[6, 13]] = False
+        blended = (
+            previous_action.reshape(1, -1) * (1.0 - ramp) + actions[:blend_steps] * ramp
+        )
+        actions = actions.copy()
+        actions[:blend_steps, joint_mask] = blended[:, joint_mask]
+        return actions
 
     def _calculate_adaptive_horizon(self, actions: np.ndarray) -> int:
         max_horizon = int(self.config.sliding_window_max_action_execute_horizon)
@@ -656,7 +687,15 @@ class PiperEnv(gym.Env):
         from scipy.signal import butter, filtfilt
 
         cutoff_freq = float(self.config.action_smooth_cutoff_freq)
-        sampling_freq = float(self.config.action_smooth_sampling_freq)
+        sampling_freq = float(
+            getattr(
+                self.config,
+                "action_smooth_sampling_freq",
+                getattr(self.config, "step_frequency", 25.0),
+            )
+        )
+        if sampling_freq <= 0:
+            sampling_freq = float(getattr(self.config, "step_frequency", 25.0))
         order = int(self.config.action_smooth_order)
         b, a = butter(
             order,

@@ -57,14 +57,14 @@ _EFFORT_RAW_TO_SI: float = 1e-3  # raw → SI
 
 # ---------------------------------------------------------------------------
 # Piper 6-DOF 关节物理限位 (rad)
-# 参考: piper_env.py 中的 min_qpos / max_qpos（前6个为关节，后2个为夹爪）
+# 参考: piper_env.py 中的 min_qpos / max_qpos（前6个为关节，最后1个为夹爪）
 # ---------------------------------------------------------------------------
 
 PIPER_JOINT_LIMITS_LOW: np.ndarray = np.array(
-    [-2.618, 0.0, -2.967, -1.745, -1.22, -2.0944], dtype=np.float64
+    [-2.618, 0.0, -2.967, -1.745, -1.22, -2.7925], dtype=np.float64
 )
 PIPER_JOINT_LIMITS_HIGH: np.ndarray = np.array(
-    [2.618, 3.14, 0.0, 1.745, 1.22, 2.0944], dtype=np.float64
+    [2.618, 3.14, 0.0, 1.745, 1.22, 2.7925], dtype=np.float64
 )
 
 # 夹爪范围 (m): 0 ~ 0.07m（由 Gripper.srv 定义）
@@ -192,9 +192,9 @@ def endpose_si_to_raw(
     Returns:
         (raw_xyz, raw_rpy): SDK 原始值元组（整数数组）。
     """
-    raw_xyz = np.round(
-        np.asarray(xyz_m, dtype=np.float64) * _POS_M_TO_RAW
-    ).astype(np.int64)
+    raw_xyz = np.round(np.asarray(xyz_m, dtype=np.float64) * _POS_M_TO_RAW).astype(
+        np.int64
+    )
     raw_rpy = np.round(
         np.asarray(rpy_rad, dtype=np.float64) * _EULER_RAD_TO_RAW
     ).astype(np.int64)

@@ -67,6 +67,8 @@ class TrainConfig:
     norm_stats_path: str
     output_dir: str
     urdf_path: str
+    model_path: str | None = None
+    rl_token_path: str | None = None
     max_steps: int = 5000
     batch_size: int = 256
     gamma: float = 0.94
@@ -102,6 +104,11 @@ class TrainConfig:
     tcp_target: tuple[float, float, float] | list[float] | None = DEFAULT_TCP_TARGET
     tcp_radius: float = 0.10
     tcp_filter_mode: str = "chunk_center"
+    warm_up_chunks: int = 0
+    generate_feature_cache_if_missing: bool = False
+    feature_cache_batch_size: int = 8
+    feature_cache_task_description: str = "peg and insertion"
+    feature_cache_model_config: str | None = None
 
 
 def layer_norm_no_params(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -460,9 +467,14 @@ def compute_mc_returns(
 
 
 def reshape_right_full(flat: torch.Tensor | np.ndarray) -> torch.Tensor | np.ndarray:
+    env_action_dim = 14
+    flat_dim = int(flat.shape[-1])
+    if flat_dim % env_action_dim != 0:
+        raise ValueError(f"Expected flat action dim divisible by 14, got {flat_dim}")
+    horizon = flat_dim // env_action_dim
     if torch.is_tensor(flat):
-        return flat.reshape(flat.shape[0], 10, 14)[..., 7:14]
-    return np.asarray(flat).reshape(flat.shape[0], 10, 14)[..., 7:14]
+        return flat.reshape(flat.shape[0], horizon, env_action_dim)[..., 7:14]
+    return np.asarray(flat).reshape(flat.shape[0], horizon, env_action_dim)[..., 7:14]
 
 
 def reshape_right_joints(flat: torch.Tensor | np.ndarray) -> torch.Tensor | np.ndarray:
@@ -518,6 +530,174 @@ def _chunk_tcp_point(
     return right_tcp(q, kin, RIGHT_BASE_OFFSET)[0]
 
 
+def _trajectory_index_from_path(path: Path, fallback: int) -> int:
+    stem = path.stem
+    parts = stem.split("_")
+    if len(parts) >= 2 and parts[0] == "trajectory":
+        try:
+            return int(parts[1])
+        except ValueError:
+            return int(fallback)
+    return int(fallback)
+
+
+def _select_obs_at_chunk(obs: dict[str, Any], rel: int, task_description: str) -> dict:
+    env_obs = {}
+    for src_key, out_key in (
+        ("main_images", "main_images"),
+        ("extra_view_images", "extra_view_images"),
+        ("states", "states"),
+        ("task_descriptions", "task_descriptions"),
+    ):
+        if src_key not in obs:
+            continue
+        value = obs[src_key]
+        if torch.is_tensor(value):
+            selected = value[rel, 0].unsqueeze(0).contiguous()
+            env_obs[out_key] = selected
+        elif isinstance(value, list):
+            item = value[rel] if rel < len(value) else value[-1]
+            env_obs[out_key] = item
+        else:
+            env_obs[out_key] = value
+    if "task_descriptions" not in env_obs:
+        env_obs["task_descriptions"] = [task_description]
+    return env_obs
+
+
+@torch.no_grad()
+def _extract_rl_token(model, env_obs: dict) -> torch.Tensor:
+    prefix_output, _, _ = model._build_prefix_cache_from_obs(env_obs)
+    image_features = model._select_prefix_features(prefix_output)
+    return model.rl_token_autoencoder.encoder(image_features).detach().cpu().float()
+
+
+def generate_feature_cache(cfg: TrainConfig) -> None:
+    if cfg.model_path is None or cfg.rl_token_path is None:
+        raise ValueError(
+            "Feature cache is missing. Set `model_path` and `rl_token_path`, "
+            "or provide an existing `feature_cache`."
+        )
+
+    from rlinf.models import get_model
+
+    device = torch.device(f"cuda:{cfg.gpu}" if torch.cuda.is_available() else "cpu")
+    model_cfg = build_feature_model_cfg(cfg)
+    model = get_model(model_cfg)
+    model.to(device)
+    model.eval()
+
+    metas: list[dict[str, Any]] = []
+    tokens: list[torch.Tensor] = []
+    traj_paths = sorted(Path(cfg.data_dir).glob("*.pt"))
+    for fallback_idx, traj_path in enumerate(traj_paths):
+        traj = torch.load(traj_path, map_location="cpu", weights_only=False)
+        curr_obs = traj.get("curr_obs")
+        if not isinstance(curr_obs, dict) or "states" not in curr_obs:
+            continue
+        num_chunks = int(curr_obs["states"].shape[0])
+        traj_reward_sum = float(torch.as_tensor(traj.get("rewards", 0)).float().sum())
+        traj_index = _trajectory_index_from_path(traj_path, fallback_idx)
+        for rel in range(num_chunks):
+            env_obs = _select_obs_at_chunk(
+                curr_obs,
+                rel,
+                str(cfg.feature_cache_task_description),
+            )
+            token = _extract_rl_token(model, env_obs)
+            tokens.append(token.squeeze(0))
+            metas.append(
+                {
+                    "path": str(traj_path),
+                    "rel_chunk": int(rel),
+                    "traj_index": int(traj_index),
+                    "success": bool(traj_reward_sum > 0),
+                }
+            )
+
+    if tokens:
+        rltoken = torch.stack(tokens, dim=0).float().cpu()
+    else:
+        rltoken = torch.empty(0, int(cfg.z_dim), dtype=torch.float32)
+    out_path = Path(cfg.feature_cache)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "rltoken": rltoken,
+            "metas": metas,
+            "source_log_dir": str(Path(cfg.data_dir).parent),
+            "num_trajectories": len(traj_paths),
+            "feature_source": {
+                "model_path": cfg.model_path,
+                "rl_token_path": cfg.rl_token_path,
+                "task_description": cfg.feature_cache_task_description,
+            },
+        },
+        out_path,
+    )
+    print(
+        json.dumps(
+            {
+                "feature_cache": {
+                    "path": str(out_path),
+                    "num_features": int(rltoken.shape[0]),
+                    "num_trajectories": len(traj_paths),
+                }
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
+def build_feature_model_cfg(cfg: TrainConfig):
+    from omegaconf import OmegaConf
+
+    if cfg.feature_cache_model_config:
+        source_cfg = OmegaConf.load(cfg.feature_cache_model_config)
+        model_cfg = OmegaConf.create(
+            OmegaConf.to_container(source_cfg.actor.model, resolve=True)
+        )
+    else:
+        model_cfg = OmegaConf.create({})
+    if not model_cfg.get("openpi", None):
+        raise ValueError(
+            "Feature cache generation requires OpenPI model config. "
+            "Set `feature_cache_model_config` to the data-collection yaml."
+        )
+    model_cfg.model_type = "openpi_rl_token"
+    model_cfg.model_path = cfg.model_path
+    model_cfg.rl_token_path = cfg.rl_token_path
+    if not model_cfg.get("precision", None):
+        model_cfg.precision = "bf16"
+    model_cfg.is_lora = bool(model_cfg.get("is_lora", False))
+    model_cfg.action_horizon = int(model_cfg.get("num_action_chunks", cfg.chunk_len))
+    model_cfg.num_action_chunks = int(model_cfg.get("num_action_chunks", cfg.chunk_len))
+    model_cfg.action_dim = int(model_cfg.get("action_dim", 14))
+    model_cfg.env_action_dim = int(
+        model_cfg.get("env_action_dim", model_cfg.action_dim)
+    )
+    model_cfg.robot_state_dim = int(model_cfg.get("robot_state_dim", 14))
+    model_cfg.freeze_rl_token = True
+    return model_cfg
+
+
+def ensure_feature_cache(cfg: TrainConfig, generator=generate_feature_cache) -> None:
+    feature_cache = Path(cfg.feature_cache)
+    if feature_cache.exists():
+        return
+    if not cfg.generate_feature_cache_if_missing:
+        raise FileNotFoundError(
+            f"Feature cache not found: {feature_cache}. "
+            "Set `generate_feature_cache_if_missing: true` to create it first."
+        )
+    generator(cfg)
+    if not feature_cache.exists():
+        raise FileNotFoundError(
+            f"Feature cache generator did not create: {feature_cache}"
+        )
+
+
 def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
     cache = torch.load(cfg.feature_cache, map_location="cpu")
     metas = cache["metas"]
@@ -535,9 +715,13 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
     loaded: dict[str, dict] = {}
     skipped_radius = 0
     skipped_missing = 0
+    skipped_warmup = 0
     for feature_idx, meta in enumerate(metas):
         path = _resolve_meta_path(str(meta["path"]), cfg.data_dir)
         rel = int(meta["rel_chunk"])
+        if rel < int(cfg.warm_up_chunks):
+            skipped_warmup += 1
+            continue
         if path not in loaded:
             if not Path(path).exists():
                 skipped_missing += 1
@@ -547,8 +731,8 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
         fwd = traj.get("forward_inputs", {})
         action_src = fwd.get("executed_action", fwd.get("action", traj["actions"]))
         action_flat = action_src[rel, 0].float().reshape(-1)
-        if action_flat.numel() == 60:
-            actions = action_flat.reshape(10, 6)
+        if action_flat.numel() % 14 != 0:
+            actions = action_flat.reshape(-1, 6)
         else:
             actions = reshape_right_joints(action_flat.reshape(1, -1))[0]
         ref = fwd.get("ref_action", None)
@@ -556,8 +740,8 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
             ref_right = actions
         else:
             ref_flat = ref[rel, 0].float().reshape(-1)
-            if ref_flat.numel() == 60:
-                ref_right = ref_flat.reshape(10, 6)
+            if ref_flat.numel() % 14 != 0:
+                ref_right = ref_flat.reshape(-1, 6)
             else:
                 ref_right = reshape_right_joints(ref_flat.reshape(1, -1))[0]
         state = traj["curr_obs"]["states"][rel, 0].float()
@@ -575,9 +759,9 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
         )
         env_abs_right = None
         if env_abs is not None:
-            env_abs_right = reshape_right_full(env_abs[rel, 0].float().reshape(1, -1))[
-                0
-            ]
+            env_abs_flat = env_abs[rel, 0].float().reshape(-1)
+            if env_abs_flat.numel() % 14 == 0:
+                env_abs_right = reshape_right_full(env_abs_flat.reshape(1, -1))[0]
         state_right_full = state[RIGHT_ARM_FULL]
         tcp_point = _chunk_tcp_point(
             state_right_full, env_abs_right, kin, cfg.tcp_filter_mode
@@ -611,8 +795,9 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
         )
     if not rows:
         raise RuntimeError(
-            f"TCP filter kept zero rows: radius={cfg.tcp_radius}, "
-            f"target={tcp_target.tolist()}, missing_paths={skipped_missing}"
+            f"Dataset filter kept zero rows: warm_up_chunks={cfg.warm_up_chunks}, "
+            f"tcp_radius={cfg.tcp_radius}, target={tcp_target.tolist()}, "
+            f"missing_paths={skipped_missing}"
         )
 
     by_key = {(r["path"], r["rel"]): r["idx"] for r in rows}
@@ -640,8 +825,10 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
         "trajectories": loaded,
         "tcp_target": torch.tensor(tcp_target, dtype=torch.float32),
         "tcp_radius": float(cfg.tcp_radius),
+        "warm_up_chunks": int(cfg.warm_up_chunks),
         "skipped_radius": int(skipped_radius),
         "skipped_missing": int(skipped_missing),
+        "skipped_warmup": int(skipped_warmup),
     }
     data["next_z"] = data["z"][data["next_idx"]]
     data["next_ref"] = data["ref"][data["next_idx"]]
@@ -653,11 +840,13 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
         "tcp_target": tcp_target.tolist(),
         "tcp_radius": float(cfg.tcp_radius),
         "tcp_filter_mode": str(cfg.tcp_filter_mode),
+        "warm_up_chunks": int(cfg.warm_up_chunks),
         "tcp_distance_min": float(min(r["tcp_distance"] for r in rows)),
         "tcp_distance_max": float(max(r["tcp_distance"] for r in rows)),
         "tcp_distance_mean": float(np.mean([r["tcp_distance"] for r in rows])),
         "skipped_radius": int(skipped_radius),
         "skipped_missing": int(skipped_missing),
+        "skipped_warmup": int(skipped_warmup),
     }
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     (Path(cfg.output_dir) / "dataset_filter_summary.json").write_text(
@@ -1156,6 +1345,8 @@ def main() -> int:
         default="/shared_disk/users/angen.ye/code/giga_rlinf/train_logs/openrlt_right_arm/openrlt_right_arm_tcp10cm_6joints",
     )
     parser.add_argument("--urdf-path", default="assets/piper_local_assets/piper.urdf")
+    parser.add_argument("--model-path", default=None)
+    parser.add_argument("--rl-token-path", default=None)
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--gpu", type=int, default=0)
@@ -1163,6 +1354,8 @@ def main() -> int:
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--patience", type=int, default=1200)
     parser.add_argument("--viz-per-class", type=int, default=3)
+    parser.add_argument("--chunk-len", type=int, default=10)
+    parser.add_argument("--action-dim", type=int, default=6)
     parser.add_argument("--gamma", type=float, default=0.94)
     parser.add_argument("--n-step", type=int, default=10)
     parser.add_argument("--bc-weight", type=float, default=20.0)
@@ -1187,6 +1380,18 @@ def main() -> int:
     parser.add_argument(
         "--tcp-target", type=float, nargs=3, default=list(DEFAULT_TCP_TARGET)
     )
+    parser.add_argument("--warm-up-chunks", type=int, default=0)
+    parser.add_argument(
+        "--generate-feature-cache-if-missing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--feature-cache-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--feature-cache-task-description",
+        default="peg and insertion",
+    )
+    parser.add_argument("--feature-cache-model-config", default=None)
     args = parser.parse_args()
 
     cfg = TrainConfig(**vars(args))
@@ -1199,6 +1404,7 @@ def main() -> int:
         json.dumps(asdict(cfg), indent=2), encoding="utf-8"
     )
 
+    ensure_feature_cache(cfg)
     data = load_dataset(cfg)
     build_n_step_arrays(data, cfg.gamma, cfg.n_step)
     action_mean, action_std = load_norm_stats(cfg.norm_stats_path)

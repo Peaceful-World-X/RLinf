@@ -43,7 +43,7 @@ runner:
   resume_dir: null
   ckpt_path: null
 
-  num_data_episodes: 200
+  num_data_episodes: 100
   record_task_description: True
 
 algorithm:
@@ -119,6 +119,7 @@ env:
     auto_reset: False
     ignore_terminations: False
     break_chunk_after_intervention: true
+    save_substep_obs: true
     max_steps_per_rollout_epoch: 5000   # 30 Hz * ~167 s; must be divisible by num_action_chunks
     max_episode_steps: 5000
     override_cfg:
@@ -159,8 +160,8 @@ actor:
   enable_offload: false
 
   model:
-    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_cube_insert"
-    num_action_chunks: 10
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert"
+    num_action_chunks: 15
     action_dim: 14
     add_value_head: false
     num_steps: 5

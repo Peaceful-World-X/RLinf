@@ -548,6 +548,64 @@ class TrajectoryReplayBuffer:
         )
         return int(valid[pick].item())
 
+    def _get_flat_trajectory_for_sampling(self, trajectory_id: int) -> dict:
+        if self._flat_trajectory_cache is not None:
+            cached = self._flat_trajectory_cache.get(int(trajectory_id))
+            if cached is not None:
+                return cached
+        info = self._trajectory_index[int(trajectory_id)]
+        trajectory = self._load_trajectory(int(trajectory_id), info["model_weights_id"])
+        flat = self._flatten_trajectory(trajectory)
+        if self._flat_trajectory_cache is not None:
+            self._flat_trajectory_cache.put(int(trajectory_id), flat)
+        return flat
+
+    def _sample_chunks_from_forward_input_filter(
+        self,
+        window_ids: list[int],
+        num_chunks: int,
+        *,
+        tail_window_size: int = 0,
+    ) -> dict[str, torch.Tensor]:
+        flats_by_id: dict[int, dict] = {}
+        candidates: list[tuple[int, int]] = []
+        tail_window_size = max(0, int(tail_window_size))
+
+        for trajectory_id in window_ids:
+            info = self._trajectory_index[int(trajectory_id)]
+            flat = self._get_flat_trajectory_for_sampling(int(trajectory_id))
+            num_samples = min(int(info["num_samples"]), self._flat_num_samples(flat))
+            valid = self._valid_local_indices_for_filter(flat, num_samples)
+            if valid is None:
+                valid = torch.arange(num_samples, dtype=torch.long)
+            if tail_window_size > 0 and num_samples > 0:
+                offset = max(0, num_samples - min(num_samples, tail_window_size))
+                valid = valid[valid >= offset]
+            if valid.numel() == 0:
+                continue
+            flats_by_id[int(trajectory_id)] = flat
+            candidates.extend(
+                (int(trajectory_id), int(local)) for local in valid.tolist()
+            )
+
+        if not candidates:
+            return {}
+
+        picks = torch.randint(
+            0,
+            len(candidates),
+            (int(num_chunks),),
+            generator=self.random_generator,
+        ).tolist()
+        flats: list[dict] = []
+        buffer_indices: list[int] = []
+        for pick in picks:
+            trajectory_id, local = candidates[int(pick)]
+            flats.append(flats_by_id[trajectory_id])
+            buffer_indices.append(local)
+
+        return self._sample_from_flat_specs(flats, buffer_indices)
+
     def _init_random_generator(self, seed):
         """(Re)initialize numpy and torch RNGs from self.seed."""
         np.random.seed(seed)
@@ -883,6 +941,13 @@ class TrajectoryReplayBuffer:
 
         if window_total_samples == 0:
             return {}
+
+        if self.sample_forward_input_filter_key:
+            return self._sample_chunks_from_forward_input_filter(
+                window_ids,
+                num_chunks,
+                tail_window_size=tail_window_size,
+            )
 
         if num_chunks > window_total_samples:
             num_chunks = window_total_samples
