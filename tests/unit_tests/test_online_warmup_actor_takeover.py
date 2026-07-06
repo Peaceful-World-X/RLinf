@@ -15,6 +15,10 @@
 import torch
 from omegaconf import OmegaConf
 
+from examples.embodiment.intervention_classifier_gate import (
+    InterventionClassifierGate,
+    InterventionGateDecision,
+)
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
@@ -23,6 +27,18 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.workers.actor.fsdp_td3_policy_worker import EmbodiedTD3FSDPPolicy
 from rlinf.workers.env.env_worker import EnvWorker
+
+
+class _FakeGate(InterventionClassifierGate):
+    def __init__(self, decisions):
+        self.decisions = list(decisions)
+        self.enabled = True
+        self.model = None
+        self.device = torch.device("cpu")
+        self.last_probability = None
+
+    def decide_actor_intervention(self, zrl, chunk_idx, warm_up_chunks, threshold):
+        return self.decisions.pop(0)
 
 
 class _RolloutResult:
@@ -55,6 +71,7 @@ class _RolloutResult:
             "rollout_control_source": torch.ones(
                 actor_env_actions.shape[0], 1, dtype=torch.long
             ),
+            "rl_token": torch.zeros(actor_env_actions.shape[0], 4),
         }
 
 
@@ -79,6 +96,9 @@ def _worker(warm_up_chunks=16):
     worker.vla_warmup_chunk_steps = warm_up_chunks
     worker.rollout_control_mode = "warmup"
     worker._online_action_norm_cache = None
+    worker._intervention_gate = InterventionClassifierGate(model=None)
+    worker.intervention_classifier_threshold = 0.8
+    worker._last_intervention_gate_decision = None
     return worker
 
 
@@ -132,6 +152,50 @@ def test_after_warmup_replaces_only_right_arm_joints_and_keeps_grippers_from_pi0
     assert torch.equal(rollout.forward_inputs["action"], actor_action)
     assert torch.equal(rollout.forward_inputs["executed_action"], actor_action)
     assert rollout.forward_inputs["rollout_control_source"].item() == 1
+
+
+def test_classifier_disabled_matches_warmup_chunk_boundary_regression():
+    worker = _worker(warm_up_chunks=16)
+    pi05 = torch.zeros(1, 3, 14)
+    actor = torch.zeros(1, 3, 14)
+    rollout = _RolloutResult(actor, pi05)
+
+    assert worker._should_force_vla_rollout(rollout, chunk_step_idx=15) is True
+    assert worker._should_force_vla_rollout(rollout, chunk_step_idx=16) is False
+
+
+def test_classifier_enabled_overrides_warmup_chunk_boundary():
+    worker = _worker(warm_up_chunks=16)
+    worker._intervention_gate = _FakeGate(
+        [
+            InterventionGateDecision(
+                actor_intervene=True,
+                mode="classifier",
+                classifier_probability=0.9,
+                classifier_triggered=True,
+            ),
+            InterventionGateDecision(
+                actor_intervene=False,
+                mode="classifier",
+                classifier_probability=0.1,
+                classifier_triggered=False,
+            ),
+        ]
+    )
+    pi05 = torch.zeros(1, 3, 14)
+    actor = torch.zeros(1, 3, 14)
+    rollout = _RolloutResult(actor, pi05)
+
+    # chunk_step_idx=5 is well before warm_up_chunks=16, but the classifier
+    # says the actor should intervene, so no VLA should be forced.
+    forced_early = worker._should_force_vla_rollout(rollout, chunk_step_idx=5)
+    # chunk_step_idx=20 is past warm_up_chunks=16, but the classifier says no,
+    # so VLA should still be forced (no latch, decided independently).
+    forced_late = worker._should_force_vla_rollout(rollout, chunk_step_idx=20)
+
+    assert forced_early is False
+    assert forced_late is True
+    assert worker._last_intervention_gate_decision.classifier_probability == 0.1
 
 
 def test_warmup_forced_chunk_is_appended_to_rollout_result_for_replay_save():

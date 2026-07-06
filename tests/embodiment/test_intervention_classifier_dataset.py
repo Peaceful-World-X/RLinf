@@ -118,3 +118,39 @@ def test_build_classifier_rows_aligns_feature_cache(tmp_path):
     assert len(positive_rows) == 1
     assert positive_rows[0]["rel"] == 2
     assert positive_rows[0]["source_intervention_steps"] == [4]
+
+
+def test_build_classifier_rows_filters_feature_cache_to_configured_data_dirs(tmp_path):
+    keep_dir = tmp_path / "keep"
+    drop_dir = tmp_path / "drop"
+    keep_dir.mkdir()
+    drop_dir.mkdir()
+    keep_path = keep_dir / "trajectory_0_keep.pt"
+    drop_path = drop_dir / "trajectory_1_drop.pt"
+    flags = torch.zeros(3, 1, 90, dtype=torch.bool)
+    states = torch.zeros(3, 1, 14)
+    torch.save({"intervene_flags": flags, "curr_obs": {"states": states}}, keep_path)
+    torch.save({"intervene_flags": flags, "curr_obs": {"states": states}}, drop_path)
+
+    metas = []
+    for path, traj_index in [(keep_path, 0), (drop_path, 1)]:
+        for rel in range(3):
+            metas.append(
+                {"path": str(path), "rel_chunk": rel, "traj_index": traj_index}
+            )
+    cache_path = tmp_path / "features.pt"
+    torch.save({"rltoken": torch.randn(6, 8), "metas": metas}, cache_path)
+
+    cfg = ClassifierConfig(
+        train_data_dirs=[str(keep_dir)],
+        output_dir=str(tmp_path / "out"),
+        norm_stats_path="unused_norm.json",
+        urdf_path="unused.urdf",
+        feature_cache=str(cache_path),
+        z_dim=8,
+        negative_sample_ratio=0.0,
+    )
+    data = build_classifier_rows(cfg)
+
+    assert len(data["rows"]) == 3
+    assert {Path(row["path"]).parent for row in data["rows"]} == {keep_dir}

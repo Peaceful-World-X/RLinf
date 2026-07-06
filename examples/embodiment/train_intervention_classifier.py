@@ -339,9 +339,42 @@ def load_feature_cache(path: Path) -> tuple[torch.Tensor, list[dict[str, Any]]]:
     return z, metas
 
 
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def filter_feature_rows_to_data_dirs(
+    z: torch.Tensor, metas: list[dict[str, Any]], train_data_dirs: list[str]
+) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    roots = [Path(data_dir).resolve() for data_dir in train_data_dirs]
+    if not roots:
+        return z, metas
+    keep_indices = [
+        idx
+        for idx, meta in enumerate(metas)
+        if any(
+            _path_is_relative_to(Path(str(meta["path"])).resolve(), root)
+            for root in roots
+        )
+    ]
+    if len(keep_indices) == len(metas):
+        return z, metas
+    if not keep_indices:
+        raise RuntimeError(
+            "No feature-cache rows matched train_data_dirs; check feature_cache and data paths"
+        )
+    index = torch.tensor(keep_indices, dtype=torch.long)
+    return z[index], [metas[idx] for idx in keep_indices]
+
+
 def build_classifier_rows(cfg: ClassifierConfig) -> dict[str, Any]:
     feature_cache = ensure_feature_cache(cfg)
     z_all, metas = load_feature_cache(feature_cache)
+    z_all, metas = filter_feature_rows_to_data_dirs(z_all, metas, cfg.train_data_dirs)
     meta_by_key = {
         (str(meta["path"]), int(meta["rel_chunk"])): idx
         for idx, meta in enumerate(metas)

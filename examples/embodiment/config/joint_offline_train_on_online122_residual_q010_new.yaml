@@ -1,0 +1,22 @@
+# Joint offline training wrapper.
+# Runs actor/critic OpenRLT training and intervention-classifier training as
+# independent subprocess stages under one timestamped output directory.
+
+run_name: joint_offline_train_on_online122_residual_q010_new
+output_root: /home/focal/shared_disk/users/kwj/RLinf/logs
+timestamped_run_dir: true
+co_locate_outputs: true
+run_mode: sequential
+stop_on_failure: true
+
+openrlt:
+  enabled: true
+  config: offline_train_on_online122_residual_q010_new
+  output_subdir: openrlt
+  extra_args: []
+
+classifier:
+  enabled: true
+  config: intervention_classifier_online122_residual_q010_new
+  output_subdir: intervention_classifier
+  extra_args: []

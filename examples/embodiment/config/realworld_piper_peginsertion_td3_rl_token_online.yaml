@@ -44,7 +44,7 @@ runner:
   reset_global_step_on_resume: True
   log_interval: 20
   weight_sync_interval: 10
-  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/logs/20260626-07:51:18-realworld_piper_peginsertion_td3_rl_token_online/replay_buffer/rank_0/offline_train_on_online122_residual_q010_new/checkpoints/global_step_1500"
+  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/logs/20260703-05:14:40-realworld_piper_peginsertion_td3_rl_token_online/piper_td3_rl_token_online/checkpoints/global_step_300/actor"
   ckpt_path: null
 
 algorithm:
@@ -107,7 +107,7 @@ algorithm:
     save_executor_workers: 2
     checkpoint_executor_workers: 2
     exclude_warmup_chunks_from_training: true
-    preload_checkpoint_path: null
+    preload_checkpoint_path: /home/focal/shared_disk/users/kwj/RLinf/logs/20260703-05:14:40-realworld_piper_peginsertion_td3_rl_token_online/replay_buffer #实际为replay_buffer_path
     cache_obs_keys:
       - visual_latent
       - states
@@ -235,6 +235,8 @@ actor:
     num_action_chunks: 15
     num_steps: 5
     rollout_control_mode: "warmup"
+    intervention_classifier_path: /home/focal/shared_disk/users/kwj/RLinf/logs/20260703-07:54:56-joint_offline_train_on_online122_residual_q010_new/intervention_classifier/best_intervention_classifier.pt
+    intervention_classifier_threshold: 0.8
     rollout_gate_mse_threshold: 9.0e-3
     rollout_gate_disable_mse_threshold: 1.2e-2
     rollout_gate_stable_chunks: 3

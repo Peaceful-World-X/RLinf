@@ -20,6 +20,9 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from examples.embodiment.intervention_classifier_gate import (
+    InterventionClassifierGate,
+)
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
@@ -156,6 +159,14 @@ class EnvWorker(Worker):
         self._rollout_gate_last_gripper_source = "none"
         self._rollout_gate_last_chunk_step_idx = -1
         self._rollout_gate_gripper_debug_count = 0
+        self._intervention_gate = InterventionClassifierGate.from_optional_checkpoint(
+            actor_model_cfg.get("intervention_classifier_path", None),
+            device="cpu",
+        )
+        self.intervention_classifier_threshold = float(
+            actor_model_cfg.get("intervention_classifier_threshold", 0.8)
+        )
+        self._last_intervention_gate_decision = None
         self.stage_num = self.cfg.rollout.pipeline_stage_num
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
@@ -636,12 +647,26 @@ class EnvWorker(Worker):
             )
             if self._rollout_gate_tcp_error is not None:
                 tcp_gate_text += f" tcp_error={self._rollout_gate_tcp_error}"
+        classifier_gate_text = ""
+        if self._intervention_gate.enabled:
+            decision = self._last_intervention_gate_decision
+            prob_text = (
+                "nan"
+                if decision is None or decision.classifier_probability is None
+                else f"{decision.classifier_probability:.4f}"
+            )
+            mode_text = "none" if decision is None else decision.mode
+            classifier_gate_text = (
+                f" classifier_mode={mode_text}"
+                f" classifier_prob={prob_text}"
+                f" classifier_threshold={float(self.intervention_classifier_threshold):.4f}"
+            )
         print(
             "[online-env] "
             f"chunk={chunk_step_idx} owner={source} executed={executed} "
             f"actor_ref_mse={mse_text} valid_steps={valid_steps} "
             f"intervene_steps={intervene_steps} reward_sum={reward_sum} reward_last={reward_last}"
-            f"{action_stats_text}{gripper_gate_text}{tcp_gate_text}",
+            f"{action_stats_text}{gripper_gate_text}{tcp_gate_text}{classifier_gate_text}",
             flush=True,
         )
 
@@ -856,6 +881,21 @@ class EnvWorker(Worker):
         obs_source=None,
     ) -> bool:
         if self.rollout_control_mode == "warmup":
+            if self._intervention_gate.enabled:
+                zrl = rollout_result.forward_inputs.get("rl_token", None)
+                if zrl is None:
+                    raise RuntimeError(
+                        "rollout_control_mode='warmup' with intervention_classifier_path "
+                        "configured requires forward_inputs['rl_token'] from the actor model"
+                    )
+                decision = self._intervention_gate.decide_actor_intervention(
+                    zrl=zrl,
+                    chunk_idx=chunk_step_idx,
+                    warm_up_chunks=self.vla_warmup_chunk_steps,
+                    threshold=self.intervention_classifier_threshold,
+                )
+                self._last_intervention_gate_decision = decision
+                return not decision.actor_intervene
             return (
                 self.vla_warmup_chunk_steps > 0
                 and chunk_step_idx < self.vla_warmup_chunk_steps

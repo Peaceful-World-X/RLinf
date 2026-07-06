@@ -830,6 +830,7 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             "actor_action": flat_actions,
             "env_action_absolute": env_actions.reshape(env_actions.shape[0], -1).cpu(),
             "visual_latent": image_features.cpu(),
+            "rl_token": rl_token.detach().cpu(),
             "ref_action": ref_flat.cpu(),
             "actor_ref_mse": actor_ref_mse.cpu(),
             "rollout_control_source": rollout_source.cpu(),
