@@ -51,6 +51,15 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             rl_token_num_heads=rl_config_from_ckpt["num_heads"],
             rl_token_max_seq_len=rl_config_from_ckpt["max_seq_len"],
             rl_token_dropout=rl_config_from_ckpt.get("dropout", 0.1),
+            num_image_tokens=cfg.get("num_image_tokens", 768),
+            prefix_feature_type=cfg.get("prefix_feature_type", "image_only"),
+            rl_token_source=cfg.get("rl_token_source", "autoencoder"),
+            actor_train_prefix_token_linear=cfg.get(
+                "actor_train_prefix_token_linear", False
+            ),
+            critic_train_prefix_token_linear=cfg.get(
+                "critic_train_prefix_token_linear", False
+            ),
             robot_state_dim=cfg.get("robot_state_dim", 14),
             actor_head_type=cfg.get("actor_head_type", "mlp"),
             actor_hidden_dims=tuple(cfg.get("actor_hidden_dims", [512, 256])),
@@ -105,6 +114,13 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             rl_token_dropout=cfg.get("rl_token_dropout", 0.1),
             num_image_tokens=cfg.get("num_image_tokens", 768),
             prefix_feature_type=cfg.get("prefix_feature_type", "image_only"),
+            rl_token_source=cfg.get("rl_token_source", "autoencoder"),
+            actor_train_prefix_token_linear=cfg.get(
+                "actor_train_prefix_token_linear", False
+            ),
+            critic_train_prefix_token_linear=cfg.get(
+                "critic_train_prefix_token_linear", False
+            ),
             robot_state_dim=cfg.get("robot_state_dim", 14),
             actor_head_type=cfg.get("actor_head_type", "mlp"),
             actor_hidden_dims=tuple(cfg.get("actor_hidden_dims", [512, 256])),

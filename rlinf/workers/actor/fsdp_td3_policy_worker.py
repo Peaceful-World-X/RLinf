@@ -122,6 +122,8 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 critic_param_filters.append("critic_rl_token_encoder")
             else:
                 critic_param_filters.append("rl_token_autoencoder.encoder")
+        if bool(self.cfg.actor.model.get("critic_train_prefix_token_linear", False)):
+            critic_param_filters.append("critic_prefix_token_linear")
         param_filters = {"critic": critic_param_filters}
         filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
         optimizers = self.build_optimizers(
@@ -410,6 +412,9 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         prefix_pairs = (
             ("rl_token_autoencoder.", "target_rl_token_autoencoder."),
             ("critic_rl_token_encoder.", "target_critic_rl_token_encoder."),
+            ("actor_prefix_token_linear.", "target_actor_prefix_token_linear."),
+            ("critic_prefix_token_linear_1.", "target_critic_prefix_token_linear_1."),
+            ("critic_prefix_token_linear_2.", "target_critic_prefix_token_linear_2."),
             ("actor_head.", "target_actor_head."),
             ("critic_head_1.", "target_critic_head_1."),
             ("critic_head_2.", "target_critic_head_2."),
@@ -595,6 +600,11 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             "curr_obs.ref_action",
         )
         recon_coef = getattr(self.cfg.actor.model, "recon_loss_coef", 0.1)
+        compute_recon_loss = bool(
+            recon_coef > 0.0
+            and self.cfg.actor.model.get("rl_token_source", "autoencoder")
+            == "autoencoder"
+        )
 
         actions, actor_aux = self.model(
             forward_type=ForwardType.TD3,
@@ -604,17 +614,20 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             ref_action=ref_action,
             ref_action_dropout_p=float(self.td3_algorithm.actor_ref_action_dropout_p),
             use_target=False,
-            compute_recon_loss=recon_coef > 0.0,
+            compute_recon_loss=compute_recon_loss,
         )
 
         q_pi = None
         q_pi_mean = 0.0
         if float(self.td3_algorithm.actor_q_coef) > 0.0:
+            critic_rl_state = actor_aux.get("critic_rl_state", actor_aux["rl_state"])
+            if isinstance(critic_rl_state, (tuple, list)):
+                critic_rl_state = tuple(state.detach() for state in critic_rl_state)
+            else:
+                critic_rl_state = critic_rl_state.detach()
             q1, q2 = self.model(
                 forward_type=ForwardType.TD3_Q,
-                rl_state=actor_aux.get(
-                    "critic_rl_state", actor_aux["rl_state"]
-                ).detach(),
+                rl_state=critic_rl_state,
                 action=actions,
             )
             q_pi = torch.minimum(q1, q2)
@@ -1010,6 +1023,9 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             ("target_critic_head_1.", "critic_head_1."),
             ("target_critic_head_2.", "critic_head_2."),
             ("target_critic_rl_token_encoder.", "critic_rl_token_encoder."),
+            ("target_actor_prefix_token_linear.", "actor_prefix_token_linear."),
+            ("target_critic_prefix_token_linear_1.", "critic_prefix_token_linear_1."),
+            ("target_critic_prefix_token_linear_2.", "critic_prefix_token_linear_2."),
         )
         for name, value in state.items():
             out_name = name
@@ -1022,7 +1038,12 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
 
     def _save_actor_critic_checkpoint(self, save_base_path, step):
         os.makedirs(save_base_path, exist_ok=True)
-        online_prefixes = ("actor_head.", "critic_head_1.", "critic_head_2.")
+        online_prefixes = ["actor_head.", "critic_head_1.", "critic_head_2."]
+        if bool(self.cfg.actor.model.get("actor_train_prefix_token_linear", False)):
+            online_prefixes.insert(0, "actor_prefix_token_linear.")
+        if bool(self.cfg.actor.model.get("critic_train_prefix_token_linear", False)):
+            online_prefixes.insert(0, "critic_prefix_token_linear_2.")
+            online_prefixes.insert(0, "critic_prefix_token_linear_1.")
         if bool(self.cfg.algorithm.get("critic_train_rl_token_encoder", False)):
             if bool(
                 self.cfg.actor.model.get("critic_separate_rl_token_encoder", False)
@@ -1030,12 +1051,8 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 encoder_prefix = "critic_rl_token_encoder."
             else:
                 encoder_prefix = "rl_token_autoencoder.encoder."
-            online_prefixes = (
-                encoder_prefix,
-                "actor_head.",
-                "critic_head_1.",
-                "critic_head_2.",
-            )
+            online_prefixes.insert(0, encoder_prefix)
+        online_prefixes = tuple(online_prefixes)
         target_prefixes = online_prefixes
         payload = {
             "format": "rlinf_td3_actor_critic_only",

@@ -69,6 +69,11 @@ class TrainConfig:
     urdf_path: str
     model_path: str | None = None
     rl_token_path: str | None = None
+    rl_token_source: str = "autoencoder"
+    prefix_feature_type: str = "image_only"
+    num_image_tokens: int = 768
+    actor_train_prefix_token_linear: bool = False
+    critic_train_prefix_token_linear: bool = False
     max_steps: int = 5000
     batch_size: int = 256
     gamma: float = 0.94
@@ -568,8 +573,9 @@ def _select_obs_at_chunk(obs: dict[str, Any], rel: int, task_description: str) -
 @torch.no_grad()
 def _extract_rl_token(model, env_obs: dict) -> torch.Tensor:
     prefix_output, _, _ = model._build_prefix_cache_from_obs(env_obs)
-    image_features = model._select_prefix_features(prefix_output)
-    return model.rl_token_autoencoder.encoder(image_features).detach().cpu().float()
+    features = model._select_token_features(prefix_output)
+    token = model._encode_actor_token(features, use_target=False)
+    return token.detach().cpu().float()
 
 
 def generate_feature_cache(cfg: TrainConfig) -> None:
@@ -668,6 +674,15 @@ def build_feature_model_cfg(cfg: TrainConfig):
     model_cfg.model_type = "openpi_rl_token"
     model_cfg.model_path = cfg.model_path
     model_cfg.rl_token_path = cfg.rl_token_path
+    model_cfg.rl_token_source = cfg.rl_token_source
+    model_cfg.prefix_feature_type = cfg.prefix_feature_type
+    model_cfg.num_image_tokens = int(cfg.num_image_tokens)
+    model_cfg.actor_train_prefix_token_linear = bool(
+        cfg.actor_train_prefix_token_linear
+    )
+    model_cfg.critic_train_prefix_token_linear = bool(
+        cfg.critic_train_prefix_token_linear
+    )
     if not model_cfg.get("precision", None):
         model_cfg.precision = "bf16"
     model_cfg.is_lora = bool(model_cfg.get("is_lora", False))
@@ -1347,6 +1362,27 @@ def main() -> int:
     parser.add_argument("--urdf-path", default="assets/piper_local_assets/piper.urdf")
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--rl-token-path", default=None)
+    parser.add_argument(
+        "--rl-token-source",
+        choices=["autoencoder", "last_token", "image_last_linear"],
+        default="autoencoder",
+    )
+    parser.add_argument(
+        "--prefix-feature-type",
+        choices=["image_only", "full_prefix"],
+        default="image_only",
+    )
+    parser.add_argument("--num-image-tokens", type=int, default=768)
+    parser.add_argument(
+        "--actor-train-prefix-token-linear",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--critic-train-prefix-token-linear",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--gpu", type=int, default=0)

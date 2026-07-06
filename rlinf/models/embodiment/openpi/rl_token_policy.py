@@ -54,6 +54,12 @@ class OpenPiRLTokenConfig:
     # "full_prefix": use all prefix tokens (image + language)
     # "image_only": use only the first num_image_tokens (image tokens)
     prefix_feature_type: str = "image_only"
+    # "autoencoder": encode prefix features with the pretrained RL-token encoder.
+    # "last_token": use the full prefix's last token directly as the RL token.
+    # "image_last_linear": linearly aggregate image tokens plus the last token.
+    rl_token_source: str = "autoencoder"
+    actor_train_prefix_token_linear: bool = False
+    critic_train_prefix_token_linear: bool = False
     robot_state_dim: int = 14  # proprioception dimension (s_p)
     actor_head_type: str = "mlp"
     actor_hidden_dims: tuple = (512, 256)
@@ -397,6 +403,23 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         torch.nn.Module.__init__(self)
         self.config = config
         self.action_space = str(getattr(config, "action_space", "absolute"))
+        self.rl_token_source = str(
+            getattr(config, "rl_token_source", "autoencoder")
+        ).lower()
+        if self.rl_token_source not in {
+            "autoencoder",
+            "last_token",
+            "image_last_linear",
+        }:
+            raise ValueError(f"Unsupported rl_token_source: {self.rl_token_source}")
+        if self.rl_token_source != "autoencoder" and int(config.rl_token_dim) != int(
+            config.hidden_dim
+        ):
+            raise ValueError(
+                f"rl_token_source={self.rl_token_source!r} returns hidden_dim "
+                f"tokens, but rl_token_dim={config.rl_token_dim} and "
+                f"hidden_dim={config.hidden_dim}"
+            )
 
         rl_cfg = RLTokenConfig(
             hidden_dim=config.hidden_dim,
@@ -414,6 +437,17 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             self.critic_rl_token_encoder = copy.deepcopy(
                 self.rl_token_autoencoder.encoder
             )
+        self.actor_prefix_token_linear = None
+        self.critic_prefix_token_linear_1 = None
+        self.critic_prefix_token_linear_2 = None
+        if self.rl_token_source == "image_last_linear":
+            seq_len = int(config.num_image_tokens) + 1
+            self.actor_prefix_token_linear = torch.nn.Linear(seq_len, 1, bias=False)
+            self.critic_prefix_token_linear_1 = torch.nn.Linear(seq_len, 1, bias=False)
+            self.critic_prefix_token_linear_2 = torch.nn.Linear(seq_len, 1, bias=False)
+            self._init_prefix_token_linear(self.actor_prefix_token_linear)
+            self._init_prefix_token_linear(self.critic_prefix_token_linear_1)
+            self._init_prefix_token_linear(self.critic_prefix_token_linear_2)
         self._setup_action_transform()
         ref_action_dim = config.action_horizon * config.action_dim
         self.use_robot_state = bool(getattr(config, "use_robot_state", True))
@@ -557,6 +591,21 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             if self.critic_rl_token_encoder is not None
             else None
         )
+        self.target_actor_prefix_token_linear = (
+            copy.deepcopy(self.actor_prefix_token_linear)
+            if self.actor_prefix_token_linear is not None
+            else None
+        )
+        self.target_critic_prefix_token_linear_1 = (
+            copy.deepcopy(self.critic_prefix_token_linear_1)
+            if self.critic_prefix_token_linear_1 is not None
+            else None
+        )
+        self.target_critic_prefix_token_linear_2 = (
+            copy.deepcopy(self.critic_prefix_token_linear_2)
+            if self.critic_prefix_token_linear_2 is not None
+            else None
+        )
         self.target_actor_head = copy.deepcopy(self.actor_head)
         self.target_critic_head_1 = copy.deepcopy(self.critic_head_1)
         self.target_critic_head_2 = copy.deepcopy(self.critic_head_2)
@@ -568,8 +617,19 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         )
         if self.target_critic_rl_token_encoder is not None:
             target_params += list(self.target_critic_rl_token_encoder.parameters())
+        if self.target_actor_prefix_token_linear is not None:
+            target_params += list(self.target_actor_prefix_token_linear.parameters())
+        if self.target_critic_prefix_token_linear_1 is not None:
+            target_params += list(self.target_critic_prefix_token_linear_1.parameters())
+        if self.target_critic_prefix_token_linear_2 is not None:
+            target_params += list(self.target_critic_prefix_token_linear_2.parameters())
         for p in target_params:
             p.requires_grad_(False)
+
+    @staticmethod
+    def _init_prefix_token_linear(module: torch.nn.Linear) -> None:
+        torch.nn.init.zeros_(module.weight)
+        module.weight.data[0, -1] = 1.0
 
     def _controlled_action_indices(self) -> tuple[int, ...]:
         indices = getattr(self.config, "controlled_action_indices", None)
@@ -766,8 +826,9 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         if obs is None:
             raise ValueError("predict_action_batch requires `env_obs` or `obs`.")
         prefix_output, _, _ = self._build_prefix_cache_from_obs(obs)
-        image_features = self._select_prefix_features(prefix_output)
-        rl_token = self.rl_token_autoencoder.encoder(image_features)
+        features = self._select_token_features(prefix_output)
+        visual_latent = self._select_prefix_features(prefix_output)
+        rl_token = self._encode_actor_token(features, use_target=False)
         robot_state = obs.get("states", obs.get("robot_state", None))
         if robot_state is not None and not isinstance(robot_state, torch.Tensor):
             robot_state = torch.tensor(robot_state, dtype=torch.float32)
@@ -829,7 +890,7 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             "model_action": flat_actions,
             "actor_action": flat_actions,
             "env_action_absolute": env_actions.reshape(env_actions.shape[0], -1).cpu(),
-            "visual_latent": image_features.cpu(),
+            "visual_latent": visual_latent.cpu(),
             "rl_token": rl_token.detach().cpu(),
             "ref_action": ref_flat.cpu(),
             "actor_ref_mse": actor_ref_mse.cpu(),
@@ -880,15 +941,15 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         # ordinary heads already contain EMA target weights, so using the internal
         # target_* heads here would apply a second, stale target path.
         prefix_output = self._extract_prefix_from_visual_feat(visual_feat)
-        features = self._select_prefix_features(prefix_output)
-        rl_token = self.rl_token_autoencoder.encoder(features)
+        features = self._select_token_features(prefix_output)
+        rl_token = self._encode_actor_token(features, use_target=False)
         ref_action_for_actor, ref_action_mask = self._maybe_mask_ref_action(
             ref_action, float(ref_action_dropout_p)
         )
         x = self._build_x(rl_token, robot_state, ref_action_for_actor, ref_action_mask)
         actions = self._decode_action(x, use_target=False)
-        critic_rl_token = self._encode_critic_token(features, use_target=False)
-        critic_state = self._build_critic_state(
+        critic_rl_token = self._encode_critic_tokens(features, use_target=False)
+        critic_state = self._build_critic_states(
             critic_rl_token, robot_state, ref_action
         )
         return actions, {
@@ -928,6 +989,16 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             and self.critic_rl_token_encoder is not None
         ):
             trainable_modules.add(self.critic_rl_token_encoder)
+        if (
+            bool(getattr(self.config, "actor_train_prefix_token_linear", False))
+            and self.actor_prefix_token_linear is not None
+        ):
+            trainable_modules.add(self.actor_prefix_token_linear)
+        if bool(getattr(self.config, "critic_train_prefix_token_linear", False)):
+            if self.critic_prefix_token_linear_1 is not None:
+                trainable_modules.add(self.critic_prefix_token_linear_1)
+            if self.critic_prefix_token_linear_2 is not None:
+                trainable_modules.add(self.critic_prefix_token_linear_2)
         for name, param in self.named_parameters():
             # Check if param belongs to any trainable module
             is_trainable = any(
@@ -951,15 +1022,15 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         **kwargs,
     ):
         prefix_output = self._extract_prefix_from_visual_feat(visual_feat)
-        features = self._select_prefix_features(prefix_output)
+        features = self._select_token_features(prefix_output)
         rl_token = self._encode_actor_token(features, use_target=use_target)
         ref_action_for_actor, ref_action_mask = self._maybe_mask_ref_action(
             ref_action, float(ref_action_dropout_p)
         )
         x = self._build_x(rl_token, robot_state, ref_action_for_actor, ref_action_mask)
         actions = self._decode_action(x, use_target=use_target)
-        critic_rl_token = self._encode_critic_token(features, use_target=use_target)
-        critic_state = self._build_critic_state(
+        critic_rl_token = self._encode_critic_tokens(features, use_target=use_target)
+        critic_state = self._build_critic_states(
             critic_rl_token, robot_state, ref_action
         )
         aux = {
@@ -971,6 +1042,11 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             "actor_ref_action_mask": ref_action_mask,
         }
         if compute_recon_loss:
+            if self.rl_token_source != "autoencoder":
+                raise ValueError(
+                    "compute_recon_loss is only supported with "
+                    "rl_token_source='autoencoder'"
+                )
             aux["recon_loss"] = self.compute_recon_loss(features, rl_token)
         return actions, aux
 
@@ -998,27 +1074,33 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
     def _compute_q(self, rl_state: Tensor, action: Tensor, use_target: bool):
         if action.dim() == 3:
             action = action.reshape(action.shape[0], -1)
+        if isinstance(rl_state, (tuple, list)):
+            rl_state_1, rl_state_2 = rl_state
+        else:
+            rl_state_1 = rl_state_2 = rl_state
         if self.critic_head_type in {"openrlt", "openrlt_mlp"}:
             if use_target:
-                q1 = self.target_critic_head_1(rl_state, action)
-                q2 = self.target_critic_head_2(rl_state, action)
+                q1 = self.target_critic_head_1(rl_state_1, action)
+                q2 = self.target_critic_head_2(rl_state_2, action)
             else:
-                q1 = self.critic_head_1(rl_state, action)
-                q2 = self.critic_head_2(rl_state, action)
+                q1 = self.critic_head_1(rl_state_1, action)
+                q2 = self.critic_head_2(rl_state_2, action)
             return q1, q2
         if self.critic_state_norm is not None:
-            rl_state = self.critic_state_norm(rl_state)
+            rl_state_1 = self.critic_state_norm(rl_state_1)
+            rl_state_2 = self.critic_state_norm(rl_state_2)
         if self.critic_action_norm is not None:
             action = self.critic_action_norm(action)
         if self.critic_action_encoder is not None:
             action = self.critic_action_encoder(action)
-        critic_input = torch.cat([rl_state, action], dim=-1)
+        critic_input_1 = torch.cat([rl_state_1, action], dim=-1)
+        critic_input_2 = torch.cat([rl_state_2, action], dim=-1)
         if use_target:
-            q1 = self.target_critic_head_1(critic_input)
-            q2 = self.target_critic_head_2(critic_input)
+            q1 = self.target_critic_head_1(critic_input_1)
+            q2 = self.target_critic_head_2(critic_input_2)
         else:
-            q1 = self.critic_head_1(critic_input)
-            q2 = self.critic_head_2(critic_input)
+            q1 = self.critic_head_1(critic_input_1)
+            q2 = self.critic_head_2(critic_input_2)
         return q1, q2
 
     def _build_x(
@@ -1055,6 +1137,19 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
                 ).reshape(rl_token.shape[0], -1)
             )
         return torch.cat(parts, dim=-1)
+
+    def _build_critic_states(
+        self,
+        rl_token: Tensor | tuple[Tensor, Tensor],
+        robot_state: Tensor | None,
+        ref_action: Tensor | None,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        if isinstance(rl_token, tuple):
+            return (
+                self._build_critic_state(rl_token[0], robot_state, ref_action),
+                self._build_critic_state(rl_token[1], robot_state, ref_action),
+            )
+        return self._build_critic_state(rl_token, robot_state, ref_action)
 
     def _build_critic_state(
         self, rl_token: Tensor, robot_state: Tensor | None, ref_action: Tensor | None
@@ -1096,7 +1191,21 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             return prefix_output[:, : self.config.num_image_tokens, :]
         return prefix_output  # "full_prefix"
 
+    def _select_token_features(self, prefix_output: Tensor) -> Tensor:
+        if self.rl_token_source == "autoencoder":
+            return self._select_prefix_features(prefix_output)
+        return prefix_output
+
     def _encode_actor_token(self, features: Tensor, use_target: bool = False) -> Tensor:
+        if self.rl_token_source == "last_token":
+            return features[:, -1, :]
+        if self.rl_token_source == "image_last_linear":
+            module = (
+                self.target_actor_prefix_token_linear
+                if use_target
+                else self.actor_prefix_token_linear
+            )
+            return self._linear_prefix_token(module, features)
         encoder = (
             self.target_rl_token_autoencoder.encoder
             if use_target
@@ -1104,9 +1213,31 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         )
         return encoder(features)
 
+    def _encode_critic_tokens(
+        self, features: Tensor, use_target: bool = False
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        if self.rl_token_source == "image_last_linear":
+            module_1 = (
+                self.target_critic_prefix_token_linear_1
+                if use_target
+                else self.critic_prefix_token_linear_1
+            )
+            module_2 = (
+                self.target_critic_prefix_token_linear_2
+                if use_target
+                else self.critic_prefix_token_linear_2
+            )
+            return (
+                self._linear_prefix_token(module_1, features),
+                self._linear_prefix_token(module_2, features),
+            )
+        return self._encode_critic_token(features, use_target=use_target)
+
     def _encode_critic_token(
         self, features: Tensor, use_target: bool = False
     ) -> Tensor:
+        if self.rl_token_source == "last_token":
+            return features[:, -1, :]
         if self.critic_rl_token_encoder is None:
             return self._encode_actor_token(features, use_target=use_target)
         if use_target:
@@ -1116,6 +1247,22 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         else:
             encoder = self.critic_rl_token_encoder
         return encoder(features)
+
+    def _linear_prefix_token(
+        self, module: torch.nn.Linear | None, features: Tensor
+    ) -> Tensor:
+        if module is None:
+            raise RuntimeError("prefix token linear module is not initialized")
+        expected_len = int(self.config.num_image_tokens) + 1
+        if features.shape[1] < expected_len:
+            raise ValueError(
+                "prefix sequence is too short for image_last_linear: "
+                f"got {features.shape[1]} tokens, need at least {expected_len}"
+            )
+        image_tokens = features[:, : int(self.config.num_image_tokens), :]
+        last_token = features[:, -1:, :]
+        tokens = torch.cat([image_tokens, last_token], dim=1)
+        return module(tokens.transpose(1, 2)).squeeze(-1)
 
     def _extract_prefix_from_visual_feat(self, visual_feat) -> Tensor:
         """Extract prefix tokens from visual_feat.

@@ -1,18 +1,15 @@
 """Smoke test for OpenPiRLTokenPolicy — no GPU, no environment, no real PI0 weights."""
 
-from unittest.mock import patch
-
 import torch
 
+from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.openpi.rl_token_policy import (
     OpenPiRLTokenConfig,
     OpenPiRLTokenPolicy,
 )
-from rlinf.models.embodiment.base_policy import ForwardType
-
 
 B = 2
-L = 32          # prefix token sequence length (mocked)
+L = 32  # prefix token sequence length (mocked)
 HIDDEN_DIM = 64  # small for speed; production uses 2048
 RL_TOKEN_DIM = 16
 ACTION_HORIZON = 3
@@ -32,7 +29,9 @@ def _make_policy():
         critic_hidden_dims=(32,),
         action_horizon=ACTION_HORIZON,
         action_dim=ACTION_DIM,
+        env_action_dim=ROBOT_STATE_DIM,
         robot_state_dim=ROBOT_STATE_DIM,
+        controlled_action_indices=tuple(range(ROBOT_STATE_DIM)),
     )
     return OpenPiRLTokenPolicy(cfg)
 
@@ -140,6 +139,102 @@ def test_actor_forward_can_compute_recon_loss_inside_forward():
     assert aux["recon_loss"].item() >= 0.0
 
 
+def _make_direct_token_policy(source, *, train_actor=False, train_critic=False):
+    cfg = OpenPiRLTokenConfig(
+        hidden_dim=HIDDEN_DIM,
+        rl_token_dim=HIDDEN_DIM,
+        rl_token_encoder_layers=1,
+        rl_token_decoder_layers=1,
+        rl_token_num_heads=4,
+        rl_token_max_seq_len=64,
+        num_image_tokens=4,
+        prefix_feature_type="image_only",
+        rl_token_source=source,
+        actor_train_prefix_token_linear=train_actor,
+        critic_train_prefix_token_linear=train_critic,
+        actor_hidden_dims=(32,),
+        critic_hidden_dims=(32,),
+        action_horizon=ACTION_HORIZON,
+        action_dim=ACTION_DIM,
+        env_action_dim=ROBOT_STATE_DIM,
+        robot_state_dim=ROBOT_STATE_DIM,
+        controlled_action_indices=tuple(range(ROBOT_STATE_DIM)),
+    )
+    return OpenPiRLTokenPolicy(cfg)
+
+
+def test_last_token_source_uses_full_prefix_last_token():
+    policy = _make_direct_token_policy("last_token")
+    prefix = torch.randn(B, L, HIDDEN_DIM)
+    token_features = policy._select_token_features(prefix)
+
+    actor_token = policy._encode_actor_token(token_features)
+    critic_token = policy._encode_critic_tokens(token_features)
+
+    assert torch.equal(actor_token, prefix[:, -1, :])
+    assert torch.equal(critic_token, prefix[:, -1, :])
+
+
+def test_image_last_linear_initializes_to_last_token():
+    policy = _make_direct_token_policy("image_last_linear")
+    prefix = torch.randn(B, L, HIDDEN_DIM)
+    token_features = policy._select_token_features(prefix)
+
+    assert policy.actor_prefix_token_linear.bias is None
+    assert policy.critic_prefix_token_linear_1.bias is None
+    assert policy.critic_prefix_token_linear_2.bias is None
+    actor_weight = policy.actor_prefix_token_linear.weight.detach()
+    critic_weight_1 = policy.critic_prefix_token_linear_1.weight.detach()
+    critic_weight_2 = policy.critic_prefix_token_linear_2.weight.detach()
+    expected = torch.zeros_like(actor_weight)
+    expected[0, -1] = 1.0
+
+    assert policy.actor_prefix_token_linear is not policy.critic_prefix_token_linear_1
+    assert (
+        policy.critic_prefix_token_linear_1 is not policy.critic_prefix_token_linear_2
+    )
+    assert torch.equal(actor_weight, expected)
+    assert torch.equal(critic_weight_1, expected)
+    assert torch.equal(critic_weight_2, expected)
+    assert torch.equal(policy._encode_actor_token(token_features), prefix[:, -1, :])
+    critic_token_1, critic_token_2 = policy._encode_critic_tokens(token_features)
+    assert torch.equal(critic_token_1, prefix[:, -1, :])
+    assert torch.equal(critic_token_2, prefix[:, -1, :])
+
+    actions, aux = policy.td3_forward(
+        mode="actor",
+        visual_feat=prefix,
+        robot_state=torch.randn(B, ROBOT_STATE_DIM),
+        ref_action=torch.randn(B, ACTION_HORIZON, ACTION_DIM),
+    )
+    assert isinstance(aux["critic_rl_state"], tuple)
+    assert len(aux["critic_rl_state"]) == 2
+    q1, q2 = policy.td3_forward(
+        mode="critic",
+        rl_state=aux["rl_state"],
+        critic_rl_state=aux["critic_rl_state"],
+        action=actions,
+    )
+    assert q1.shape == (B, 1)
+    assert q2.shape == (B, 1)
+
+
+def test_prefix_token_linear_train_flags_are_respected():
+    frozen = _make_direct_token_policy("image_last_linear")
+    frozen.freeze_backbone()
+    assert not frozen.actor_prefix_token_linear.weight.requires_grad
+    assert not frozen.critic_prefix_token_linear_1.weight.requires_grad
+    assert not frozen.critic_prefix_token_linear_2.weight.requires_grad
+
+    trainable = _make_direct_token_policy(
+        "image_last_linear", train_actor=True, train_critic=True
+    )
+    trainable.freeze_backbone()
+    assert trainable.actor_prefix_token_linear.weight.requires_grad
+    assert trainable.critic_prefix_token_linear_1.weight.requires_grad
+    assert trainable.critic_prefix_token_linear_2.weight.requires_grad
+
+
 def test_base_policy_forward_dispatch():
     """Verify BasePolicy.forward routes TD3/TD3_Q correctly."""
     policy = _make_policy()
@@ -171,5 +266,8 @@ if __name__ == "__main__":
     test_recon_loss()
     test_actor_aux_rl_token_is_used_for_recon_loss()
     test_actor_forward_can_compute_recon_loss_inside_forward()
+    test_last_token_source_uses_full_prefix_last_token()
+    test_image_last_linear_initializes_to_last_token()
+    test_prefix_token_linear_train_flags_are_respected()
     test_base_policy_forward_dispatch()
     print("All smoke tests passed.")
