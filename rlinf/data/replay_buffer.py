@@ -560,6 +560,40 @@ class TrajectoryReplayBuffer:
             self._flat_trajectory_cache.put(int(trajectory_id), flat)
         return flat
 
+    def count_forward_input_filter_matches(
+        self,
+        *,
+        window_size: int | None = None,
+        tail_window_size: int = 0,
+    ) -> int:
+        """Return how many samples are currently eligible for the active filter."""
+        if not self.sample_forward_input_filter_key:
+            return int(self._total_samples)
+        tail_window_size = max(0, int(tail_window_size))
+        with self._index_lock:
+            if window_size is None:
+                window_size = max(0, int(self.sample_window_size))
+            else:
+                window_size = max(0, int(window_size))
+            if window_size > 0:
+                window_ids = list(self._trajectory_id_list[-window_size:])
+            else:
+                window_ids = list(self._trajectory_id_list)
+
+        total = 0
+        for trajectory_id in window_ids:
+            info = self._trajectory_index[int(trajectory_id)]
+            flat = self._get_flat_trajectory_for_sampling(int(trajectory_id))
+            num_samples = min(int(info["num_samples"]), self._flat_num_samples(flat))
+            valid = self._valid_local_indices_for_filter(flat, num_samples)
+            if valid is None:
+                valid = torch.arange(num_samples, dtype=torch.long)
+            if tail_window_size > 0 and num_samples > 0:
+                offset = max(0, num_samples - min(num_samples, tail_window_size))
+                valid = valid[valid >= offset]
+            total += int(valid.numel())
+        return total
+
     def _sample_chunks_from_forward_input_filter(
         self,
         window_ids: list[int],

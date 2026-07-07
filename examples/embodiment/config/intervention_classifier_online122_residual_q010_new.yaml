@@ -23,7 +23,7 @@ include_positive_window: 1
 negative_sample_ratio: 3.0
 min_rel_chunk: 0
 
-max_steps: 3000
+max_steps: 200
 batch_size: 256
 learning_rate: 0.0001
 weight_decay: 0.0001

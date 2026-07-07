@@ -251,6 +251,15 @@ class TD3Algorithm:
     def _detach_if_tensor(value):
         return value.detach() if torch.is_tensor(value) else value
 
+    @classmethod
+    def _detach_rl_state(cls, value):
+        # `critic_rl_state` is a plain tensor for most rl_token_source values, but
+        # a (q1_state, q2_state) tuple for "image_last_linear" (separate critic
+        # prefix-token linears per Q head). Detach whichever shape we got.
+        if isinstance(value, tuple):
+            return tuple(cls._detach_if_tensor(v) for v in value)
+        return cls._detach_if_tensor(value)
+
     @staticmethod
     def _get_robot_state(obs, device, dtype):
         robot_state = obs.get("robot_state", obs.get("states", None))
@@ -1162,9 +1171,9 @@ class TD3Algorithm:
                     ref_action_dropout_p=0.0,
                     use_target=False,
                 )
-                curr_rl_state = curr_actor_aux.get(
-                    "critic_rl_state", curr_actor_aux["rl_state"]
-                ).detach()
+                curr_rl_state = self._detach_rl_state(
+                    curr_actor_aux.get("critic_rl_state", curr_actor_aux["rl_state"])
+                )
                 curr_critic_visual_tokens = curr_actor_aux.get(
                     "critic_visual_tokens", None
                 )

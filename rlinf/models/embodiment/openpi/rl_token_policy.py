@@ -1193,8 +1193,14 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
 
     def _select_token_features(self, prefix_output: Tensor) -> Tensor:
         if self.rl_token_source == "autoencoder":
-            return self._select_prefix_features(prefix_output)
-        return prefix_output
+            features = self._select_prefix_features(prefix_output)
+        else:
+            features = prefix_output
+        # The frozen VLA backbone runs in bfloat16, but the trainable RL-token
+        # modules (autoencoder encoder, prefix_token_linear, actor/critic heads)
+        # are always constructed in float32 and never cast to match. Downcast
+        # here so every rl_token_source path feeds them float32 consistently.
+        return features.to(dtype=torch.float32)
 
     def _encode_actor_token(self, features: Tensor, use_target: bool = False) -> Tensor:
         if self.rl_token_source == "last_token":

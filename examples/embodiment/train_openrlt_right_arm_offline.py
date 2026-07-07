@@ -114,12 +114,24 @@ class TrainConfig:
     feature_cache_batch_size: int = 8
     feature_cache_task_description: str = "peg and insertion"
     feature_cache_model_config: str | None = None
+    realtime_prefix_features: bool = False
 
 
 def layer_norm_no_params(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return (x - x.mean(dim=-1, keepdim=True)) / torch.sqrt(
         x.var(dim=-1, unbiased=False, keepdim=True) + eps
     )
+
+
+def uses_prefix_token_training(cfg: TrainConfig) -> bool:
+    return str(cfg.rl_token_source).lower() == "image_last_linear" and (
+        bool(cfg.actor_train_prefix_token_linear)
+        or bool(cfg.critic_train_prefix_token_linear)
+    )
+
+
+def cache_feature_key(cfg: TrainConfig) -> str:
+    return "prefix_tokens" if uses_prefix_token_training(cfg) else "rltoken"
 
 
 class MLP(nn.Module):
@@ -140,10 +152,67 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class ChunkActor(nn.Module):
-    def __init__(self, cfg: TrainConfig):
+class OfflinePrefixTokenEncoder(nn.Module):
+    def __init__(self, cfg: TrainConfig, role: str = "both"):
         super().__init__()
         self.cfg = cfg
+        self.role = str(role)
+        seq_len = int(cfg.num_image_tokens) + 1
+        self.actor_prefix_token_linear = None
+        self.critic_prefix_token_linear_1 = None
+        self.critic_prefix_token_linear_2 = None
+        if self.role in {"actor", "both"}:
+            self.actor_prefix_token_linear = nn.Linear(seq_len, 1, bias=False)
+            self._init_prefix_token_linear(self.actor_prefix_token_linear)
+        if self.role in {"critic", "both"}:
+            self.critic_prefix_token_linear_1 = nn.Linear(seq_len, 1, bias=False)
+            self.critic_prefix_token_linear_2 = nn.Linear(seq_len, 1, bias=False)
+            self._init_prefix_token_linear(self.critic_prefix_token_linear_1)
+            self._init_prefix_token_linear(self.critic_prefix_token_linear_2)
+
+    @staticmethod
+    def _init_prefix_token_linear(module: nn.Linear) -> None:
+        nn.init.zeros_(module.weight)
+        module.weight.data[0, -1] = 1.0
+
+    def _linear_prefix_token(
+        self, module: nn.Linear | None, prefix_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        if module is None:
+            raise RuntimeError("prefix token linear module is not initialized")
+        if prefix_tokens.dim() != 3:
+            return prefix_tokens
+        expected_len = int(self.cfg.num_image_tokens) + 1
+        if prefix_tokens.shape[1] != expected_len:
+            raise ValueError(
+                "prefix token cache has incompatible sequence length: "
+                f"got {prefix_tokens.shape[1]}, expected {expected_len}"
+            )
+        return module(prefix_tokens.transpose(1, 2)).squeeze(-1)
+
+    def actor_token(self, prefix_tokens: torch.Tensor) -> torch.Tensor:
+        return self._linear_prefix_token(self.actor_prefix_token_linear, prefix_tokens)
+
+    def critic_tokens(
+        self, prefix_tokens: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if prefix_tokens.dim() != 3:
+            return prefix_tokens
+        return (
+            self._linear_prefix_token(self.critic_prefix_token_linear_1, prefix_tokens),
+            self._linear_prefix_token(self.critic_prefix_token_linear_2, prefix_tokens),
+        )
+
+
+class ChunkActor(nn.Module):
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        prefix_encoder: OfflinePrefixTokenEncoder | None = None,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.prefix_encoder = prefix_encoder
         flat_action_dim = cfg.chunk_len * cfg.action_dim
         self.z_proj = nn.Linear(cfg.z_dim, 256)
         self.state_proj = nn.Linear(cfg.proprio_dim, 64)
@@ -168,6 +237,10 @@ class ChunkActor(nn.Module):
     ) -> torch.Tensor:
         bsz = z.shape[0]
         ref_flat = ref_chunk.reshape(bsz, -1)
+        if z.dim() == 3:
+            if self.prefix_encoder is None:
+                raise RuntimeError("prefix token input requires actor prefix encoder")
+            z = self.prefix_encoder.actor_token(z)
         z_feat = layer_norm_no_params(self.z_proj(z))
         proprio_feat = torch.tanh(layer_norm_no_params(self.state_proj(proprio)))
         ref_feat = torch.tanh(layer_norm_no_params(self.ref_proj(ref_flat)))
@@ -200,8 +273,9 @@ class ChunkActor(nn.Module):
 
 
 class QNetwork(nn.Module):
-    def __init__(self, cfg: TrainConfig):
+    def __init__(self, cfg: TrainConfig, critic_index: int = 1):
         super().__init__()
+        self.critic_index = int(critic_index)
         flat_action_dim = cfg.chunk_len * cfg.action_dim
         self.z_proj = nn.Linear(cfg.z_dim, 256)
         self.state_proj = nn.Linear(cfg.proprio_dim, 64)
@@ -211,6 +285,8 @@ class QNetwork(nn.Module):
     def forward(
         self, z: torch.Tensor, proprio: torch.Tensor, action_chunk: torch.Tensor
     ) -> torch.Tensor:
+        if isinstance(z, tuple):
+            z = z[0] if self.critic_index == 1 else z[1]
         bsz = z.shape[0]
         action_flat = action_chunk.reshape(bsz, -1)
         z_feat = layer_norm_no_params(self.z_proj(z))
@@ -220,14 +296,23 @@ class QNetwork(nn.Module):
 
 
 class TwinCritic(nn.Module):
-    def __init__(self, cfg: TrainConfig):
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        prefix_encoder: OfflinePrefixTokenEncoder | None = None,
+    ):
         super().__init__()
-        self.q1 = QNetwork(cfg)
-        self.q2 = QNetwork(cfg)
+        self.prefix_encoder = prefix_encoder
+        self.q1 = QNetwork(cfg, critic_index=1)
+        self.q2 = QNetwork(cfg, critic_index=2)
 
     def forward(
         self, z: torch.Tensor, proprio: torch.Tensor, action_chunk: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if z.dim() == 3:
+            if self.prefix_encoder is None:
+                raise RuntimeError("prefix token input requires critic prefix encoder")
+            z = self.prefix_encoder.critic_tokens(z)
         return self.q1(z, proprio, action_chunk), self.q2(z, proprio, action_chunk)
 
     def q_min(
@@ -241,6 +326,59 @@ def soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
     with torch.no_grad():
         for target_param, source_param in zip(target.parameters(), source.parameters()):
             target_param.data.mul_(1.0 - tau).add_(source_param.data, alpha=tau)
+
+
+def trainable_params(module: nn.Module):
+    return [param for param in module.parameters() if param.requires_grad]
+
+
+def build_actor_optimizer(actor: ChunkActor, cfg: TrainConfig) -> torch.optim.Optimizer:
+    if actor.prefix_encoder is not None and not bool(
+        cfg.actor_train_prefix_token_linear
+    ):
+        for param in actor.prefix_encoder.parameters():
+            param.requires_grad_(False)
+    return torch.optim.Adam(trainable_params(actor), lr=cfg.actor_lr)
+
+
+def build_critic_optimizer(
+    critic: TwinCritic, cfg: TrainConfig
+) -> torch.optim.Optimizer:
+    if critic.prefix_encoder is not None and not bool(
+        cfg.critic_train_prefix_token_linear
+    ):
+        for param in critic.prefix_encoder.parameters():
+            param.requires_grad_(False)
+    return torch.optim.Adam(trainable_params(critic), lr=cfg.critic_lr)
+
+
+def actor_head_state_dict(actor: ChunkActor) -> dict[str, torch.Tensor]:
+    return {
+        key: value
+        for key, value in actor.state_dict().items()
+        if not key.startswith("prefix_encoder.")
+    }
+
+
+def critic_head_state_dict(critic: TwinCritic, head: str) -> dict[str, torch.Tensor]:
+    module = critic.q1 if head == "q1" else critic.q2
+    return module.state_dict()
+
+
+def prefix_state_dict(
+    model: ChunkActor | TwinCritic, target: bool = False
+) -> dict[str, torch.Tensor]:
+    encoder = getattr(model, "prefix_encoder", None)
+    if encoder is None:
+        return {}
+    prefix = "target_" if target else ""
+    state = {}
+    for name, tensor in encoder.state_dict().items():
+        if name.startswith("actor_prefix_token_linear."):
+            state[f"{prefix}{name}"] = tensor.detach().cpu()
+        elif name.startswith("critic_prefix_token_linear_"):
+            state[f"{prefix}{name}"] = tensor.detach().cpu()
+    return state
 
 
 def load_norm_stats(path: str, std_floor: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
@@ -578,23 +716,187 @@ def _extract_rl_token(model, env_obs: dict) -> torch.Tensor:
     return token.detach().cpu().float()
 
 
-def generate_feature_cache(cfg: TrainConfig) -> None:
-    if cfg.model_path is None or cfg.rl_token_path is None:
+@torch.no_grad()
+def _extract_prefix_tokens(
+    model, env_obs: dict, cfg: TrainConfig, to_cpu: bool = True
+) -> torch.Tensor:
+    prefix_output, _, _ = model._build_prefix_cache_from_obs(env_obs)
+    features = prefix_output
+    expected_len = int(cfg.num_image_tokens) + 1
+    if features.shape[1] < expected_len:
         raise ValueError(
-            "Feature cache is missing. Set `model_path` and `rl_token_path`, "
-            "or provide an existing `feature_cache`."
+            "prefix sequence is too short for offline image_last_linear training: "
+            f"got {features.shape[1]} tokens, need at least {expected_len}"
+        )
+    image_tokens = features[:, : int(cfg.num_image_tokens), :]
+    last_token = features[:, -1:, :]
+    out = torch.cat([image_tokens, last_token], dim=1).detach().float()
+    return out.cpu() if to_cpu else out
+
+
+def _collate_env_obs(obs_list: list[dict]) -> dict:
+    """Batch a list of single-chunk env-obs dicts along dim 0.
+
+    Each entry comes from `_select_obs_at_chunk`, whose tensors carry a leading
+    batch dim of 1; concatenating restores a real batch. Lists (e.g.
+    ``task_descriptions``) are flattened; everything else falls back to a list.
+    """
+    if not obs_list:
+        return {}
+    collated: dict[str, Any] = {}
+    for key in obs_list[0].keys():
+        values = [obs[key] for obs in obs_list if key in obs]
+        first = values[0]
+        if torch.is_tensor(first):
+            collated[key] = torch.cat(values, dim=0)
+        elif isinstance(first, list):
+            merged: list[Any] = []
+            for value in values:
+                merged.extend(value)
+            collated[key] = merged
+        else:
+            collated[key] = values
+    return collated
+
+
+class RealtimeFeatureProvider:
+    """Compute prefix tokens on the fly from raw observations via the frozen VLA.
+
+    Drop-in replacement for the precomputed ``data["z"]`` tensor: supports
+    ``.shape`` and ``__getitem__`` over dataset *row* indices, returning
+    prefix-token tensors of shape ``(len(indices), num_image_tokens + 1, z_dim)``.
+    Nothing is cached, so peak memory stays bounded by one sub-batch of features.
+    """
+
+    def __init__(
+        self,
+        model,
+        rows: list[dict],
+        trajectories: dict[str, dict],
+        cfg: TrainConfig,
+        device: torch.device,
+    ):
+        self.model = model
+        self.rows = rows
+        self.trajectories = trajectories
+        self.cfg = cfg
+        self.device = device
+        self.task_description = str(cfg.feature_cache_task_description)
+        seq_len = int(cfg.num_image_tokens) + 1
+        self.shape = torch.Size([len(rows), seq_len, int(cfg.z_dim)])
+
+    def _row_obs(self, row_idx: int) -> dict:
+        row = self.rows[int(row_idx)]
+        traj = self.trajectories[row["path"]]
+        return _select_obs_at_chunk(
+            traj["curr_obs"], int(row["rel"]), self.task_description
         )
 
+    def _to_index_list(self, indices) -> list[int]:
+        if torch.is_tensor(indices):
+            return indices.reshape(-1).tolist()
+        if isinstance(indices, (list, tuple)):
+            return [int(i) for i in indices]
+        return [int(indices)]
+
+    def __getitem__(self, indices) -> torch.Tensor:
+        idx_list = self._to_index_list(indices)
+        if not idx_list:
+            return torch.empty(0, *self.shape[1:], device=self.device)
+        feats: list[torch.Tensor] = []
+        sub_bs = max(1, int(self.cfg.feature_cache_batch_size))
+        for start in range(0, len(idx_list), sub_bs):
+            sub = idx_list[start : start + sub_bs]
+            env_obs = _collate_env_obs([self._row_obs(i) for i in sub])
+            feats.append(
+                _extract_prefix_tokens(self.model, env_obs, self.cfg, to_cpu=False)
+            )
+        return torch.cat(feats, dim=0).to(self.device)
+
+
+class CachedFeatureProvider:
+    """Lazily index a memory-mapped, precomputed feature cache.
+
+    Drop-in replacement for the eagerly-stacked ``data["z"]`` tensor: supports
+    ``.shape`` and ``__getitem__`` over dataset *row* indices, translating each
+    row to its cache row via ``feature_idx`` before slicing. Rows are only
+    copied out of the (mmapped) cache when indexed, so peak memory stays
+    bounded by the requested batch instead of the full cache.
+    """
+
+    def __init__(self, z_all: torch.Tensor, feature_idx: torch.Tensor):
+        self.z_all = z_all
+        self.feature_idx = feature_idx
+        self.shape = torch.Size([feature_idx.shape[0], *z_all.shape[1:]])
+
+    def __getitem__(self, indices) -> torch.Tensor:
+        if not torch.is_tensor(indices):
+            indices = torch.as_tensor(indices, dtype=torch.long)
+        cache_idx = self.feature_idx[indices.reshape(-1)]
+        return self.z_all[cache_idx].float()
+
+
+def load_feature_model(cfg: TrainConfig, device: torch.device):
+    """Instantiate the frozen OpenPI RL-token model used for prefix extraction."""
     from rlinf.models import get_model
 
-    device = torch.device(f"cuda:{cfg.gpu}" if torch.cuda.is_available() else "cpu")
     model_cfg = build_feature_model_cfg(cfg)
     model = get_model(model_cfg)
     model.to(device)
     model.eval()
+    return model
+
+
+def build_trajectory_metas(
+    cfg: TrainConfig, loaded: dict[str, dict] | None = None
+) -> tuple[list[dict], int]:
+    """Scan trajectory files to build feature metas without a feature cache.
+
+    Mirrors the trajectory/chunk enumeration in ``generate_feature_cache``. When
+    ``loaded`` is provided, each trajectory is stored there (keyed by path) so the
+    caller can reuse it and avoid loading every file twice.
+    """
+    metas: list[dict] = []
+    traj_paths = sorted(Path(cfg.data_dir).glob("*.pt"))
+    for fallback_idx, traj_path in enumerate(traj_paths):
+        traj = torch.load(traj_path, map_location="cpu", weights_only=False)
+        curr_obs = traj.get("curr_obs")
+        if not isinstance(curr_obs, dict) or "states" not in curr_obs:
+            continue
+        if loaded is not None:
+            loaded[str(traj_path)] = traj
+        num_chunks = int(curr_obs["states"].shape[0])
+        traj_reward_sum = float(torch.as_tensor(traj.get("rewards", 0)).float().sum())
+        traj_index = _trajectory_index_from_path(traj_path, fallback_idx)
+        for rel in range(num_chunks):
+            metas.append(
+                {
+                    "path": str(traj_path),
+                    "rel_chunk": int(rel),
+                    "traj_index": int(traj_index),
+                    "success": bool(traj_reward_sum > 0),
+                }
+            )
+    return metas, len(traj_paths)
+
+
+def generate_feature_cache(cfg: TrainConfig) -> None:
+    if cfg.model_path is None:
+        raise ValueError(
+            "Feature cache is missing. Set `model_path`, or provide an existing "
+            "`feature_cache`."
+        )
+    if cfg.rl_token_path is None and not uses_prefix_token_training(cfg):
+        raise ValueError(
+            "Feature cache is missing. Set `rl_token_path` for compressed RL-token "
+            "cache generation, or enable image_last_linear prefix-token training."
+        )
+
+    device = torch.device(f"cuda:{cfg.gpu}" if torch.cuda.is_available() else "cpu")
+    model = load_feature_model(cfg, device)
 
     metas: list[dict[str, Any]] = []
-    tokens: list[torch.Tensor] = []
+    features_cache: list[torch.Tensor] = []
     traj_paths = sorted(Path(cfg.data_dir).glob("*.pt"))
     for fallback_idx, traj_path in enumerate(traj_paths):
         traj = torch.load(traj_path, map_location="cpu", weights_only=False)
@@ -610,8 +912,11 @@ def generate_feature_cache(cfg: TrainConfig) -> None:
                 rel,
                 str(cfg.feature_cache_task_description),
             )
-            token = _extract_rl_token(model, env_obs)
-            tokens.append(token.squeeze(0))
+            if uses_prefix_token_training(cfg):
+                feature = _extract_prefix_tokens(model, env_obs, cfg)
+            else:
+                feature = _extract_rl_token(model, env_obs)
+            features_cache.append(feature.squeeze(0))
             metas.append(
                 {
                     "path": str(traj_path),
@@ -621,21 +926,29 @@ def generate_feature_cache(cfg: TrainConfig) -> None:
                 }
             )
 
-    if tokens:
-        rltoken = torch.stack(tokens, dim=0).float().cpu()
+    feature_key = cache_feature_key(cfg)
+    if features_cache:
+        feature_tensor = torch.stack(features_cache, dim=0).float().cpu()
     else:
-        rltoken = torch.empty(0, int(cfg.z_dim), dtype=torch.float32)
+        shape = (
+            (0, int(cfg.num_image_tokens) + 1, int(cfg.z_dim))
+            if feature_key == "prefix_tokens"
+            else (0, int(cfg.z_dim))
+        )
+        feature_tensor = torch.empty(*shape, dtype=torch.float32)
     out_path = Path(cfg.feature_cache)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "rltoken": rltoken,
+            feature_key: feature_tensor,
             "metas": metas,
             "source_log_dir": str(Path(cfg.data_dir).parent),
             "num_trajectories": len(traj_paths),
             "feature_source": {
                 "model_path": cfg.model_path,
                 "rl_token_path": cfg.rl_token_path,
+                "rl_token_source": cfg.rl_token_source,
+                "feature_key": feature_key,
                 "task_description": cfg.feature_cache_task_description,
             },
         },
@@ -646,7 +959,8 @@ def generate_feature_cache(cfg: TrainConfig) -> None:
             {
                 "feature_cache": {
                     "path": str(out_path),
-                    "num_features": int(rltoken.shape[0]),
+                    "feature_key": feature_key,
+                    "num_features": int(feature_tensor.shape[0]),
                     "num_trajectories": len(traj_paths),
                 }
             },
@@ -713,10 +1027,35 @@ def ensure_feature_cache(cfg: TrainConfig, generator=generate_feature_cache) -> 
         )
 
 
-def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
-    cache = torch.load(cfg.feature_cache, map_location="cpu")
-    metas = cache["metas"]
-    z_all = cache["rltoken"].float()
+def load_dataset(
+    cfg: TrainConfig,
+    feature_model=None,
+    device: torch.device | None = None,
+) -> dict[str, Any]:
+    feature_key = cache_feature_key(cfg)
+    realtime = bool(cfg.realtime_prefix_features)
+    loaded: dict[str, dict] = {}
+    if realtime:
+        if feature_model is None:
+            raise ValueError(
+                "realtime_prefix_features requires a loaded feature_model."
+            )
+        metas, _ = build_trajectory_metas(cfg, loaded=loaded)
+        z_all = None
+    else:
+        cache = torch.load(
+            cfg.feature_cache, map_location="cpu", mmap=True, weights_only=False
+        )
+        metas = cache["metas"]
+        if feature_key not in cache:
+            if feature_key == "prefix_tokens" and "rltoken" in cache:
+                raise ValueError(
+                    "This config enables offline image_last_linear prefix training, "
+                    "but the feature cache only contains compressed `rltoken`. "
+                    "Delete/regenerate the cache with this config to store `prefix_tokens`."
+                )
+            raise KeyError(f"Feature cache missing expected key: {feature_key}")
+        z_all = cache[feature_key]
     kin = SimpleUrdfKinematics(cfg.urdf_path)
     traj_paths = sorted(Path(cfg.data_dir).glob("*.pt"))
     if cfg.tcp_target is None:
@@ -727,7 +1066,6 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
     else:
         tcp_target = np.asarray(cfg.tcp_target, dtype=np.float64).reshape(3)
     rows = []
-    loaded: dict[str, dict] = {}
     skipped_radius = 0
     skipped_missing = 0
     skipped_warmup = 0
@@ -761,14 +1099,10 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
                 ref_right = reshape_right_joints(ref_flat.reshape(1, -1))[0]
         state = traj["curr_obs"]["states"][rel, 0].float()
         next_state = traj["next_obs"]["states"][rel, 0].float()
-        reward = float(traj["rewards"][rel, 0].float().reshape(-1)[0].item())
+        reward = float(traj["rewards"][rel, 0].float().reshape(-1).sum().item())
         traj_reward_sum = float(torch.as_tensor(traj["rewards"]).float().sum().item())
-        done = bool(
-            traj.get("dones", traj.get("terminations"))[rel, 0]
-            .bool()
-            .reshape(-1)[0]
-            .item()
-        )
+        done_src = traj.get("dones", traj.get("terminations"))
+        done = bool(done_src[rel, 0].bool().reshape(-1).any().item())
         env_abs = fwd.get(
             "executed_env_action_absolute", fwd.get("env_action_absolute", None)
         )
@@ -794,7 +1128,6 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
                 "rel": rel,
                 "traj_index": int(meta.get("traj_index", -1)),
                 "success": int(meta.get("success", traj_reward_sum > 0)),
-                "z": z_all[feature_idx],
                 "state_right": state[RIGHT_ARM_JOINTS],
                 "state_right_full": state_right_full,
                 "state_full": state,
@@ -821,7 +1154,14 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
         row["next_idx"] = int(next_idx)
 
     data = {
-        "z": torch.stack([r["z"] for r in rows]),
+        "z": (
+            RealtimeFeatureProvider(feature_model, rows, loaded, cfg, device)
+            if realtime
+            else CachedFeatureProvider(
+                z_all,
+                torch.tensor([r["feature_idx"] for r in rows], dtype=torch.long),
+            )
+        ),
         "state": torch.stack([r["state_right"] for r in rows]),
         "next_state": torch.stack([r["next_state_right"] for r in rows]),
         "action": torch.stack([r["action"] for r in rows]),
@@ -845,13 +1185,14 @@ def load_dataset(cfg: TrainConfig) -> dict[str, Any]:
         "skipped_missing": int(skipped_missing),
         "skipped_warmup": int(skipped_warmup),
     }
-    data["next_z"] = data["z"][data["next_idx"]]
     data["next_ref"] = data["ref"][data["next_idx"]]
     summary = {
         "num_rows": len(rows),
         "num_trajectories": len({r["path"] for r in rows}),
         "success_rows": int(sum(int(r["success"]) for r in rows)),
         "failure_rows": int(sum(1 - int(r["success"]) for r in rows)),
+        "feature_key": feature_key,
+        "feature_shape": list(data["z"].shape),
         "tcp_target": tcp_target.tolist(),
         "tcp_radius": float(cfg.tcp_radius),
         "tcp_filter_mode": str(cfg.tcp_filter_mode),
@@ -1274,29 +1615,36 @@ def save_checkpoint(
         path / "actor_critic_standalone.pt",
     )
     model_state = {
-        **{f"actor_head.{k}": v.detach().cpu() for k, v in actor.state_dict().items()},
+        **{
+            f"actor_head.{k}": v.detach().cpu()
+            for k, v in actor_head_state_dict(actor).items()
+        },
         **{
             f"critic_head_1.{k}": v.detach().cpu()
-            for k, v in critic.q1.state_dict().items()
+            for k, v in critic_head_state_dict(critic, "q1").items()
         },
         **{
             f"critic_head_2.{k}": v.detach().cpu()
-            for k, v in critic.q2.state_dict().items()
+            for k, v in critic_head_state_dict(critic, "q2").items()
         },
+        **prefix_state_dict(actor),
+        **prefix_state_dict(critic),
     }
     target_model_state = {
         **{
             f"actor_head.{k}": v.detach().cpu()
-            for k, v in target_actor.state_dict().items()
+            for k, v in actor_head_state_dict(target_actor).items()
         },
         **{
             f"critic_head_1.{k}": v.detach().cpu()
-            for k, v in target_critic.q1.state_dict().items()
+            for k, v in critic_head_state_dict(target_critic, "q1").items()
         },
         **{
             f"critic_head_2.{k}": v.detach().cpu()
-            for k, v in target_critic.q2.state_dict().items()
+            for k, v in critic_head_state_dict(target_critic, "q2").items()
         },
+        **prefix_state_dict(target_actor, target=True),
+        **prefix_state_dict(target_critic, target=True),
     }
     torch.save(
         {
@@ -1428,6 +1776,11 @@ def main() -> int:
         default="peg and insertion",
     )
     parser.add_argument("--feature-cache-model-config", default=None)
+    parser.add_argument(
+        "--realtime-prefix-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     args = parser.parse_args()
 
     cfg = TrainConfig(**vars(args))
@@ -1440,22 +1793,53 @@ def main() -> int:
         json.dumps(asdict(cfg), indent=2), encoding="utf-8"
     )
 
-    ensure_feature_cache(cfg)
-    data = load_dataset(cfg)
+    if cfg.realtime_prefix_features:
+        if not uses_prefix_token_training(cfg):
+            raise ValueError(
+                "--realtime-prefix-features requires image_last_linear prefix training "
+                "(rl_token_source=image_last_linear with actor/critic prefix linears)."
+            )
+        feature_model = load_feature_model(cfg, device)
+        data = load_dataset(cfg, feature_model=feature_model, device=device)
+    else:
+        ensure_feature_cache(cfg)
+        data = load_dataset(cfg)
     build_n_step_arrays(data, cfg.gamma, cfg.n_step)
     action_mean, action_std = load_norm_stats(cfg.norm_stats_path)
     mean_t = torch.tensor(action_mean, device=device, dtype=torch.float32)
     std_t = torch.tensor(action_std, device=device, dtype=torch.float32)
     fk = DifferentiablePiperFK(cfg.urdf_path).to(device)
 
-    actor = ChunkActor(cfg).to(device)
-    critic = TwinCritic(cfg).to(device)
-    target_actor = ChunkActor(cfg).to(device)
-    target_critic = TwinCritic(cfg).to(device)
+    actor_prefix = (
+        OfflinePrefixTokenEncoder(cfg, role="actor")
+        if uses_prefix_token_training(cfg)
+        else None
+    )
+    critic_prefix = (
+        OfflinePrefixTokenEncoder(cfg, role="critic")
+        if uses_prefix_token_training(cfg)
+        else None
+    )
+    target_actor_prefix = (
+        OfflinePrefixTokenEncoder(cfg, role="actor")
+        if uses_prefix_token_training(cfg)
+        else None
+    )
+    target_critic_prefix = (
+        OfflinePrefixTokenEncoder(cfg, role="critic")
+        if uses_prefix_token_training(cfg)
+        else None
+    )
+    actor = ChunkActor(cfg, prefix_encoder=actor_prefix).to(device)
+    critic = TwinCritic(cfg, prefix_encoder=critic_prefix).to(device)
+    target_actor = ChunkActor(cfg, prefix_encoder=target_actor_prefix).to(device)
+    target_critic = TwinCritic(cfg, prefix_encoder=target_critic_prefix).to(device)
     target_actor.load_state_dict(actor.state_dict())
     target_critic.load_state_dict(critic.state_dict())
-    actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.actor_lr)
-    critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
+    target_actor.requires_grad_(False)
+    target_critic.requires_grad_(False)
+    actor_opt = build_actor_optimizer(actor, cfg)
+    critic_opt = build_critic_optimizer(critic, cfg)
 
     metrics_path = Path(cfg.output_dir) / "metrics.jsonl"
     num_samples = int(data["z"].shape[0])
@@ -1526,7 +1910,7 @@ def main() -> int:
                 std_t,
                 fk,
             )
-            actor_q = critic.q1(b["z"], b["state"], actor_action).mean()
+            actor_q = critic(b["z"], b["state"], actor_action)[0].mean()
             q_weight = float(cfg.q_weight) if step >= int(cfg.q_warmup_steps) else 0.0
             actor_loss = (
                 cfg.bc_weight * bc_loss

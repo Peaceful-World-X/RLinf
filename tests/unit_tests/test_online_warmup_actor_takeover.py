@@ -322,3 +322,93 @@ def test_td3_worker_uses_all_chunks_when_warmup_exclusion_is_disabled():
     worker._configure_replay_buffer_sample_filter()
 
     assert worker.replay_buffer.calls == []
+
+
+def test_td3_update_skips_when_actor_control_filter_returns_empty_batch():
+    policy = object.__new__(EmbodiedTD3FSDPPolicy)
+    policy.cfg = OmegaConf.create(
+        {
+            "actor": {"micro_batch_size": 8},
+            "algorithm": {"critic_actor_ratio": 1},
+        }
+    )
+    policy.update_step = 0
+
+    skipped, metrics = policy._skip_update_metrics_if_batch_empty({})
+
+    assert skipped is True
+    assert metrics["training/skipped_empty_batch"] == 1.0
+    assert metrics["critic/skipped"] == 1.0
+    assert metrics["actor/skipped"] == 1.0
+
+
+def test_td3_update_does_not_skip_when_batch_has_curr_obs():
+    policy = object.__new__(EmbodiedTD3FSDPPolicy)
+    policy.cfg = OmegaConf.create(
+        {
+            "actor": {"micro_batch_size": 1},
+            "algorithm": {"critic_actor_ratio": 1},
+        }
+    )
+    policy.update_step = 0
+    batch = {"curr_obs": {"states": torch.zeros(1, 14)}}
+
+    skipped, metrics = policy._skip_update_metrics_if_batch_empty(batch)
+
+    assert skipped is False
+    assert metrics == {}
+
+
+def test_replay_buffer_counts_forward_input_filter_matches():
+    buffer = TrajectoryReplayBuffer(seed=1234, enable_cache=True, cache_size=2)
+    buffer.set_sample_forward_input_filter("rollout_control_source", min_value=1.0)
+    traj = Trajectory(max_episode_length=10)
+    traj.rewards = torch.zeros(4, 1, 1)
+    traj.actions = torch.zeros(4, 1, 1)
+    traj.forward_inputs = {
+        "rollout_control_source": torch.tensor([[[0]], [[1]], [[0]], [[1]]]),
+        "action": torch.zeros(4, 1, 1),
+    }
+    buffer.add_trajectories([traj])
+
+    assert buffer.count_forward_input_filter_matches() == 2
+    assert buffer.count_forward_input_filter_matches(tail_window_size=2) == 1
+
+
+def test_td3_run_training_waits_for_filtered_actor_samples():
+    class _FilteredReplayBuffer:
+        def is_ready(self, _min_size):
+            return True
+
+        def count_forward_input_filter_matches(self, **_kwargs):
+            return 0
+
+    class _Model:
+        def train(self):
+            raise AssertionError("model.train should not run without filtered samples")
+
+    policy = object.__new__(EmbodiedTD3FSDPPolicy)
+    policy.cfg = OmegaConf.create(
+        {
+            "actor": {"global_batch_size": 8, "micro_batch_size": 8},
+            "algorithm": {
+                "replay_buffer": {"min_buffer_size": 2},
+                "train_actor_steps": 0,
+                "update_epoch": 1,
+                "tail_curriculum": {"enabled": True, "end_window": 20},
+            },
+        }
+    )
+    policy._world_size = 1
+    policy._timer_metrics = {}
+    policy.update_step = 7
+    policy.replay_buffer = _FilteredReplayBuffer()
+    policy.model = _Model()
+    policy.log_on_first_rank = lambda *_args, **_kwargs: None
+
+    metrics = policy.run_training()
+
+    assert policy.update_step == 7
+    assert metrics["training/skipped_no_filtered_samples"] == 1.0
+    assert metrics["training/filtered_samples"] == 0.0
+    assert metrics["training/update_applied"] == 0.0

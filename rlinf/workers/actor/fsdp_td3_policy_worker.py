@@ -661,6 +661,16 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
     # Training loop
     # ------------------------------------------------------------------
 
+    def _skip_update_metrics_if_batch_empty(self, batch):
+        if isinstance(batch, dict) and "curr_obs" in batch:
+            return False, {}
+        return True, {
+            "training/skipped_empty_batch": 1.0,
+            "td3/critic_loss": 0.0,
+            "critic/skipped": 1.0,
+            "actor/skipped": 1.0,
+        }
+
     @Worker.timer("update_one_epoch")
     def update_one_epoch(self):
         self._maybe_delete_last_replay_trajectory_from_keyboard()
@@ -712,6 +722,14 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 )
             else:
                 global_batch = next(self.buffer_dataloader_iter)
+
+        skip_update, skip_metrics = self._skip_update_metrics_if_batch_empty(
+            global_batch
+        )
+        if skip_update:
+            skip_metrics["critic/tail_window_size"] = float(tail_window_size)
+            skip_metrics["training/stage_coupled"] = float(stage_name == "coupled_td3")
+            return skip_metrics
 
         micro_batches = split_dict_to_chunk(
             global_batch,
@@ -897,6 +915,23 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             min_buffer_size, self.cfg.algorithm.get("train_actor_steps", 0)
         )
         _ = self.replay_buffer.is_ready(train_actor_steps)  # logged internally
+        if hasattr(self.replay_buffer, "count_forward_input_filter_matches"):
+            tail_window_size = 0
+            tail_cfg = self.cfg.algorithm.get("tail_curriculum", None)
+            if tail_cfg is not None and bool(tail_cfg.get("enabled", False)):
+                tail_window_size = int(tail_cfg.get("end_window", 0))
+            filtered_samples = self.replay_buffer.count_forward_input_filter_matches(
+                tail_window_size=tail_window_size
+            )
+            if filtered_samples <= 0:
+                self.log_on_first_rank(
+                    "Replay buffer has no samples matching the TD3 training filter; skipping update"
+                )
+                return {
+                    "training/skipped_no_filtered_samples": 1.0,
+                    "training/filtered_samples": 0.0,
+                    "training/update_applied": 0.0,
+                }
 
         assert (
             self.cfg.actor.global_batch_size
@@ -915,6 +950,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             append_to_dict(metrics, self.update_one_epoch())
             self.update_step += 1
 
+        append_to_dict(metrics, {"training/update_applied": 1.0})
         mean_metrics = self.process_train_metrics(metrics)
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -1714,14 +1750,34 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 self._load_filtered_named_tensors(
                     self.target_model, payload.get("target_model", {})
                 )
-            if payload.get("actor_optimizer") is not None:
+            load_optimizer = bool(
+                self.cfg.runner.get("load_optimizer_on_actor_critic_resume", True)
+            )
+            if load_optimizer and payload.get("actor_optimizer") is not None:
                 self.actor_optimizer.load_state_dict(payload["actor_optimizer"])
-            if payload.get("critic_optimizer") is not None and not reset_critic:
+            if (
+                load_optimizer
+                and payload.get("critic_optimizer") is not None
+                and not reset_critic
+            ):
                 self.critic_optimizer.load_state_dict(payload["critic_optimizer"])
-            if payload.get("actor_lr_scheduler") is not None:
+            if (
+                load_optimizer
+                and payload.get("actor_lr_scheduler") is not None
+                and self.lr_scheduler is not None
+            ):
                 self.lr_scheduler.load_state_dict(payload["actor_lr_scheduler"])
-            if payload.get("critic_lr_scheduler") is not None and not reset_critic:
+            if (
+                load_optimizer
+                and payload.get("critic_lr_scheduler") is not None
+                and self.qf_lr_scheduler is not None
+                and not reset_critic
+            ):
                 self.qf_lr_scheduler.load_state_dict(payload["critic_lr_scheduler"])
+            if not load_optimizer:
+                self.log_on_first_rank(
+                    "Skipped actor/critic optimizer state during checkpoint resume."
+                )
             if reset_critic:
                 self._reset_td3_critic_state()
                 self.log_on_first_rank(

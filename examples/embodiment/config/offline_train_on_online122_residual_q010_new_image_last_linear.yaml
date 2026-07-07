@@ -6,10 +6,10 @@
 #   bash examples/embodiment/run_offline_train_openrlt.sh offline_train_on_online122_residual_q010_new_image_last_linear
 
 # --- Path roots ---
-online_log_dir: /home/focal/shared_disk/users/kwj/RLinf/logs/20260630-06:47:23-realworld_piper_cubeinsert_pi05_eval_with_reward/demos
+online_log_dir: /home/focal/shared_disk/users/kwj/RLinf/logs/20260703-05:14:40-realworld_piper_peginsertion_td3_rl_token_online
 output_name: offline_train_on_online122_residual_q010_new_image_last_linear
-data_dir: /home/focal/shared_disk/users/kwj/RLinf/logs/20260630-06:47:23-realworld_piper_cubeinsert_pi05_eval_with_reward/demos
-feature_cache: /home/focal/shared_disk/users/kwj/RLinf/logs/20260630-06:47:23-realworld_piper_cubeinsert_pi05_eval_with_reward/demos/online_rltoken_features_image_last_linear.pt
+data_dir: /home/focal/shared_disk/users/kwj/RLinf/logs/20260703-05:14:40-realworld_piper_peginsertion_td3_rl_token_online/replay_buffer/rank_0
+feature_cache: /home/focal/shared_disk/users/kwj/RLinf/logs/20260703-05:14:40-realworld_piper_peginsertion_td3_rl_token_online/online_prefix_tokens_image_last_linear.pt
 generate_feature_cache_if_missing: true
 feature_cache_batch_size: 8
 feature_cache_task_description: "peg and insertion"
@@ -29,8 +29,14 @@ num_image_tokens: 768
 actor_train_prefix_token_linear: true
 critic_train_prefix_token_linear: true
 
+# Read prefix tokens from the saved feature_cache (not realtime VLA inference).
+# load_dataset() mmaps the ~16GB cache and only pages in the rows a batch
+# actually indexes, so this avoids the load_dataset OOM without needing to
+# re-run the frozen VLA forward pass every step.
+realtime_prefix_features: false
+
 # --- Training schedule ---
-max_steps: 5000
+max_steps: 2000
 batch_size: 256
 gpu: 0
 save_interval: 50

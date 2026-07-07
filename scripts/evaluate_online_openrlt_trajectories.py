@@ -138,7 +138,7 @@ def build_policy(
 def build_full_policy_from_model_config(
     checkpoint_path: Path,
     model_config_path: Path,
-    rl_token_path: Path,
+    rl_token_path: Path | None,
     norm_stats_path: Path,
     device: torch.device,
 ) -> OpenPiRLTokenPolicy:
@@ -153,7 +153,28 @@ def build_full_policy_from_model_config(
     model_cfg.model_type = "openpi_rl_token"
     model_cfg.precision = model_cfg.get("precision", None)
     model_cfg.is_lora = bool(model_cfg.get("is_lora", False))
-    model_cfg.rl_token_path = str(rl_token_path)
+    if train_cfg.get("model_path") is not None:
+        model_cfg.model_path = str(train_cfg["model_path"])
+    resolved_rl_token_path = train_cfg.get("rl_token_path") or rl_token_path
+    if resolved_rl_token_path is not None:
+        model_cfg.rl_token_path = str(resolved_rl_token_path)
+    elif hasattr(model_cfg, "rl_token_path"):
+        model_cfg.rl_token_path = None
+    model_cfg.rl_token_source = train_cfg.get(
+        "rl_token_source", model_cfg.get("rl_token_source", "autoencoder")
+    )
+    model_cfg.prefix_feature_type = train_cfg.get(
+        "prefix_feature_type", model_cfg.get("prefix_feature_type", "image_only")
+    )
+    model_cfg.num_image_tokens = int(
+        train_cfg.get("num_image_tokens", model_cfg.get("num_image_tokens", 768))
+    )
+    model_cfg.actor_train_prefix_token_linear = bool(
+        train_cfg.get("actor_train_prefix_token_linear", False)
+    )
+    model_cfg.critic_train_prefix_token_linear = bool(
+        train_cfg.get("critic_train_prefix_token_linear", False)
+    )
     model_cfg.action_horizon = int(
         train_cfg.get("chunk_len", model_cfg.get("num_action_chunks", 10))
     )
@@ -407,17 +428,87 @@ def _select_obs_at_chunk(curr: dict, rel: int, task_description: str) -> dict:
     return env_obs
 
 
+def _policy_uses_image_last_linear(policy: OpenPiRLTokenPolicy) -> bool:
+    source = getattr(policy, "rl_token_source", None)
+    if source is None:
+        source = getattr(getattr(policy, "config", None), "rl_token_source", None)
+    return str(source) == "image_last_linear"
+
+
+def load_prefix_feature_cache(path: Path | None) -> dict | None:
+    if path is None:
+        return None
+    if not path.exists():
+        raise FileNotFoundError(f"feature_cache not found: {path}")
+    try:
+        payload = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    if "prefix_tokens" not in payload:
+        raise KeyError(f"feature_cache does not contain `prefix_tokens`: {path}")
+    lookup: dict[tuple[str, int], int] = {}
+    for idx, meta in enumerate(payload.get("metas", [])):
+        rel = int(meta.get("rel_chunk", meta.get("chunk_index", -1)))
+        raw_path = str(meta.get("path", ""))
+        if rel < 0 or not raw_path:
+            continue
+        meta_path = Path(raw_path)
+        lookup[(str(meta_path), rel)] = int(idx)
+        lookup[(meta_path.name, rel)] = int(idx)
+    return {
+        "path": path,
+        "prefix_tokens": payload["prefix_tokens"],
+        "lookup": lookup,
+    }
+
+
+def cached_prefix_for_trajectory(
+    path: Path, n: int, feature_cache: dict | None
+) -> torch.Tensor | None:
+    if feature_cache is None:
+        return None
+    tokens = feature_cache["prefix_tokens"]
+    lookup = feature_cache["lookup"]
+    rows = []
+    for rel in range(n):
+        idx = lookup.get((str(path), rel), lookup.get((path.name, rel)))
+        if idx is None:
+            return None
+        rows.append(tokens[int(idx)].float())
+    return torch.stack(rows, dim=0)
+
+
 def visual_latent_for_trajectory(
+    path: Path,
     n: int,
     fwd: dict,
     curr: dict,
     policy: OpenPiRLTokenPolicy,
     device: torch.device,
     task_description: str,
+    feature_cache: dict | None = None,
 ) -> torch.Tensor:
+    if _policy_uses_image_last_linear(policy):
+        cached = cached_prefix_for_trajectory(path, n, feature_cache)
+        if cached is not None:
+            print(
+                f"[eval] using cached prefix_tokens from {feature_cache['path']}",
+                flush=True,
+            )
+            return cached
     visual = fwd.get("visual_latent", curr.get("visual_latent", None))
     if visual is not None:
-        return visual[:, 0].float()
+        visual = visual[:, 0].float()
+        if not _policy_uses_image_last_linear(policy):
+            return visual
+        expected_len = int(getattr(policy.config, "num_image_tokens", 768)) + 1
+        if visual.dim() >= 3 and visual.shape[1] >= expected_len:
+            return visual
+        print(
+            "[eval] stored visual_latent is image-only; recomputing full prefix "
+            "for image_last_linear",
+            flush=True,
+        )
     rows = []
     with torch.no_grad():
         for rel in range(n):
@@ -427,7 +518,12 @@ def visual_latent_for_trajectory(
                 for key, value in env_obs.items()
             }
             prefix_output, _, _ = policy._build_prefix_cache_from_obs(env_obs)
-            rows.append(policy._select_prefix_features(prefix_output).squeeze(0).cpu())
+            if _policy_uses_image_last_linear(policy):
+                rows.append(prefix_output.squeeze(0).cpu())
+            else:
+                rows.append(
+                    policy._select_prefix_features(prefix_output).squeeze(0).cpu()
+                )
     return torch.stack(rows, dim=0).float()
 
 
@@ -441,6 +537,7 @@ def evaluate_trajectory(
     batch_size: int,
     action_horizon: int,
     task_description: str,
+    feature_cache: dict | None = None,
 ) -> dict:
     traj = torch.load(path, map_location="cpu", weights_only=False)
     fwd = traj.get("forward_inputs", {})
@@ -450,7 +547,7 @@ def evaluate_trajectory(
     dones_full = traj["dones"][:, 0].bool()
     n = int(states.shape[0])
     visual = visual_latent_for_trajectory(
-        n, fwd, curr, policy, device, task_description
+        path, n, fwd, curr, policy, device, task_description, feature_cache
     )
     valid_mask = fwd.get("chunk_valid_mask")
     if valid_mask is None:
@@ -758,9 +855,10 @@ def main() -> int:
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--model-config", type=Path)
+    parser.add_argument("--feature-cache", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--rl-token-path", type=Path, required=True)
+    parser.add_argument("--rl-token-path", type=Path)
     parser.add_argument("--norm-stats-path", type=Path, required=True)
     parser.add_argument("--urdf-path", type=Path, required=True)
     parser.add_argument("--gamma", type=float, default=0.89)
@@ -797,6 +895,7 @@ def main() -> int:
     print(f"[eval] trajectories={len(trajectories)}")
     print(f"[eval] data_dir={data_dir}")
     print(f"[eval] model_config={args.model_config}")
+    print(f"[eval] feature_cache={args.feature_cache}")
     print(f"[eval] checkpoint={checkpoint}")
     print(f"[eval] output_dir={output_dir}")
     print(
@@ -818,6 +917,7 @@ def main() -> int:
             checkpoint, args.rl_token_path, args.norm_stats_path, device, action_horizon
         )
     kin = SimpleUrdfKinematics(str(args.urdf_path))
+    feature_cache = load_prefix_feature_cache(args.feature_cache)
 
     rows = []
     for idx, path in enumerate(trajectories):
@@ -833,6 +933,7 @@ def main() -> int:
             batch_size=args.batch_size,
             action_horizon=action_horizon,
             task_description=args.task_description,
+            feature_cache=feature_cache,
         )
         rows.append(metrics)
         print(

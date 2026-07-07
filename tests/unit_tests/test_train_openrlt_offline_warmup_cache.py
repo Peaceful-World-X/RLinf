@@ -90,6 +90,53 @@ def test_load_dataset_skips_per_trajectory_warm_up_chunks(tmp_path, monkeypatch)
     assert data["skipped_warmup"] == 3
 
 
+def test_load_dataset_uses_full_chunk_horizon_for_reward_and_done(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(train, "SimpleUrdfKinematics", lambda _: object())
+    monkeypatch.setattr(
+        train, "right_tcp", lambda q, kin, offset: torch.zeros(1, 3).numpy()
+    )
+
+    data_dir = tmp_path / "demos"
+    data_dir.mkdir()
+    traj_path = data_dir / "trajectory_0.pt"
+    _write_trajectory(traj_path, num_chunks=4)
+    traj = torch.load(traj_path, map_location="cpu", weights_only=False)
+    traj["rewards"] = torch.zeros(4, 1, 15, dtype=torch.float32)
+    traj["dones"] = torch.zeros(4, 1, 15, dtype=torch.bool)
+    traj["rewards"][3, 0, 2] = 1.0
+    traj["dones"][3, 0, 2] = True
+    torch.save(traj, traj_path)
+
+    feature_cache = tmp_path / "features.pt"
+    torch.save(
+        {
+            "rltoken": torch.arange(4 * 2048, dtype=torch.float32).reshape(4, 2048),
+            "metas": [
+                {
+                    "path": str(traj_path),
+                    "rel_chunk": rel,
+                    "traj_index": 0,
+                    "success": False,
+                }
+                for rel in range(4)
+            ],
+        },
+        feature_cache,
+    )
+
+    data = train.load_dataset(_cfg(tmp_path, data_dir, feature_cache))
+    train.build_n_step_arrays(data, gamma=0.9, n_step=4)
+
+    assert data["reward"].reshape(-1).tolist() == [0.0, 0.0, 0.0, 1.0]
+    assert data["done"].reshape(-1).tolist() == [0.0, 0.0, 0.0, 1.0]
+    assert torch.allclose(
+        data["n_return"].reshape(-1), torch.tensor([0.9**3, 0.9**2, 0.9, 1.0])
+    )
+    assert data["n_done"].reshape(-1).tolist() == [1.0, 1.0, 1.0, 1.0]
+
+
 def test_ensure_feature_cache_generates_missing_cache(tmp_path):
     data_dir = tmp_path / "demos"
     data_dir.mkdir()

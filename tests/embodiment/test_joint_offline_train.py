@@ -177,3 +177,20 @@ def test_dry_run_manifest_contains_independent_checkpoint_paths(tmp_path: Path):
     )
     assert manifest["stages"][0]["output_dir"] != manifest["stages"][1]["output_dir"]
     assert (run_dir / "manifest.json").exists()
+
+
+def test_realworld_charge_insert_offline_config_uses_prefix_token_openrlt():
+    repo = Path(__file__).resolve().parents[2]
+    config_dir = repo / "examples" / "embodiment" / "config"
+    cfg = load_joint_config(config_dir / "realworld_charge_insert_offline.yaml")
+
+    assert cfg.run_name == "realworld_charge_insert_offline"
+    assert (
+        cfg.openrlt.config
+        == "offline_train_on_online122_residual_q010_new_image_last_linear"
+    )
+    assert cfg.openrlt.output_subdir == "openrlt"
+    assert (
+        cfg.classifier.config == "intervention_classifier_online122_residual_q010_new"
+    )
+    assert cfg.classifier.output_subdir == "intervention_classifier"

@@ -1,0 +1,28 @@
+# Real-world charge-insert offline GigaCL training wrapper.
+# Runs:
+#   1. OpenRLT TD3+BC actor/critic training with cached prefix tokens and
+#      trainable image_last_linear prefix-compression layers.
+#   2. Intervention-classifier training as an independent subprocess stage.
+#
+# Usage:
+#   bash examples/embodiment/run_realworld_offine_train_gigacl.sh \
+#     realworld_charge_insert_offline.yaml
+
+run_name: realworld_charge_insert_offline
+output_root: /home/focal/shared_disk/users/kwj/RLinf/logs
+timestamped_run_dir: true
+co_locate_outputs: true
+run_mode: sequential
+stop_on_failure: true
+
+openrlt:
+  enabled: true
+  config: offline_train_on_online122_residual_q010_new_image_last_linear
+  output_subdir: openrlt
+  extra_args: []
+
+classifier:
+  enabled: true
+  config: intervention_classifier_online122_residual_q010_new
+  output_subdir: intervention_classifier
+  extra_args: []
