@@ -44,6 +44,10 @@ class ClassifierConfig:
     urdf_path: str
     model_path: str | None = None
     rl_token_path: str | None = None
+    rl_token_source: str = "autoencoder"
+    prefix_feature_type: str = "image_only"
+    num_image_tokens: int = 768
+    prefix_linear_checkpoint: str | None = None
     feature_cache: str | None = None
     generate_feature_cache_if_missing: bool = True
     feature_cache_batch_size: int = 16
@@ -224,11 +228,22 @@ def select_obs_at_chunk(
     return env_obs
 
 
+def uses_image_last_linear_features(cfg: ClassifierConfig) -> bool:
+    return str(cfg.rl_token_source).lower() == "image_last_linear"
+
+
 @torch.no_grad()
-def extract_rl_token_from_model(model: Any, env_obs: dict[str, Any]) -> torch.Tensor:
+def extract_rl_token_from_model(
+    model: Any, env_obs: dict[str, Any], cfg: ClassifierConfig
+) -> torch.Tensor:
     prefix_output, _, _ = model._build_prefix_cache_from_obs(env_obs)
-    image_features = model._select_prefix_features(prefix_output)
-    token = model.rl_token_autoencoder.encoder(image_features).detach().cpu().float()
+    if uses_image_last_linear_features(cfg):
+        features = model._select_token_features(prefix_output)
+        token = model._encode_actor_token(features, use_target=False)
+    else:
+        image_features = model._select_prefix_features(prefix_output)
+        token = model.rl_token_autoencoder.encoder(image_features)
+    token = token.detach().cpu().float()
     if token.dim() == 3:
         token = token.mean(dim=1)
     return token
@@ -251,6 +266,12 @@ def build_feature_model_cfg(cfg: ClassifierConfig):
     model_cfg.model_type = "openpi_rl_token"
     model_cfg.model_path = cfg.model_path
     model_cfg.rl_token_path = cfg.rl_token_path
+    model_cfg.rl_token_source = cfg.rl_token_source
+    model_cfg.prefix_feature_type = cfg.prefix_feature_type
+    model_cfg.num_image_tokens = int(cfg.num_image_tokens)
+    if uses_image_last_linear_features(cfg):
+        model_cfg.actor_train_prefix_token_linear = True
+        model_cfg.critic_train_prefix_token_linear = False
     if not model_cfg.get("precision", None):
         model_cfg.precision = "bf16"
     model_cfg.is_lora = bool(model_cfg.get("is_lora", False))
@@ -258,10 +279,81 @@ def build_feature_model_cfg(cfg: ClassifierConfig):
     return model_cfg
 
 
-def generate_feature_cache(cfg: ClassifierConfig) -> Path:
-    if cfg.model_path is None or cfg.rl_token_path is None:
+def load_prefix_linear_checkpoint(model: Any, cfg: ClassifierConfig) -> None:
+    if not cfg.prefix_linear_checkpoint:
+        return
+    checkpoint_path = Path(str(cfg.prefix_linear_checkpoint))
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"prefix_linear_checkpoint not found: {checkpoint_path}"
+        )
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state = payload.get("model", payload) if isinstance(payload, dict) else payload
+    if not isinstance(state, dict):
+        raise TypeError(
+            f"prefix_linear_checkpoint must contain a state dict, got {type(state).__name__}"
+        )
+    weight = None
+    candidate_keys = (
+        "actor_prefix_token_linear.weight",
+        "module.actor_prefix_token_linear.weight",
+        "_fsdp_wrapped_module.actor_prefix_token_linear.weight",
+        "target_actor_prefix_token_linear.weight",
+    )
+    for key in candidate_keys:
+        value = state.get(key)
+        if torch.is_tensor(value):
+            weight = value
+            break
+    if weight is None:
+        for key, value in state.items():
+            if key.endswith("actor_prefix_token_linear.weight") and torch.is_tensor(
+                value
+            ):
+                weight = value
+                break
+    if weight is None:
+        available = sorted(
+            str(key) for key in state if "prefix_token_linear" in str(key)
+        )
+        raise KeyError(
+            "prefix_linear_checkpoint is missing actor_prefix_token_linear.weight; "
+            f"available prefix keys: {available}"
+        )
+    module = getattr(model, "actor_prefix_token_linear", None)
+    if module is None:
+        raise RuntimeError(
+            "model does not expose actor_prefix_token_linear; set "
+            "rl_token_source: image_last_linear"
+        )
+    if tuple(weight.shape) != tuple(module.weight.shape):
         raise ValueError(
-            "model_path and rl_token_path are required to generate zrl features"
+            "actor_prefix_token_linear shape mismatch: "
+            f"checkpoint {tuple(weight.shape)} vs model {tuple(module.weight.shape)}"
+        )
+    with torch.no_grad():
+        module.weight.copy_(
+            weight.to(device=module.weight.device, dtype=module.weight.dtype)
+        )
+    print(
+        json.dumps(
+            {
+                "prefix_linear_checkpoint": str(checkpoint_path),
+                "loaded_key": "actor_prefix_token_linear.weight",
+                "shape": list(weight.shape),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
+def generate_feature_cache(cfg: ClassifierConfig) -> Path:
+    if cfg.model_path is None:
+        raise ValueError("model_path is required to generate classifier features")
+    if cfg.rl_token_path is None and not uses_image_last_linear_features(cfg):
+        raise ValueError(
+            "rl_token_path is required for autoencoder classifier features"
         )
     from rlinf.models import get_model
 
@@ -269,6 +361,7 @@ def generate_feature_cache(cfg: ClassifierConfig) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     device = torch.device(f"cuda:{cfg.gpu}" if torch.cuda.is_available() else "cpu")
     model = get_model(build_feature_model_cfg(cfg)).to(device).eval()
+    load_prefix_linear_checkpoint(model, cfg)
     tokens: list[torch.Tensor] = []
     metas: list[dict[str, Any]] = []
     for data_dir in cfg.train_data_dirs:
@@ -291,7 +384,7 @@ def generate_feature_cache(cfg: ClassifierConfig) -> Path:
                 env_obs = select_obs_at_chunk(
                     curr_obs, rel, cfg.feature_cache_task_description
                 )
-                token = extract_rl_token_from_model(model, env_obs)
+                token = extract_rl_token_from_model(model, env_obs, cfg)
                 tokens.append(token.squeeze(0))
                 metas.append(
                     {
@@ -305,7 +398,16 @@ def generate_feature_cache(cfg: ClassifierConfig) -> Path:
             print(f"[feature-cache] {traj_path.name} chunks={num_chunks}", flush=True)
     if not tokens:
         raise RuntimeError("No RL-token features were generated")
-    payload = {"rltoken": torch.stack(tokens, dim=0).float().cpu(), "metas": metas}
+    payload = {
+        "rltoken": torch.stack(tokens, dim=0).float().cpu(),
+        "metas": metas,
+        "feature_source": {
+            "rl_token_source": cfg.rl_token_source,
+            "prefix_feature_type": cfg.prefix_feature_type,
+            "num_image_tokens": int(cfg.num_image_tokens),
+            "prefix_linear_checkpoint": cfg.prefix_linear_checkpoint,
+        },
+    }
     torch.save(payload, out_path)
     print(
         json.dumps(
@@ -313,6 +415,9 @@ def generate_feature_cache(cfg: ClassifierConfig) -> Path:
                 "feature_cache": str(out_path),
                 "num_rows": len(metas),
                 "shape": list(payload["rltoken"].shape),
+                "rl_token_source": cfg.rl_token_source,
+                "prefix_feature_type": cfg.prefix_feature_type,
+                "num_image_tokens": int(cfg.num_image_tokens),
             },
             indent=2,
         ),

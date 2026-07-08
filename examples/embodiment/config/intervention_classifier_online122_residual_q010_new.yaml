@@ -7,7 +7,7 @@ train_data_dirs:
   - /home/focal/shared_disk/users/kwj/RLinf/logs/20260626-07:51:18-realworld_piper_peginsertion_td3_rl_token_online/replay_buffer/rank_0
 
 output_dir: /home/focal/shared_disk/users/kwj/RLinf/logs/intervention_classifier_online122_residual_q010_new
-feature_cache: /home/focal/shared_disk/users/kwj/RLinf/logs/intervention_classifier_online122_residual_q010_new/intervention_classifier_rltoken_features.pt
+feature_cache: /home/focal/shared_disk/users/kwj/RLinf/logs/intervention_classifier_online122_residual_q010_new/intervention_classifier_image_last_linear_features.pt
 generate_feature_cache_if_missing: true
 feature_cache_batch_size: 16
 feature_cache_task_description: "peg and insertion"
@@ -17,6 +17,12 @@ norm_stats_path: /home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_ins
 urdf_path: /home/focal/shared_disk/users/kwj/RLinf/assets/piper_local_assets/piper.urdf
 model_path: /home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert
 rl_token_path: /home/focal/shared_disk/users/kwj/weight/rltoken/pi05_charge_insert/10000
+
+# Match offline OpenRLT image_last_linear feature compression.
+rl_token_source: image_last_linear
+prefix_feature_type: full_prefix
+num_image_tokens: 768
+prefix_linear_checkpoint: /home/focal/shared_disk/users/kwj/RLinf/logs/20260703-05:14:40-realworld_piper_peginsertion_td3_rl_token_online/offline_train_on_online122_residual_q010_new_image_last_linear/checkpoints/final/actor_critic.pt
 
 pre_intervention_chunks: 2
 include_positive_window: 1

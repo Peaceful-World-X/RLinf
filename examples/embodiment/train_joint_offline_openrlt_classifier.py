@@ -128,6 +128,16 @@ def _output_override_args(
     return run_dir / stage.output_subdir, []
 
 
+def _args_have_flag(args: list[str], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in args)
+
+
+def _config_uses_image_last_linear(config_path: Path) -> bool:
+    with config_path.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    return str(raw.get("rl_token_source", "")).lower() == "image_last_linear"
+
+
 def build_stage_commands(
     cfg: JointTrainConfig,
     repo_root: Path,
@@ -136,9 +146,11 @@ def build_stage_commands(
 ) -> list[StageCommand]:
     stages: list[StageCommand] = []
     embodied = repo_root / "examples" / "embodiment"
+    openrlt_output_dir: Path | None = None
     if cfg.openrlt.enabled:
         config_path = resolve_config_path(cfg.openrlt.config, config_dir)
         output_dir, output_args = _output_override_args(cfg, cfg.openrlt, run_dir)
+        openrlt_output_dir = output_dir
         stages.append(
             StageCommand(
                 name="openrlt",
@@ -156,6 +168,29 @@ def build_stage_commands(
     if cfg.classifier.enabled:
         config_path = resolve_config_path(cfg.classifier.config, config_dir)
         output_dir, output_args = _output_override_args(cfg, cfg.classifier, run_dir)
+        classifier_extra_args = list(cfg.classifier.extra_args)
+        if cfg.openrlt.enabled and _config_uses_image_last_linear(config_path):
+            if openrlt_output_dir is None:
+                raise RuntimeError("OpenRLT output dir was not resolved.")
+            prefix_checkpoint = (
+                openrlt_output_dir / "checkpoints" / "final" / "actor_critic.pt"
+            )
+            if not _args_have_flag(classifier_extra_args, "--prefix-linear-checkpoint"):
+                classifier_extra_args.extend(
+                    ["--prefix-linear-checkpoint", str(prefix_checkpoint)]
+                )
+            if cfg.co_locate_outputs and not _args_have_flag(
+                classifier_extra_args, "--feature-cache"
+            ):
+                classifier_extra_args.extend(
+                    [
+                        "--feature-cache",
+                        str(
+                            output_dir
+                            / "intervention_classifier_image_last_linear_features.pt"
+                        ),
+                    ]
+                )
         stages.append(
             StageCommand(
                 name="classifier",
@@ -163,7 +198,7 @@ def build_stage_commands(
                     "bash",
                     str(embodied / "run_intervention_classifier_train.sh"),
                     str(config_path),
-                    *cfg.classifier.extra_args,
+                    *classifier_extra_args,
                     *output_args,
                 ],
                 output_dir=output_dir,

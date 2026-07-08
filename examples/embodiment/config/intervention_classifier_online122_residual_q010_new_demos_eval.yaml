@@ -1,26 +1,23 @@
-# Demos-only offline classifier eval.
-# Reuses the shared RL-token feature cache, then filters rows to this data dir.
-
 train_data_dirs:
-  - /home/focal/shared_disk/users/kwj/RLinf/logs/20260630-06:47:23-realworld_piper_cubeinsert_pi05_eval_with_reward/demos
-
-output_dir: /home/focal/shared_disk/users/kwj/RLinf/logs/intervention_classifier_online122_residual_q010_new_demos_eval
-feature_cache: /home/focal/shared_disk/users/kwj/RLinf/logs/intervention_classifier_online122_residual_q010_new/intervention_classifier_rltoken_features.pt
+- /home/focal/shared_disk/users/kwj/RLinf/logs/20260630-06:47:23-realworld_piper_cubeinsert_pi05_eval_with_reward/demos
+output_dir: /home/focal/shared_disk/users/kwj/RLinf/logs/20260708-09:53:32-realworld_charge_insert_offline/classifier_offline_eval
+feature_cache: /home/focal/shared_disk/users/kwj/RLinf/logs/20260708-09:53:32-realworld_charge_insert_offline/intervention_classifier/intervention_classifier_image_last_linear_features.pt
 generate_feature_cache_if_missing: true
 feature_cache_batch_size: 16
-feature_cache_task_description: "peg and insertion"
+feature_cache_task_description: peg and insertion
 feature_cache_model_config: /home/focal/shared_disk/users/kwj/RLinf/examples/embodiment/config/realworld_piper_cubeinsert_pi05_eval_with_reward.yaml
-
 norm_stats_path: /home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert/norm_stats.json
 urdf_path: /home/focal/shared_disk/users/kwj/RLinf/assets/piper_local_assets/piper.urdf
 model_path: /home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert
 rl_token_path: /home/focal/shared_disk/users/kwj/weight/rltoken/pi05_charge_insert/10000
-
+rl_token_source: image_last_linear
+prefix_feature_type: full_prefix
+num_image_tokens: 768
+prefix_linear_checkpoint: /home/focal/shared_disk/users/kwj/RLinf/logs/20260708-09:53:32-realworld_charge_insert_offline/openrlt/checkpoints/final/actor_critic.pt
 pre_intervention_chunks: 2
 include_positive_window: 1
 negative_sample_ratio: 3.0
 min_rel_chunk: 0
-
 max_steps: 3000
 batch_size: 256
 learning_rate: 0.0001
