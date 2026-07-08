@@ -158,7 +158,7 @@ actor:
   enable_offload: false
 
   model:
-    model_path: "/home/ubuntu/user/chenshiyi/tos_downloads/pi05_weights/pi05_plug_cable"
+    model_path: "/home/ubuntu/user/chenshiyi/tos_downloads/pi05_weights/pi05_plug_cable" #更改路径
     num_action_chunks: 50
     action_dim: 14
     add_value_head: false

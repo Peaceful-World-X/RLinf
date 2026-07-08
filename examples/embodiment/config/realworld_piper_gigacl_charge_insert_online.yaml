@@ -46,7 +46,7 @@ runner:
   load_optimizer_on_actor_critic_resume: False
   log_interval: 20
   weight_sync_interval: 10
-  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/logs/20260707-11:27:20-realworld_charge_insert_offline/openrlt/checkpoints/final"
+  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/logs/20260707-11:27:20-realworld_charge_insert_offline/openrlt/checkpoints/final" #更改为第二阶段离线训练的checkpoint路径
   ckpt_path: null
 
 algorithm:
@@ -205,7 +205,7 @@ actor:
   recv_drain_max_trajectories: 64
 
   model:
-    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert"
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert" #更改路径
     rl_token_path: null
     freeze_rl_token: True
     critic_train_rl_token_encoder: ${algorithm.critic_train_rl_token_encoder}
@@ -231,7 +231,7 @@ actor:
     actor_residual_ref: True
     actor_residual_scale: 1.0
     action_space: "normalized_delta"
-    action_norm_stats_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert/norm_stats.json"
+    action_norm_stats_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert/norm_stats.json" #更改路径
     action_norm_std_floor: 1.0
     # Actor/critic train only the right arm; rollout still executes full 14D
     # absolute Piper actions by keeping the left arm on the VLA reference action.
