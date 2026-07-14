@@ -95,6 +95,10 @@ def _worker(warm_up_chunks=16):
     )
     worker.vla_warmup_chunk_steps = warm_up_chunks
     worker.rollout_control_mode = "warmup"
+    worker.rollout_gate_reset_on_episode_start = True
+    worker._rollout_gate_stable_count = 0
+    worker._rollout_gate_actor_enabled = False
+    worker._rollout_gate_last_chunk_step_idx = -1
     worker._online_action_norm_cache = None
     worker._intervention_gate = InterventionClassifierGate(model=None)
     worker.intervention_classifier_threshold = 0.8
@@ -164,7 +168,7 @@ def test_classifier_disabled_matches_warmup_chunk_boundary_regression():
     assert worker._should_force_vla_rollout(rollout, chunk_step_idx=16) is False
 
 
-def test_classifier_enabled_overrides_warmup_chunk_boundary():
+def test_classifier_enabled_latches_actor_after_first_trigger_until_episode_end():
     worker = _worker(warm_up_chunks=16)
     worker._intervention_gate = _FakeGate(
         [
@@ -186,16 +190,44 @@ def test_classifier_enabled_overrides_warmup_chunk_boundary():
     actor = torch.zeros(1, 3, 14)
     rollout = _RolloutResult(actor, pi05)
 
-    # chunk_step_idx=5 is well before warm_up_chunks=16, but the classifier
-    # says the actor should intervene, so no VLA should be forced.
+    # The first classifier trigger should enter actor intervention.
     forced_early = worker._should_force_vla_rollout(rollout, chunk_step_idx=5)
-    # chunk_step_idx=20 is past warm_up_chunks=16, but the classifier says no,
-    # so VLA should still be forced (no latch, decided independently).
+    # Match the zrl gate behavior: once actor intervention starts, later
+    # low classifier probabilities do not exit actor control by themselves.
     forced_late = worker._should_force_vla_rollout(rollout, chunk_step_idx=20)
 
     assert forced_early is False
-    assert forced_late is True
+    assert forced_late is False
+    assert worker._rollout_gate_actor_enabled is True
     assert worker._last_intervention_gate_decision.classifier_probability == 0.1
+
+
+def test_classifier_actor_latch_releases_on_terminal_keyboard_reward():
+    worker = _worker(warm_up_chunks=16)
+    worker._rollout_gate_actor_enabled = True
+    worker._rollout_gate_stable_count = 3
+
+    released = worker._release_actor_gate_on_episode_end(
+        torch.tensor([[False, True, False]])
+    )
+
+    assert released is True
+    assert worker._rollout_gate_actor_enabled is False
+    assert worker._rollout_gate_stable_count == 0
+
+
+def test_classifier_actor_latch_ignores_nonterminal_positive_reward():
+    worker = _worker(warm_up_chunks=16)
+    worker._rollout_gate_actor_enabled = True
+    worker._rollout_gate_stable_count = 3
+
+    released = worker._release_actor_gate_on_episode_end(
+        torch.tensor([[False, False, False]])
+    )
+
+    assert released is False
+    assert worker._rollout_gate_actor_enabled is True
+    assert worker._rollout_gate_stable_count == 3
 
 
 def test_warmup_forced_chunk_is_appended_to_rollout_result_for_replay_save():

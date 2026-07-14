@@ -7,7 +7,7 @@ export REPO_PATH=$(dirname "$(dirname "$EMBODIED_PATH")")
 export SRC_FILE="${EMBODIED_PATH}/train_async.py"
 export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 
-PYTHON_BIN=${PYTHON_BIN:-python}
+PYTHON_BIN="${PYTHON_BIN:-/opt/venv/piper/bin/python}"
 CONFIG_NAME=${1:-realworld_piper_peginsertion_td3_rl_token_online}
 if [ "$#" -ge 1 ]; then
   shift

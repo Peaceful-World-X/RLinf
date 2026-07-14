@@ -44,7 +44,12 @@ runner:
   reset_global_step_on_resume: True
   log_interval: 20
   weight_sync_interval: 10
-  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/logs/20260703-05:14:40-realworld_piper_peginsertion_td3_rl_token_online/piper_td3_rl_token_online/checkpoints/global_step_300/actor"
+  # Co-train OpenRLT checkpoint directory. Do not append `/actor`: this
+  # checkpoint is saved as actor_critic.pt under the step directory.
+  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/logs/20260708-09:53:32-realworld_charge_insert_offline/openrlt/checkpoints/global_step_1450"
+  # Online RL starts fresh optimizers; the offline optimizer param groups
+  # include co-trained prefix linears that are frozen below.
+  load_optimizer_on_actor_critic_resume: False
   ckpt_path: null
 
 algorithm:
@@ -107,7 +112,10 @@ algorithm:
     save_executor_workers: 2
     checkpoint_executor_workers: 2
     exclude_warmup_chunks_from_training: true
-    preload_checkpoint_path: /home/focal/shared_disk/users/kwj/RLinf/logs/20260703-05:14:40-realworld_piper_peginsertion_td3_rl_token_online/replay_buffer #实际为replay_buffer_path
+    # Do not preload the old online replay buffer here: its cached
+    # visual_latent rows are image_only (768 tokens). image_last_linear
+    # online training requires full-prefix features (768 image + last token).
+    preload_checkpoint_path: null
     cache_obs_keys:
       - visual_latent
       - states
@@ -204,7 +212,16 @@ actor:
 
   model:
     model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert"
-    rl_token_path: "/home/focal/shared_disk/users/kwj/weight/rltoken/pi05_charge_insert/10000"
+    # Co-train weights use image_last_linear compressed features instead
+    # of the old RL-token autoencoder, so no rl_token_path is needed.
+    rl_token_path: null
+    rl_token_source: "image_last_linear"
+    prefix_feature_type: "full_prefix"
+    num_image_tokens: 768
+    # Keep the compression linears loaded from the co-train checkpoint
+    # fixed online; the classifier was trained on this feature space.
+    actor_train_prefix_token_linear: false
+    critic_train_prefix_token_linear: false
     freeze_rl_token: True
     critic_train_rl_token_encoder: ${algorithm.critic_train_rl_token_encoder}
     critic_separate_rl_token_encoder: ${algorithm.critic_separate_rl_token_encoder}
@@ -234,8 +251,13 @@ actor:
     controlled_action_indices: [7, 8, 9, 10, 11, 12]
     num_action_chunks: 15
     num_steps: 5
+    # With intervention_classifier_path set, warmup mode uses the classifier
+    # probability to decide when the actor takes over from VLA control.
     rollout_control_mode: "warmup"
-    intervention_classifier_path: /home/focal/shared_disk/users/kwj/RLinf/logs/20260703-07:54:56-joint_offline_train_on_online122_residual_q010_new/intervention_classifier/best_intervention_classifier.pt
+    # Co-trained image_last_linear/full_prefix classifier checkpoint.
+    # Online gate consumes forward_inputs["rl_token"] (2048-D compressed actor token),
+    # so keep this paired with the same co-train actor checkpoint above.
+    intervention_classifier_path: /home/focal/shared_disk/users/kwj/RLinf/logs/20260708-09:53:32-realworld_charge_insert_offline/intervention_classifier/best_intervention_classifier.pt
     intervention_classifier_threshold: 0.8
     rollout_gate_mse_threshold: 9.0e-3
     rollout_gate_disable_mse_threshold: 1.2e-2

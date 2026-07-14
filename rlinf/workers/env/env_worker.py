@@ -874,6 +874,20 @@ class EnvWorker(Worker):
         self._rollout_gate_last_gripper_value = None
         self._rollout_gate_last_gripper_source = "none"
 
+    def _release_actor_gate_on_episode_end(self, dones) -> bool:
+        if not bool(getattr(self, "_rollout_gate_actor_enabled", False)):
+            return False
+        if dones is None:
+            return False
+        try:
+            episode_done = bool(torch.as_tensor(dones).bool().any().item())
+        except Exception:
+            return False
+        if not episode_done:
+            return False
+        self._reset_actor_gate()
+        return True
+
     def _should_force_vla_rollout(
         self,
         rollout_result: RolloutResult,
@@ -881,6 +895,13 @@ class EnvWorker(Worker):
         obs_source=None,
     ) -> bool:
         if self.rollout_control_mode == "warmup":
+            if bool(
+                getattr(self, "rollout_gate_reset_on_episode_start", True)
+            ) and chunk_step_idx <= int(
+                getattr(self, "_rollout_gate_last_chunk_step_idx", -1)
+            ):
+                self._reset_rollout_gate()
+            self._rollout_gate_last_chunk_step_idx = int(chunk_step_idx)
             if self._intervention_gate.enabled:
                 zrl = rollout_result.forward_inputs.get("rl_token", None)
                 if zrl is None:
@@ -895,7 +916,9 @@ class EnvWorker(Worker):
                     threshold=self.intervention_classifier_threshold,
                 )
                 self._last_intervention_gate_decision = decision
-                return not decision.actor_intervene
+                if decision.actor_intervene:
+                    self._rollout_gate_actor_enabled = True
+                return not bool(self._rollout_gate_actor_enabled)
             return (
                 self.vla_warmup_chunk_steps > 0
                 and chunk_step_idx < self.vla_warmup_chunk_steps
@@ -1992,6 +2015,7 @@ class EnvWorker(Worker):
                     env_output, env_info, online_forward_inputs = (
                         self.env_interact_step(exec_action, stage_id, curr_obs)
                     )
+                    self._release_actor_gate_on_episode_end(env_output.dones)
                     self._maybe_print_online_env_status(
                         rollout_result,
                         env_output,

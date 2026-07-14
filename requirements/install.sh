@@ -451,6 +451,28 @@ install_openvla_oft_model() {
     uv pip uninstall pynvml || true
 }
 
+install_piper_openpi_runtime_deps() {
+    # Piper runs OpenPI on Ubuntu 20.04. The shared uv overrides are used by
+    # other environments and can downgrade OpenPI's runtime requirements during
+    # the common sync, so repair the piper venv after installing OpenPI.
+    uv pip install --torch-backend cu126 \
+        "torch==2.7.1" \
+        "torchvision==0.22.1" \
+        "torchaudio==2.7.1" \
+        "torchcodec==0.2.1" \
+        "numpy==1.26.4" \
+        "fsspec==2025.3.0" \
+        "rich>=14.0.0" \
+        "swanlab>=0.8.4" \
+        "typeguard>=4.0.0"
+
+    # tensorflow-addons/tensorflow-graphics require typeguard<3 on Python 3.11,
+    # while OpenPI's tyro stack requires typeguard>=4. They are not used by the
+    # Piper runtime. flash-attn prebuilt torch2.7 wheels require GLIBC_2.32,
+    # which is newer than the Ubuntu 20.04 base image.
+    uv pip uninstall tensorflow-addons tensorflow-graphics flash-attn || true
+}
+
 install_openpi_model() {
     case "$ENV_NAME" in
         behavior)
@@ -518,7 +540,7 @@ install_openpi_model() {
             create_and_sync_venv
             install_common_embodied_deps
             uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/openpi
-            install_flash_attn
+            install_piper_openpi_runtime_deps
             # 安装 ROS Noetic
             if [ "$NO_ROOT" -eq 0 ]; then
                 bash $SCRIPT_DIR/embodied/ros_piper_install.sh
