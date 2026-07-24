@@ -20,7 +20,7 @@ import pickle as pkl
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -309,6 +309,7 @@ class TrajectoryReplayBuffer:
         # this enables each trajectory to be saved to or loaded from a separate file
         self._trajectory_file_path: dict[int, str] = {}
         self._trajectory_save_futures: dict[int, object] = {}
+        self._trajectory_transform: Optional[Callable[[Trajectory], Trajectory]] = None
 
         self._trajectory_counter = 0  # Next trajectory ID to use
         self._index_version = 0
@@ -352,6 +353,20 @@ class TrajectoryReplayBuffer:
         self.random_generator: Optional[torch.Generator] = None
 
         self._init_random_generator(self.seed)
+
+    def set_trajectory_transform(
+        self, transform: Optional[Callable[[Trajectory], Trajectory]]
+    ) -> None:
+        """Install an actor-local transform before trajectories are cached or saved."""
+        self._trajectory_transform = transform
+
+    def _transform_trajectory(self, trajectory: Trajectory) -> Trajectory:
+        if self._trajectory_transform is None:
+            return trajectory
+        transformed = self._trajectory_transform(trajectory)
+        if not isinstance(transformed, Trajectory):
+            raise TypeError("trajectory transform must return a Trajectory")
+        return transformed
 
     def _compute_mc_returns(self, trajectory: Trajectory) -> Optional[torch.Tensor]:
         rewards = getattr(trajectory, "rewards", None)
@@ -485,13 +500,16 @@ class TrajectoryReplayBuffer:
 
         trajectory_path = None
         file_deleted = False
+        owns_trajectory_file = self.auto_save and os.path.realpath(
+            base_dir
+        ) == os.path.realpath(self.auto_save_path)
         if self.auto_save and model_weights_id:
             trajectory_path = self._get_trajectory_path(
                 trajectory_id,
                 str(model_weights_id),
                 base_dir=base_dir,
             )
-            if os.path.exists(trajectory_path):
+            if owns_trajectory_file and os.path.exists(trajectory_path):
                 os.remove(trajectory_path)
                 file_deleted = True
 
@@ -686,8 +704,13 @@ class TrajectoryReplayBuffer:
     def _save_trajectory_index(self, save_path: Optional[str] = None):
         """Save trajectory index to disk."""
         with self._index_lock:
+            trajectory_index = copy.deepcopy(self._trajectory_index)
+            for trajectory_id, trajectory_info in trajectory_index.items():
+                file_path = self._trajectory_file_path.get(trajectory_id)
+                if file_path is not None:
+                    trajectory_info["file_path"] = str(file_path)
             index_data = {
-                "trajectory_index": copy.deepcopy(self._trajectory_index),
+                "trajectory_index": trajectory_index,
                 "trajectory_id_list": list(self._trajectory_id_list),
             }
             with open(self._get_trajectory_index_path(save_path), "w") as f:
@@ -754,7 +777,7 @@ class TrajectoryReplayBuffer:
             setattr(trajectory, field_name, value)
         self._ensure_mc_returns(trajectory)
 
-        return trajectory
+        return self._transform_trajectory(trajectory)
 
     def add_trajectories(self, trajectories: list[Trajectory]):
         """
@@ -770,6 +793,7 @@ class TrajectoryReplayBuffer:
 
         save_futures = []
         for trajectory in trajectories:
+            trajectory = self._transform_trajectory(trajectory)
             self._ensure_mc_returns(trajectory)
             model_weights_id = trajectory.model_weights_id
             trajectory_id = self._trajectory_counter
@@ -1936,7 +1960,9 @@ class TrajectoryReplayBuffer:
 
             # Update trajectory file path
             for trajectory_id in self._trajectory_id_list:
-                self._trajectory_file_path[trajectory_id] = load_path
+                self._trajectory_file_path[trajectory_id] = self._trajectory_index[
+                    trajectory_id
+                ].get("file_path", load_path)
 
             # Update size, total_samples, and trajectory_counter based on loaded portion
             self.size = len(self._trajectory_id_list)
@@ -1958,7 +1984,9 @@ class TrajectoryReplayBuffer:
             self._trajectory_index = full_trajectory_index
             self._trajectory_id_list = full_trajectory_id_list
             for trajectory_id in self._trajectory_id_list:
-                self._trajectory_file_path[trajectory_id] = load_path
+                self._trajectory_file_path[trajectory_id] = self._trajectory_index[
+                    trajectory_id
+                ].get("file_path", load_path)
             self.size = metadata.get("size", 0)
             self._total_samples = metadata.get("total_samples", 0)
             self._trajectory_counter = metadata.get("trajectory_counter", 0)

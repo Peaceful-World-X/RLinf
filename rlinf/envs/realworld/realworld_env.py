@@ -338,8 +338,9 @@ class RealWorldEnv(gym.Env):
             else chunk_actions.copy()
         )
         for env_idx, sub_env in enumerate(self.env.envs):
-            if hasattr(sub_env, "process_action_chunk"):
-                processed[env_idx] = sub_env.process_action_chunk(
+            unwrapped_env = sub_env.unwrapped
+            if hasattr(unwrapped_env, "process_action_chunk"):
+                processed[env_idx] = unwrapped_env.process_action_chunk(
                     chunk_actions[env_idx]
                 )
         chunk_actions = processed

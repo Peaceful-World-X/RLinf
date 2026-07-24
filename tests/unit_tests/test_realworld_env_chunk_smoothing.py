@@ -31,6 +31,7 @@ def _make_mock_realworld_env(num_envs=1):
     sub_env.process_action_chunk.side_effect = (
         lambda x: x * 0.9
     )  # returns modified array
+    sub_env.unwrapped = sub_env  # mimic gym.Env.unwrapped pointing to itself
 
     # Mock venv
     venv = MagicMock()

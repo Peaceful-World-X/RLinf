@@ -33,6 +33,7 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
+from rlinf.models.embodiment.openpi.rl_token_policy import REPLAY_EMBEDDING_KEYS
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.metric_utils import compute_split_num
@@ -43,6 +44,22 @@ from rlinf.utils.nested_dict_process import (
 )
 from rlinf.utils.offline_td3_visualization import SimpleUrdfKinematics
 from rlinf.utils.placement import HybridComponentPlacement
+
+
+def extract_replay_transition_features(
+    forward_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Return compact replay features required by TD3 transition observations."""
+    if all(key in forward_inputs for key in REPLAY_EMBEDDING_KEYS):
+        features = {key: forward_inputs[key] for key in REPLAY_EMBEDDING_KEYS}
+    elif forward_inputs.get("visual_latent", None) is not None:
+        features = {"visual_latent": forward_inputs["visual_latent"]}
+    else:
+        return {}
+    ref_action = forward_inputs.get("ref_action", None)
+    if ref_action is not None:
+        features["ref_action"] = ref_action
+    return features
 
 
 class EnvWorker(Worker):
@@ -1966,7 +1983,7 @@ class EnvWorker(Worker):
         ]
         pending_transition: list = [
             None
-        ] * self.stage_num  # (curr_obs, next_obs) waiting for next visual_latent
+        ] * self.stage_num  # (curr_obs, next_obs) waiting for next replay features
         env_metrics = defaultdict(list)
 
         for epoch in range(self.rollout_epoch):
@@ -2117,22 +2134,15 @@ class EnvWorker(Worker):
                             if env_output.dones.any() and self.cfg.env.train.auto_reset
                             else env_output.obs
                         )
-                        visual_latent = rollout_result.forward_inputs.get(
-                            "visual_latent", None
+                        replay_features = extract_replay_transition_features(
+                            rollout_result.forward_inputs
                         )
-                        ref_action = rollout_result.forward_inputs.get(
-                            "ref_action", None
-                        )
-                        if visual_latent is not None:
-                            curr_obs["visual_latent"] = visual_latent
-                            if ref_action is not None:
-                                curr_obs["ref_action"] = ref_action
-                            # flush pending transition: fill next_obs with curr step's latents
+                        if replay_features:
+                            curr_obs.update(replay_features)
+                            # Flush pending transition with this step's replay features.
                             if pending_transition[stage_id] is not None:
                                 p_curr, p_next = pending_transition[stage_id]
-                                p_next["visual_latent"] = visual_latent
-                                if ref_action is not None:
-                                    p_next["ref_action"] = ref_action
+                                p_next.update(replay_features)
                                 self.rollout_results[stage_id].append_transitions(
                                     p_curr, p_next
                                 )
@@ -2176,14 +2186,11 @@ class EnvWorker(Worker):
                     and pending_transition[stage_id] is not None
                 ):
                     p_curr, p_next = pending_transition[stage_id]
-                    visual_latent = rollout_result.forward_inputs.get(
-                        "visual_latent", None
+                    replay_features = extract_replay_transition_features(
+                        rollout_result.forward_inputs
                     )
-                    ref_action = rollout_result.forward_inputs.get("ref_action", None)
-                    if visual_latent is not None:
-                        p_next["visual_latent"] = visual_latent
-                        if ref_action is not None:
-                            p_next["ref_action"] = ref_action
+                    if replay_features:
+                        p_next.update(replay_features)
                         self.rollout_results[stage_id].append_transitions(
                             p_curr, p_next
                         )

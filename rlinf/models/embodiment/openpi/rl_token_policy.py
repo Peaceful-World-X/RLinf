@@ -32,6 +32,15 @@ from rlinf.models.embodiment.openpi.rl_token.rl_token import (
     reconstruction_loss,
 )
 
+REPLAY_ACTOR_TOKEN_KEY = "actor_rl_token"
+REPLAY_CRITIC_TOKEN_1_KEY = "critic_rl_token_1"
+REPLAY_CRITIC_TOKEN_2_KEY = "critic_rl_token_2"
+REPLAY_EMBEDDING_KEYS = (
+    REPLAY_ACTOR_TOKEN_KEY,
+    REPLAY_CRITIC_TOKEN_1_KEY,
+    REPLAY_CRITIC_TOKEN_2_KEY,
+)
+
 
 @dataclasses.dataclass
 class OpenPiRLTokenConfig:
@@ -60,6 +69,7 @@ class OpenPiRLTokenConfig:
     rl_token_source: str = "autoencoder"
     actor_train_prefix_token_linear: bool = False
     critic_train_prefix_token_linear: bool = False
+    replay_embedding_mode: str = "full_prefix"
     robot_state_dim: int = 14  # proprioception dimension (s_p)
     actor_head_type: str = "mlp"
     actor_hidden_dims: tuple = (512, 256)
@@ -406,6 +416,16 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         self.rl_token_source = str(
             getattr(config, "rl_token_source", "autoencoder")
         ).lower()
+        self.replay_embedding_mode = str(
+            getattr(config, "replay_embedding_mode", "full_prefix")
+        ).lower()
+        if self.replay_embedding_mode not in {
+            "full_prefix",
+            "frozen_image_last_linear",
+        }:
+            raise ValueError(
+                f"Unsupported replay_embedding_mode: {self.replay_embedding_mode}"
+            )
         if self.rl_token_source not in {
             "autoencoder",
             "last_token",
@@ -828,7 +848,12 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         prefix_output, _, _ = self._build_prefix_cache_from_obs(obs)
         features = self._select_token_features(prefix_output)
         visual_latent = self._select_prefix_features(prefix_output)
-        rl_token = self._encode_actor_token(features, use_target=False)
+        replay_embeddings = None
+        if self.replay_embedding_mode == "frozen_image_last_linear":
+            replay_embeddings = self._encode_replay_embeddings_from_features(features)
+            rl_token = replay_embeddings[REPLAY_ACTOR_TOKEN_KEY]
+        else:
+            rl_token = self._encode_actor_token(features, use_target=False)
         robot_state = obs.get("states", obs.get("robot_state", None))
         if robot_state is not None and not isinstance(robot_state, torch.Tensor):
             robot_state = torch.tensor(robot_state, dtype=torch.float32)
@@ -890,12 +915,17 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             "model_action": flat_actions,
             "actor_action": flat_actions,
             "env_action_absolute": env_actions.reshape(env_actions.shape[0], -1).cpu(),
-            "visual_latent": visual_latent.cpu(),
             "rl_token": rl_token.detach().cpu(),
             "ref_action": ref_flat.cpu(),
             "actor_ref_mse": actor_ref_mse.cpu(),
             "rollout_control_source": rollout_source.cpu(),
         }
+        if self.replay_embedding_mode == "frozen_image_last_linear":
+            forward_inputs.update(
+                {key: value.detach().cpu() for key, value in replay_embeddings.items()}
+            )
+        else:
+            forward_inputs["visual_latent"] = visual_latent.cpu()
         if ref_env_action is not None:
             forward_inputs["ref_env_action_absolute"] = ref_env_action.reshape(
                 ref_env_action.shape[0], -1
@@ -940,15 +970,16 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         # The TD3 worker calls this method on ``self.target_model``. That module's
         # ordinary heads already contain EMA target weights, so using the internal
         # target_* heads here would apply a second, stale target path.
-        prefix_output = self._extract_prefix_from_visual_feat(visual_feat)
-        features = self._select_token_features(prefix_output)
-        rl_token = self._encode_actor_token(features, use_target=False)
+        replay_embeddings, features = self._resolve_replay_embeddings(
+            visual_feat, use_target=False
+        )
+        rl_token = replay_embeddings[REPLAY_ACTOR_TOKEN_KEY]
         ref_action_for_actor, ref_action_mask = self._maybe_mask_ref_action(
             ref_action, float(ref_action_dropout_p)
         )
         x = self._build_x(rl_token, robot_state, ref_action_for_actor, ref_action_mask)
         actions = self._decode_action(x, use_target=False)
-        critic_rl_token = self._encode_critic_tokens(features, use_target=False)
+        critic_rl_token = self._critic_tokens_from_replay_embeddings(replay_embeddings)
         critic_state = self._build_critic_states(
             critic_rl_token, robot_state, ref_action
         )
@@ -1021,15 +1052,16 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         compute_recon_loss: bool = False,
         **kwargs,
     ):
-        prefix_output = self._extract_prefix_from_visual_feat(visual_feat)
-        features = self._select_token_features(prefix_output)
-        rl_token = self._encode_actor_token(features, use_target=use_target)
+        replay_embeddings, features = self._resolve_replay_embeddings(
+            visual_feat, use_target=use_target
+        )
+        rl_token = replay_embeddings[REPLAY_ACTOR_TOKEN_KEY]
         ref_action_for_actor, ref_action_mask = self._maybe_mask_ref_action(
             ref_action, float(ref_action_dropout_p)
         )
         x = self._build_x(rl_token, robot_state, ref_action_for_actor, ref_action_mask)
         actions = self._decode_action(x, use_target=use_target)
-        critic_rl_token = self._encode_critic_tokens(features, use_target=use_target)
+        critic_rl_token = self._critic_tokens_from_replay_embeddings(replay_embeddings)
         critic_state = self._build_critic_states(
             critic_rl_token, robot_state, ref_action
         )
@@ -1038,10 +1070,15 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             "critic_rl_state": critic_state,
             "rl_token": rl_token,
             "critic_rl_token": critic_rl_token,
-            "prefix_output": features,
             "actor_ref_action_mask": ref_action_mask,
         }
+        if features is not None:
+            aux["prefix_output"] = features
         if compute_recon_loss:
+            if features is None:
+                raise ValueError(
+                    "compute_recon_loss is unavailable for precomputed replay embeddings"
+                )
             if self.rl_token_source != "autoencoder":
                 raise ValueError(
                     "compute_recon_loss is only supported with "
@@ -1190,6 +1227,59 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         if self.config.prefix_feature_type == "image_only":
             return prefix_output[:, : self.config.num_image_tokens, :]
         return prefix_output  # "full_prefix"
+
+    def _encode_replay_embeddings_from_features(
+        self, features: Tensor, use_target: bool = False
+    ) -> dict[str, Tensor]:
+        actor_token = self._encode_actor_token(features, use_target=use_target)
+        critic_tokens = self._encode_critic_tokens(features, use_target=use_target)
+        if isinstance(critic_tokens, tuple):
+            critic_token_1, critic_token_2 = critic_tokens
+        else:
+            critic_token_1 = critic_tokens
+            critic_token_2 = critic_tokens
+        return {
+            REPLAY_ACTOR_TOKEN_KEY: actor_token,
+            REPLAY_CRITIC_TOKEN_1_KEY: critic_token_1,
+            REPLAY_CRITIC_TOKEN_2_KEY: critic_token_2,
+        }
+
+    def encode_replay_embeddings(
+        self, prefix_output: Tensor, use_target: bool = False
+    ) -> dict[str, Tensor]:
+        features = self._select_token_features(prefix_output)
+        return self._encode_replay_embeddings_from_features(
+            features, use_target=use_target
+        )
+
+    def _critic_tokens_from_replay_embeddings(
+        self, replay_embeddings: dict[str, Tensor]
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        if self.rl_token_source == "image_last_linear":
+            return (
+                replay_embeddings[REPLAY_CRITIC_TOKEN_1_KEY],
+                replay_embeddings[REPLAY_CRITIC_TOKEN_2_KEY],
+            )
+        return replay_embeddings[REPLAY_CRITIC_TOKEN_1_KEY]
+
+    def _resolve_replay_embeddings(
+        self, visual_feat, use_target: bool = False
+    ) -> tuple[dict[str, Tensor], Tensor | None]:
+        if isinstance(visual_feat, dict) and all(
+            key in visual_feat for key in REPLAY_EMBEDDING_KEYS
+        ):
+            return (
+                {key: visual_feat[key] for key in REPLAY_EMBEDDING_KEYS},
+                None,
+            )
+        prefix_output = self._extract_prefix_from_visual_feat(visual_feat)
+        features = self._select_token_features(prefix_output)
+        return (
+            self._encode_replay_embeddings_from_features(
+                features, use_target=use_target
+            ),
+            features,
+        )
 
     def _select_token_features(self, prefix_output: Tensor) -> Tensor:
         if self.rl_token_source == "autoencoder":

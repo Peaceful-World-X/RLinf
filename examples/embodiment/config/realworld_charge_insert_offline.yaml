@@ -19,10 +19,29 @@ openrlt:
   enabled: true
   config: offline_train_on_online122_residual_q010_new_image_last_linear
   output_subdir: openrlt
-  extra_args: []
+  extra_args:
+    - --data-dir
+    - /home/focal/shared_disk/users/kwj/RLinf/logs/20260723-combined-realworld-piper-cubeinsert-demos/demos
+    - --feature-cache
+    - /home/focal/shared_disk/users/kwj/RLinf/logs/20260723-combined-realworld-piper-cubeinsert-demos/online_prefix_tokens_image_last_linear.pt
+    - --feature-cache-task-description
+    - install the connecting rod
+    - --model-path
+    - /home/focal/shared_disk/users/kwj/weight/openpi/pi05_install_connecting_rod
+    - --norm-stats-path
+    - /home/focal/shared_disk/users/kwj/weight/openpi/pi05_install_connecting_rod/norm_stats.json
 
 classifier:
   enabled: true
   config: intervention_classifier_online122_residual_q010_new
   output_subdir: intervention_classifier
-  extra_args: []
+  extra_args:
+    - --train-data-dirs
+    - /home/focal/shared_disk/users/kwj/RLinf/logs/20260723-07:19:23-realworld_piper_cubeinsert_pi05_eval_with_reward/demos
+    - /home/focal/shared_disk/users/kwj/RLinf/logs/20260723-07:57:30-realworld_piper_cubeinsert_pi05_eval_with_reward/demos
+    - --feature-cache-task-description
+    - install the connecting rod
+    - --model-path
+    - /home/focal/shared_disk/users/kwj/weight/openpi/pi05_install_connecting_rod
+    - --norm-stats-path
+    - /home/focal/shared_disk/users/kwj/weight/openpi/pi05_install_connecting_rod/norm_stats.json

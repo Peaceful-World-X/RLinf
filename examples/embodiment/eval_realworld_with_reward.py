@@ -254,9 +254,9 @@ def wait_for_rollout_start_or_delete(
         flush=True,
     )
     while True:
-        key = keyboard.consume_any_press(("Key.enter", delete_key), include_held=False)
-        if key == "Key.enter":
+        if keyboard.consume_press("Key.enter"):
             return saved
+        key = keyboard.consume_any_press((delete_key,), include_held=False)
         if key == delete_key:
             saved = maybe_delete_last_saved_rollout(
                 keyboard=keyboard,
@@ -347,6 +347,25 @@ class EvalWithRewardCollector(Worker):
         while not self._keyboard.consume_press("Key.enter"):
             time.sleep(0.05)
 
+    def _smooth_chunk_actions(self, chunk_actions):
+        """Apply each sub-env's process_action_chunk (Butterworth smoothing +
+        sliding-window boundary blend) to the whole chunk, mirroring
+        RealWorldEnv.chunk_step's pre-processing (realworld_env.py:335-345),
+        before the actions are executed step-by-step.
+        """
+        processed = (
+            chunk_actions.clone()
+            if isinstance(chunk_actions, torch.Tensor)
+            else chunk_actions.copy()
+        )
+        for env_idx, sub_env in enumerate(self.env.env.envs):
+            unwrapped_env = sub_env.unwrapped
+            if hasattr(unwrapped_env, "process_action_chunk"):
+                processed[env_idx] = unwrapped_env.process_action_chunk(
+                    chunk_actions[env_idx]
+                )
+        return processed
+
     def _execute_action_chunk(self, chunk_actions):
         eval_cfg = self.cfg.env.eval
         break_after_intervention = (
@@ -356,6 +375,8 @@ class EvalWithRewardCollector(Worker):
         )
         if not break_after_intervention:
             return self.env.chunk_step(chunk_actions)
+
+        chunk_actions = self._smooth_chunk_actions(chunk_actions)
 
         obs_list = []
         infos_list = []

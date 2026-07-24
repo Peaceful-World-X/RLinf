@@ -1,7 +1,8 @@
 # Online TD3 config for GigaCL charge-insert weights.
-# Loads actor/critic from the joint offline run and uses the offline-trained
-# intervention classifier. Prefix-token compression layers are loaded from the
-# checkpoint but frozen during real-world RL.
+# Loads actor/critic from the joint offline run. The intervention classifier is
+# disabled; VLA controls the first 20 chunks, then the actor controls rollout.
+# Prefix-token compression layers are loaded from the checkpoint but frozen
+# during real-world RL.
 #
 # Usage:
 #   bash examples/embodiment/run_piper_online_td3.sh realworld_piper_gigacl_charge_insert_online
@@ -45,8 +46,8 @@ runner:
   reset_global_step_on_resume: True
   load_optimizer_on_actor_critic_resume: False
   log_interval: 20
-  weight_sync_interval: 10
-  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/logs/20260707-11:27:20-realworld_charge_insert_offline/openrlt/checkpoints/final" #更改为第二阶段离线训练的checkpoint路径
+  weight_sync_interval: 50
+  resume_dir: "/home/focal/shared_disk/users/kwj/RLinf/logs/20260723-10:11:47-realworld_charge_insert_offline/openrlt/checkpoints/global_step_1000"
   ckpt_path: null
 
 algorithm:
@@ -109,9 +110,11 @@ algorithm:
     save_executor_workers: 2
     checkpoint_executor_workers: 2
     exclude_warmup_chunks_from_training: true
-    preload_checkpoint_path: null #实际为replay_buffer_path
+    preload_checkpoint_path: /home/focal/shared_disk/users/kwj/RLinf/logs/20260724-10:20:52-realworld_piper_gigacl_charge_insert_online/replay_buffer/rank_0 #实际为replay_buffer_path
     cache_obs_keys:
-      - visual_latent
+      - actor_rl_token
+      - critic_rl_token_1
+      - critic_rl_token_2
       - states
       - robot_state
       - ref_action
@@ -183,8 +186,8 @@ rollout:
   pipeline_stage_num: 1
   collect_transitions: true
   collect_prev_infos: false
-  warm_up_chunk_steps: 16
-  vla_warmup_chunk_steps: 16
+  warm_up_chunk_steps: 20
+  vla_warmup_chunk_steps: 20
   online_control:
     save_substep_obs: true
     print_status: true
@@ -205,7 +208,7 @@ actor:
   recv_drain_max_trajectories: 64
 
   model:
-    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert" #更改路径
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_install_connecting_rod" #更改路径
     rl_token_path: null
     freeze_rl_token: True
     critic_train_rl_token_encoder: ${algorithm.critic_train_rl_token_encoder}
@@ -216,6 +219,8 @@ actor:
     actor_head_type: "openrlt_mlp"
     critic_head_type: "openrlt_mlp"
     rl_token_source: "image_last_linear"
+    replay_embedding_mode: "frozen_image_last_linear"
+    replay_embedding_batch_size: 8
     prefix_feature_type: "full_prefix"
     num_image_tokens: 768
     actor_train_prefix_token_linear: False
@@ -231,7 +236,7 @@ actor:
     actor_residual_ref: True
     actor_residual_scale: 1.0
     action_space: "normalized_delta"
-    action_norm_stats_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert/norm_stats.json" #更改路径
+    action_norm_stats_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_install_connecting_rod/norm_stats.json" #更改路径
     action_norm_std_floor: 1.0
     # Actor/critic train only the right arm; rollout still executes full 14D
     # absolute Piper actions by keeping the left arm on the VLA reference action.

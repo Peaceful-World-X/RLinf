@@ -60,6 +60,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             critic_train_prefix_token_linear=cfg.get(
                 "critic_train_prefix_token_linear", False
             ),
+            replay_embedding_mode=cfg.get("replay_embedding_mode", "full_prefix"),
             robot_state_dim=cfg.get("robot_state_dim", 14),
             actor_head_type=cfg.get("actor_head_type", "mlp"),
             actor_hidden_dims=tuple(cfg.get("actor_hidden_dims", [512, 256])),
@@ -121,6 +122,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             critic_train_prefix_token_linear=cfg.get(
                 "critic_train_prefix_token_linear", False
             ),
+            replay_embedding_mode=cfg.get("replay_embedding_mode", "full_prefix"),
             robot_state_dim=cfg.get("robot_state_dim", 14),
             actor_head_type=cfg.get("actor_head_type", "mlp"),
             actor_hidden_dims=tuple(cfg.get("actor_hidden_dims", [512, 256])),

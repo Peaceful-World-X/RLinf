@@ -148,6 +148,15 @@ class _FakeKeyboard:
         self.key = key
         self.keys = list(keys or [])
 
+    def consume_press(self, key):
+        if self.keys and self.keys[0] == key:
+            self.keys.pop(0)
+            return True
+        if self.key == key:
+            self.key = None
+            return True
+        return False
+
     def consume_any_press(self, keys, *, include_held=True):
         if self.keys:
             key = self.keys.pop(0)
@@ -159,6 +168,18 @@ class _FakeKeyboard:
             self.key = None
             return key
         return None
+
+
+class _LegacyEnterKeyboard:
+    def __init__(self):
+        self.consume_press_calls = []
+
+    def consume_press(self, key):
+        self.consume_press_calls.append(key)
+        return True
+
+    def consume_any_press(self, keys, *, include_held=True):
+        raise AssertionError("Enter must be consumed through consume_press")
 
 
 class _FakeBuffer:
@@ -263,3 +284,21 @@ def test_wait_for_rollout_start_handles_delete_before_enter():
     assert saved == 2
     assert progress_bar.n == 2
     assert "deleted trajectory_id=2" in logger.messages[0]
+
+
+def test_wait_for_rollout_start_uses_legacy_enter_consumption():
+    keyboard = _LegacyEnterKeyboard()
+
+    saved = wait_for_rollout_start_or_delete(
+        keyboard=keyboard,
+        buffer=_FakeBuffer({"deleted": False}),
+        saved=0,
+        progress_bar=_FakeProgressBar(),
+        log_fn=lambda message: None,
+        total_rollouts=1,
+        sleep_fn=lambda _: None,
+        prompt_fn=lambda *args, **kwargs: None,
+    )
+
+    assert saved == 0
+    assert keyboard.consume_press_calls == ["Key.enter"]

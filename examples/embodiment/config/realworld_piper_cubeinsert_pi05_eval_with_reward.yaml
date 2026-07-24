@@ -160,7 +160,7 @@ actor:
   enable_offload: false
 
   model:
-    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_charge_insert" #更改路径
+    model_path: "/home/focal/shared_disk/users/kwj/weight/openpi/pi05_install_connecting_rod" #更改路径
     num_action_chunks: 15
     action_dim: 14
     add_value_head: false

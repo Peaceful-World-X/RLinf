@@ -1,9 +1,16 @@
+# Copyright 2026 The GIGA Authors.
+#
 """Smoke test for OpenPiRLTokenPolicy — no GPU, no environment, no real PI0 weights."""
+
+import copy
 
 import torch
 
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.openpi.rl_token_policy import (
+    REPLAY_ACTOR_TOKEN_KEY,
+    REPLAY_CRITIC_TOKEN_1_KEY,
+    REPLAY_CRITIC_TOKEN_2_KEY,
     OpenPiRLTokenConfig,
     OpenPiRLTokenPolicy,
 )
@@ -217,6 +224,109 @@ def test_image_last_linear_initializes_to_last_token():
     )
     assert q1.shape == (B, 1)
     assert q2.shape == (B, 1)
+
+
+def test_precomputed_replay_embeddings_match_full_prefix_td3_forward():
+    policy = _make_direct_token_policy("image_last_linear")
+    policy.eval()
+    with torch.no_grad():
+        policy.actor_prefix_token_linear.weight.normal_()
+        policy.critic_prefix_token_linear_1.weight.normal_()
+        policy.critic_prefix_token_linear_2.weight.normal_()
+
+    prefix = torch.randn(B, L, HIDDEN_DIM)
+    robot_state = torch.randn(B, ROBOT_STATE_DIM)
+    ref_action = torch.randn(B, ACTION_HORIZON, ACTION_DIM)
+
+    with torch.no_grad():
+        full_actions, full_aux = policy.td3_forward(
+            mode="actor",
+            visual_feat=prefix,
+            robot_state=robot_state,
+            ref_action=ref_action,
+        )
+        embeddings = policy.encode_replay_embeddings(prefix)
+        cached_actions, cached_aux = policy.td3_forward(
+            mode="actor",
+            visual_feat=embeddings,
+            robot_state=robot_state,
+            ref_action=ref_action,
+        )
+
+        full_q = policy.td3_forward(
+            mode="critic",
+            rl_state=full_aux["critic_rl_state"],
+            action=full_actions,
+        )
+        cached_q = policy.td3_forward(
+            mode="critic",
+            rl_state=cached_aux["critic_rl_state"],
+            action=cached_actions,
+        )
+
+    assert set(embeddings) == {
+        REPLAY_ACTOR_TOKEN_KEY,
+        REPLAY_CRITIC_TOKEN_1_KEY,
+        REPLAY_CRITIC_TOKEN_2_KEY,
+    }
+    assert torch.allclose(cached_actions, full_actions)
+    assert torch.allclose(cached_aux["rl_token"], full_aux["rl_token"])
+    assert isinstance(cached_aux["critic_rl_state"], tuple)
+    for cached_state, full_state in zip(
+        cached_aux["critic_rl_state"], full_aux["critic_rl_state"], strict=True
+    ):
+        assert torch.allclose(cached_state, full_state)
+    for cached_value, full_value in zip(cached_q, full_q, strict=True):
+        assert torch.allclose(cached_value, full_value)
+
+
+def test_precomputed_replay_embeddings_match_target_td3_forward():
+    online_policy = _make_direct_token_policy("image_last_linear")
+    target_policy = copy.deepcopy(online_policy)
+    online_policy.eval()
+    target_policy.eval()
+    prefix = torch.randn(B, L, HIDDEN_DIM)
+    robot_state = torch.randn(B, ROBOT_STATE_DIM)
+    ref_action = torch.randn(B, ACTION_HORIZON, ACTION_DIM)
+
+    with torch.no_grad():
+        replay_embeddings = online_policy.encode_replay_embeddings(prefix)
+        full_actions, full_aux = target_policy.target_actor_forward(
+            visual_feat=prefix,
+            robot_state=robot_state,
+            ref_action=ref_action,
+        )
+        cached_actions, cached_aux = target_policy.target_actor_forward(
+            visual_feat=replay_embeddings,
+            robot_state=robot_state,
+            ref_action=ref_action,
+        )
+
+    assert torch.allclose(cached_actions, full_actions)
+    for cached_state, full_state in zip(
+        cached_aux["critic_rl_state"], full_aux["critic_rl_state"], strict=True
+    ):
+        assert torch.allclose(cached_state, full_state)
+
+
+def test_compressed_replay_rollout_omits_full_prefix():
+    policy = _make_direct_token_policy("image_last_linear")
+    policy.eval()
+    policy.replay_embedding_mode = "frozen_image_last_linear"
+    prefix = torch.randn(B, L, HIDDEN_DIM)
+    policy._build_prefix_cache_from_obs = lambda obs: (prefix, None, None)
+
+    _, result = policy.predict_action_batch(
+        env_obs={"states": torch.randn(B, ROBOT_STATE_DIM)}
+    )
+
+    forward_inputs = result["forward_inputs"]
+    assert "visual_latent" not in forward_inputs
+    assert {
+        REPLAY_ACTOR_TOKEN_KEY,
+        REPLAY_CRITIC_TOKEN_1_KEY,
+        REPLAY_CRITIC_TOKEN_2_KEY,
+    }.issubset(forward_inputs)
 
 
 def test_prefix_token_linear_train_flags_are_respected():

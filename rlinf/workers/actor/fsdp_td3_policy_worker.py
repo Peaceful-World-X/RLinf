@@ -20,6 +20,7 @@ dual critics, policy delay, no entropy temperature).
 
 import json
 import os
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -35,6 +36,7 @@ from rlinf.data.embodied_buffer_dataset import (
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
+from rlinf.models.embodiment.openpi.rl_token_policy import REPLAY_EMBEDDING_KEYS
 from rlinf.scheduler import Channel, Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
@@ -65,6 +67,44 @@ from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
+def compress_trajectory_replay_embeddings(
+    trajectory: Trajectory,
+    encode_fn: Callable[[torch.Tensor], dict[str, torch.Tensor]],
+    *,
+    batch_size: int,
+) -> Trajectory:
+    """Replace full-prefix replay tensors with frozen actor/critic embeddings."""
+
+    def compress_obs(obs: dict[str, object]) -> None:
+        visual_latent = obs.pop("visual_latent", None)
+        if visual_latent is None:
+            return
+        if not torch.is_tensor(visual_latent) or visual_latent.dim() < 3:
+            raise ValueError(
+                "visual_latent must have leading sample dimensions plus [tokens, hidden]"
+            )
+        leading_shape = visual_latent.shape[:-2]
+        flat_prefix = visual_latent.reshape(-1, *visual_latent.shape[-2:])
+        encoded_parts = {key: [] for key in REPLAY_EMBEDDING_KEYS}
+        for prefix_batch in flat_prefix.split(max(1, int(batch_size)), dim=0):
+            encoded = encode_fn(prefix_batch)
+            if set(encoded) != set(REPLAY_EMBEDDING_KEYS):
+                raise ValueError("encoder returned an incomplete replay embedding set")
+            for key in REPLAY_EMBEDDING_KEYS:
+                encoded_parts[key].append(encoded[key].detach().cpu())
+        for key, parts in encoded_parts.items():
+            obs[key] = torch.cat(parts, dim=0).reshape(*leading_shape, -1).contiguous()
+
+    if trajectory.curr_obs:
+        compress_obs(trajectory.curr_obs)
+    if trajectory.next_obs:
+        compress_obs(trajectory.next_obs)
+    if trajectory.forward_inputs:
+        for key in ("visual_latent", "rl_token", *REPLAY_EMBEDDING_KEYS):
+            trajectory.forward_inputs.pop(key, None)
+    return trajectory
+
+
 class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
@@ -78,6 +118,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         self._replay_delete_keyboard = None
         self._replay_delete_key = "d"
         self._replay_delete_enabled = False
+        self._deferred_preload_checkpoint_path = None
 
     # ------------------------------------------------------------------
     # Initialization
@@ -160,6 +201,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         )
 
     def setup_td3_components(self):
+        self._validate_compressed_replay_config()
         seed = self.cfg.actor.get("seed", 1234)
         auto_save_path = self.cfg.algorithm.replay_buffer.get("auto_save_path", None)
         if auto_save_path is None:
@@ -195,6 +237,16 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             ),
         )
         self.replay_buffer.mc_return_gamma = float(self.cfg.algorithm.gamma)
+        if self._compressed_replay_enabled:
+            self.replay_buffer.set_trajectory_transform(
+                lambda trajectory: compress_trajectory_replay_embeddings(
+                    trajectory,
+                    self._encode_replay_embeddings,
+                    batch_size=int(
+                        self.cfg.actor.model.get("replay_embedding_batch_size", 8)
+                    ),
+                )
+            )
         if hasattr(self.replay_buffer, "set_n_step"):
             self.replay_buffer.set_n_step(
                 int(self.cfg.algorithm.get("n_step", 1)),
@@ -205,18 +257,12 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             "preload_checkpoint_path", None
         )
         if preload_checkpoint_path:
-            preload_checkpoint_path = str(preload_checkpoint_path)
-            rank_path = os.path.join(preload_checkpoint_path, f"rank_{self._rank}")
-            if os.path.isdir(rank_path):
-                preload_checkpoint_path = rank_path
-            self.replay_buffer.load_checkpoint(preload_checkpoint_path)
-            self.log_on_first_rank(
-                "Preloaded replay buffer from {}: trajectories={} samples={}".format(
-                    preload_checkpoint_path,
-                    len(self.replay_buffer),
-                    int(getattr(self.replay_buffer, "total_samples", 0)),
-                )
-            )
+            if self._compressed_replay_enabled and self.cfg.runner.get(
+                "resume_dir", None
+            ):
+                self._deferred_preload_checkpoint_path = str(preload_checkpoint_path)
+            else:
+                self._load_preloaded_replay_checkpoint(str(preload_checkpoint_path))
         self._setup_replay_delete_keyboard()
 
         min_demo_buffer_size = 0
@@ -276,6 +322,77 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         )
         self.td3_algorithm.set_action_horizon(action_horizon)
         self.target_update_type = self.cfg.algorithm.get("target_update_type", "all")
+
+    def _validate_compressed_replay_config(self) -> None:
+        mode = str(
+            self.cfg.actor.model.get("replay_embedding_mode", "full_prefix")
+        ).lower()
+        self._compressed_replay_enabled = mode == "frozen_image_last_linear"
+        if mode == "full_prefix":
+            return
+        if mode != "frozen_image_last_linear":
+            raise ValueError(f"Unsupported replay_embedding_mode: {mode}")
+        if str(self.cfg.actor.model.get("rl_token_source", "")).lower() != (
+            "image_last_linear"
+        ):
+            raise ValueError(
+                "Compressed replay requires rl_token_source='image_last_linear'"
+            )
+        if bool(self.cfg.actor.model.get("actor_train_prefix_token_linear", False)):
+            raise ValueError(
+                "Compressed replay requires frozen actor prefix projection"
+            )
+        if bool(self.cfg.actor.model.get("critic_train_prefix_token_linear", False)):
+            raise ValueError(
+                "Compressed replay requires frozen critic prefix projections"
+            )
+        if bool(self.cfg.algorithm.get("critic_train_representation", False)):
+            raise ValueError(
+                "Compressed replay requires critic_train_representation=false"
+            )
+
+    def _encode_replay_embeddings(
+        self, prefix_batch: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        policy = getattr(self.model, "module", self.model)
+        with torch.no_grad():
+            encoded = policy.encode_replay_embeddings(
+                prefix_batch.to(self.device, non_blocking=True)
+            )
+        return {key: value.detach().cpu() for key, value in encoded.items()}
+
+    def _load_preloaded_replay_checkpoint(self, preload_checkpoint_path: str) -> None:
+        rank_path = os.path.join(preload_checkpoint_path, f"rank_{self._rank}")
+        if os.path.isdir(rank_path):
+            preload_checkpoint_path = rank_path
+        self.replay_buffer.load_checkpoint(preload_checkpoint_path)
+        self.log_on_first_rank(
+            "Preloaded replay buffer from {}: trajectories={} samples={}".format(
+                preload_checkpoint_path,
+                len(self.replay_buffer),
+                int(getattr(self.replay_buffer, "total_samples", 0)),
+            )
+        )
+
+    def _load_deferred_preload_replay_checkpoint(self) -> None:
+        preload_checkpoint_path = getattr(
+            self, "_deferred_preload_checkpoint_path", None
+        )
+        if preload_checkpoint_path is None:
+            return
+        self._deferred_preload_checkpoint_path = None
+        self._load_preloaded_replay_checkpoint(preload_checkpoint_path)
+
+    def _sync_target_replay_projections_from_online(self) -> None:
+        if not getattr(self, "_compressed_replay_enabled", False):
+            return
+        projection_prefixes = (
+            "actor_prefix_token_linear.",
+            "critic_prefix_token_linear_1.",
+            "critic_prefix_token_linear_2.",
+        )
+        projection_state = self._filtered_named_tensors(self.model, projection_prefixes)
+        self._load_filtered_named_tensors(self.target_model, projection_state)
 
     def _configure_replay_buffer_sample_filter(self):
         if not hasattr(self.replay_buffer, "set_sample_forward_input_filter"):
@@ -1075,9 +1192,19 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
     def _save_actor_critic_checkpoint(self, save_base_path, step):
         os.makedirs(save_base_path, exist_ok=True)
         online_prefixes = ["actor_head.", "critic_head_1.", "critic_head_2."]
-        if bool(self.cfg.actor.model.get("actor_train_prefix_token_linear", False)):
+        compressed_replay = (
+            str(
+                self.cfg.actor.model.get("replay_embedding_mode", "full_prefix")
+            ).lower()
+            == "frozen_image_last_linear"
+        )
+        if compressed_replay or bool(
+            self.cfg.actor.model.get("actor_train_prefix_token_linear", False)
+        ):
             online_prefixes.insert(0, "actor_prefix_token_linear.")
-        if bool(self.cfg.actor.model.get("critic_train_prefix_token_linear", False)):
+        if compressed_replay or bool(
+            self.cfg.actor.model.get("critic_train_prefix_token_linear", False)
+        ):
             online_prefixes.insert(0, "critic_prefix_token_linear_2.")
             online_prefixes.insert(0, "critic_prefix_token_linear_1.")
         if bool(self.cfg.algorithm.get("critic_train_rl_token_encoder", False)):
@@ -1107,9 +1234,10 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             if self.qf_lr_scheduler is not None
             else None,
             "notes": (
-                "Contains only actor_head and critic_head_* weights plus optimizer "
-                "state. target_model stores EMA copies under the same head names. "
-                "VLA backbone and RL token autoencoder are intentionally excluded."
+                "Contains actor/critic heads, required replay projections, and "
+                "optimizer state. target_model stores EMA copies under the same "
+                "names. VLA backbone and RL token autoencoder are intentionally "
+                "excluded."
             ),
         }
         torch.save(payload, os.path.join(save_base_path, "actor_critic.pt"))
@@ -1783,11 +1911,13 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 self.log_on_first_rank(
                     "Reset TD3 critic heads after loading checkpoint."
                 )
+            self._sync_target_replay_projections_from_online()
             self._apply_configured_optimizer_lrs()
             if bool(self.cfg.algorithm.get("reset_update_step_on_resume", False)):
                 self.update_step = 0
             else:
                 self.update_step = int(payload.get("update_step", 0))
+            self._load_deferred_preload_replay_checkpoint()
             return
 
         self._strategy.load_checkpoint(
@@ -1809,8 +1939,10 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         if reset_critic:
             self._reset_td3_critic_state()
             self.log_on_first_rank("Reset TD3 critic heads after loading checkpoint.")
+        self._sync_target_replay_projections_from_online()
 
         buffer_load_path = os.path.join(
             load_base_path, f"td3_components/replay_buffer/rank_{self._rank}"
         )
         self.replay_buffer.load_checkpoint(buffer_load_path)
+        self._deferred_preload_checkpoint_path = None

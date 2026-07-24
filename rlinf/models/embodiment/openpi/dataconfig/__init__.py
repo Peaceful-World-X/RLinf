@@ -312,7 +312,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
             assets=AssetsConfig(asset_id="cube_insert_norm"),
-            default_prompt="insert the cube",
+            default_prompt="install the connecting rod",
             extra_delta_transform=True,  # True for delta action, False for abs_action
             adapt_to_pi=True,
         ),

@@ -24,6 +24,11 @@ def _make_policy_with_frozen_prefix_linears():
             "runner": {"load_optimizer_on_actor_critic_resume": False},
             "algorithm": {},
             "actor": {
+                "model": {
+                    "replay_embedding_mode": "frozen_image_last_linear",
+                    "actor_train_prefix_token_linear": False,
+                    "critic_train_prefix_token_linear": False,
+                },
                 "optim": {"lr": 1.0e-4},
                 "critic_optim": {"lr": 1.0e-4},
             },
@@ -97,3 +102,43 @@ def test_actor_critic_resume_can_skip_optimizer_when_prefix_linear_is_frozen(tmp
         torch.full_like(policy.model.critic_prefix_token_linear_2.weight, 13.0),
     )
     assert policy.update_step == 123
+
+
+def test_actor_critic_checkpoint_saves_frozen_replay_projections(tmp_path):
+    policy = _make_policy_with_frozen_prefix_linears()
+    policy._compressed_replay_enabled = True
+
+    policy._save_actor_critic_checkpoint(str(tmp_path), step=50)
+
+    payload = torch.load(tmp_path / "actor_critic.pt", map_location="cpu")
+    expected = {
+        "actor_prefix_token_linear.weight",
+        "critic_prefix_token_linear_1.weight",
+        "critic_prefix_token_linear_2.weight",
+    }
+    assert expected.issubset(payload["model"])
+    assert expected.issubset(payload["target_model"])
+
+
+def test_compressed_replay_syncs_target_projections_from_online():
+    policy = _make_policy_with_frozen_prefix_linears()
+    policy._compressed_replay_enabled = True
+    with torch.no_grad():
+        policy.model.actor_prefix_token_linear.weight.fill_(7.0)
+        policy.model.critic_prefix_token_linear_1.weight.fill_(11.0)
+        policy.model.critic_prefix_token_linear_2.weight.fill_(13.0)
+        policy.target_model.actor_prefix_token_linear.weight.fill_(1.0)
+        policy.target_model.critic_prefix_token_linear_1.weight.fill_(2.0)
+        policy.target_model.critic_prefix_token_linear_2.weight.fill_(3.0)
+
+    policy._sync_target_replay_projections_from_online()
+
+    for name in (
+        "actor_prefix_token_linear",
+        "critic_prefix_token_linear_1",
+        "critic_prefix_token_linear_2",
+    ):
+        assert torch.equal(
+            getattr(policy.target_model, name).weight,
+            getattr(policy.model, name).weight,
+        )
