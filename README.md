@@ -286,6 +286,49 @@ Multiple Backend Integrations
 
 **SOTA RL Training Reproduction:** RLinf provides end-to-end recipes that reproduce or match **state-of-the-art (SOTA) RL results** out of the box—users can directly run our configs and scripts to obtain SOTA performance without custom engineering. Check out our [example gallery](https://rlinf.readthedocs.io/en/latest/rst_source/examples/index.html) for more details.
 
+### Piper: strict Conda isolation with host ROS and CUDA
+
+For Piper real-world runs on this host, RLinf Python dependencies must come only from the `rlinf` Conda environment. Host access is limited to ROS Noetic (including the Piper ROS workspace and its native dependencies) and the CUDA driver. Do not inherit the shell's `PYTHONPATH`, and do not add `/opt/openrobots` or other host Python package directories.
+
+Use the following process-local launcher. It clears the inherited environment, disables user site packages and `.pth` processing, and then adds only the approved paths:
+
+```bash
+RLINF_REPO=/home/user/users/hengyu.zhong/code/rlinf_proxy
+RLINF_CONDA=/home/user/miniconda3/envs/rlinf
+PIPER_ROS=/home/user/cobot_magic/Piper_ros_private-ros-noetic
+
+rlinf_python() {
+  env -i \
+    HOME=/tmp/rlinf-conda-clean \
+    PATH="${RLINF_CONDA}/bin:/opt/ros/noetic/bin" \
+    CONDA_PREFIX="${RLINF_CONDA}" \
+    CONDA_DEFAULT_ENV=rlinf \
+    PYTHONNOUSERSITE=1 \
+    PYTHONSAFEPATH=1 \
+    PYTHONPATH="${RLINF_REPO}:${RLINF_CONDA}/lib/python3.11/site-packages:${PIPER_ROS}/devel/lib/python3/dist-packages:/opt/ros/noetic/lib/python3/dist-packages" \
+    EMBODIED_PATH="${RLINF_REPO}" \
+    ROS_DISTRO=noetic \
+    ROS_VERSION=1 \
+    ROS_PYTHON_VERSION=3 \
+    ROS_MASTER_URI=http://localhost:11311 \
+    ROS_PACKAGE_PATH="${PIPER_ROS}/src:/opt/ros/noetic/share" \
+    LD_LIBRARY_PATH=/opt/ros/noetic/lib \
+    LD_PRELOAD=/lib/x86_64-linux-gnu/libffi.so.7 \
+    TF_USE_LEGACY_KERAS=1 \
+    "${RLINF_CONDA}/bin/python" -S -P "$@"
+}
+```
+
+Run the online Piper configuration through the launcher:
+
+```bash
+cd "${RLINF_REPO}"
+rlinf_python examples/embodiment/train_async.py \
+  --config-name=realworld_piper_gigacl_charge_insert_online
+```
+
+`TF_USE_LEGACY_KERAS=1` prevents the unused Keras 3 `pandas`/`pyarrow` import chain from crashing after Torch, Ray, and ROS are loaded. `LD_PRELOAD` selects the real `libffi.so.7` required by ROS `cv_bridge`; Conda Python continues to use its own `libffi.so.8`. Both settings apply only to the launched process. Do not remove Conda's `libffi` symlinks, downgrade packages, or persist these values with `conda env config vars`.
+
 
 ## Awesome Community Projects with RLinf
 We are excited to see a growing ecosystem of projects building on top of or integrate with RLinf, spanning embodied AI, robotics, and long-horizon agentic systems. Here are some awesome community projects:

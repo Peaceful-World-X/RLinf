@@ -281,6 +281,49 @@ RLinf具有高度灵活性，可支持多种强化学习训练工作流（PPO、
 
 **SOTA RL 训练复现：** RLinf 提供了端到端的配置和脚本，可以直接运行，无需额外工程改造，即可复现业界领先的训练效果。请参考[示例库](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/index.html)了解更多细节。
 
+### Piper：Conda 严格隔离，仅放行主机 ROS 和 CUDA
+
+在本机运行 Piper 实机任务时，RLinf 的 Python 依赖只能来自 `rlinf` Conda 环境。主机资源仅允许使用 ROS Noetic（包括 Piper ROS 工作空间及 ROS 的原生依赖）和 CUDA 驱动。禁止继承当前 shell 的 `PYTHONPATH`，禁止加入 `/opt/openrobots` 或其他主机 Python 包路径。
+
+使用下面的进程级启动器。它会清空继承环境，禁用用户 `site-packages` 和 `.pth` 处理，然后只加入明确允许的路径：
+
+```bash
+RLINF_REPO=/home/user/users/hengyu.zhong/code/rlinf_proxy
+RLINF_CONDA=/home/user/miniconda3/envs/rlinf
+PIPER_ROS=/home/user/cobot_magic/Piper_ros_private-ros-noetic
+
+rlinf_python() {
+  env -i \
+    HOME=/tmp/rlinf-conda-clean \
+    PATH="${RLINF_CONDA}/bin:/opt/ros/noetic/bin" \
+    CONDA_PREFIX="${RLINF_CONDA}" \
+    CONDA_DEFAULT_ENV=rlinf \
+    PYTHONNOUSERSITE=1 \
+    PYTHONSAFEPATH=1 \
+    PYTHONPATH="${RLINF_REPO}:${RLINF_CONDA}/lib/python3.11/site-packages:${PIPER_ROS}/devel/lib/python3/dist-packages:/opt/ros/noetic/lib/python3/dist-packages" \
+    EMBODIED_PATH="${RLINF_REPO}" \
+    ROS_DISTRO=noetic \
+    ROS_VERSION=1 \
+    ROS_PYTHON_VERSION=3 \
+    ROS_MASTER_URI=http://localhost:11311 \
+    ROS_PACKAGE_PATH="${PIPER_ROS}/src:/opt/ros/noetic/share" \
+    LD_LIBRARY_PATH=/opt/ros/noetic/lib \
+    LD_PRELOAD=/lib/x86_64-linux-gnu/libffi.so.7 \
+    TF_USE_LEGACY_KERAS=1 \
+    "${RLINF_CONDA}/bin/python" -S -P "$@"
+}
+```
+
+通过该启动器运行 Piper 在线配置：
+
+```bash
+cd "${RLINF_REPO}"
+rlinf_python examples/embodiment/train_async.py \
+  --config-name=realworld_piper_gigacl_charge_insert_online
+```
+
+`TF_USE_LEGACY_KERAS=1` 用于避免在 Torch、Ray 和 ROS 加载后，未使用的 Keras 3 `pandas`/`pyarrow` 导入链触发段错误。`LD_PRELOAD` 使 ROS `cv_bridge` 使用它需要的真实 `libffi.so.7`；Conda Python 仍使用自己的 `libffi.so.8`。两个设置都只对启动的子进程生效。不要删除 Conda 的 `libffi` 软链、不要降级依赖，也不要通过 `conda env config vars` 持久化这些变量。
+
 
 ## 基于 RLinf 的社区项目精选
 我们非常高兴地看到围绕RLinf构建或集成的项目生态系统正在蓬勃发展，涵盖具身智能、机器人技术以及长时序代理系统等领域。以下是一些优秀的社区项目：
