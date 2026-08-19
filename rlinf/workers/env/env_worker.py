@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import os
 from collections import defaultdict
 from typing import Any, Literal
 
@@ -30,6 +31,7 @@ from rlinf.data.embodied_io_struct import (
     RolloutResult,
     Trajectory,
 )
+from rlinf.data.replay_video import encode_h264_tensor
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
@@ -89,9 +91,23 @@ class EnvWorker(Worker):
             )
         )
         self.online_control_cfg = self.cfg.rollout.get("online_control", {})
+        self.manual_actor_switch_enabled = bool(
+            self.online_control_cfg.get("manual_actor_switch_enabled", False)
+        )
+        self._manual_actor_enabled = bool(
+            self.online_control_cfg.get("actor_enabled_at_episode_start", True)
+        )
+        self._force_actor_enabled = False
         self.save_online_substep_obs = bool(
             self.online_control_cfg.get("save_substep_obs", False)
         )
+        self.replay_image_encoding = str(
+            self.cfg.algorithm.replay_buffer.get("image_encoding", "raw")
+        ).lower()
+        if self.replay_image_encoding not in {"raw", "h264"}:
+            raise ValueError(
+                "algorithm.replay_buffer.image_encoding must be 'raw' or 'h264'"
+            )
         self._online_action_norm_cache = None
         actor_model_cfg = self.cfg.actor.get("model", {})
         self.rollout_control_mode = str(
@@ -678,14 +694,20 @@ class EnvWorker(Worker):
                 f" classifier_prob={prob_text}"
                 f" classifier_threshold={float(self.intervention_classifier_threshold):.4f}"
             )
-        print(
+        message = (
             "[online-env] "
             f"chunk={chunk_step_idx} owner={source} executed={executed} "
             f"actor_ref_mse={mse_text} valid_steps={valid_steps} "
             f"intervene_steps={intervene_steps} reward_sum={reward_sum} reward_last={reward_last}"
-            f"{action_stats_text}{gripper_gate_text}{tcp_gate_text}{classifier_gate_text}",
-            flush=True,
+            f"{action_stats_text}{gripper_gate_text}{tcp_gate_text}{classifier_gate_text}"
         )
+        terminal_path = os.environ.get("RLINF_PIPERX_TERMINAL")
+        if terminal_path:
+            display_source = "BASEPOLICY" if source == "VLA" else source
+            with open(terminal_path, "w", buffering=1) as terminal:
+                print(f"[{display_source}] {message}", file=terminal, flush=True)
+        else:
+            print(message, flush=True)
 
     def _actor_ref_mse_value(self, rollout_result: RolloutResult) -> float | None:
         mse_tensor = rollout_result.forward_inputs.get("actor_ref_mse", None)
@@ -911,6 +933,10 @@ class EnvWorker(Worker):
         chunk_step_idx: int,
         obs_source=None,
     ) -> bool:
+        if self._force_actor_enabled:
+            return False
+        if self.manual_actor_switch_enabled and not self._manual_actor_enabled:
+            return True
         if self.rollout_control_mode == "warmup":
             if bool(
                 getattr(self, "rollout_gate_reset_on_episode_start", True)
@@ -1377,6 +1403,14 @@ class EnvWorker(Worker):
                 intervene_flags = infos["final_info"]["intervene_flag"]
         online_forward_inputs = {}
         if isinstance(infos, dict):
+            if "piperx_actor_enabled" in infos:
+                self._manual_actor_enabled = bool(
+                    np.asarray(infos["piperx_actor_enabled"]).reshape(-1)[0]
+                )
+            if "piperx_force_actor" in infos:
+                self._force_actor_enabled = bool(
+                    np.asarray(infos["piperx_force_actor"]).reshape(-1)[0]
+                )
             valid_mask = infos.get("chunk_valid_mask", None)
             valid_mask = self._normalize_chunk_valid_mask(valid_mask)
             if valid_mask is not None:
@@ -1963,6 +1997,17 @@ class EnvWorker(Worker):
             self.actor_split_num
         )
         for trajectory in trajectories:
+            if self.replay_image_encoding == "h264":
+                for values in (
+                    trajectory.curr_obs,
+                    trajectory.next_obs,
+                    trajectory.forward_inputs,
+                ):
+                    for key, value in list(values.items()):
+                        if not torch.is_tensor(value) or "images" not in key:
+                            continue
+                        time_dim = 2 if key.startswith("substep_") else 0
+                        values[key] = encode_h264_tensor(value, time_dim=time_dim)
             channel.put(trajectory, async_op=True)
 
     @Worker.timer("run_interact_once")

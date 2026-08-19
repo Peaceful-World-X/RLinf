@@ -121,6 +121,7 @@ class PiperRobotConfig:
     # ---- Control parameters ----
     step_frequency: float = 25.0  # Hz
     publish_rate: int = 25
+    continuous_publish_timing: bool = False
     joint_speed_pct: int = 50
     pos_lookahead_step: int = 25
     chunk_size: int = 50
@@ -271,13 +272,7 @@ class PiperEnv(gym.Env):
 
         # ---- Initialize controller ----
         if not self.config.is_dummy:
-            self._controller = PiperController(
-                ns_left=config.ns_left,
-                ns_right=config.ns_right,
-                use_robot_base=config.use_robot_base,
-                robot_base_topic=config.robot_base_topic,
-                joint_speed_pct=config.joint_speed_pct,
-            )
+            self._controller = self._create_controller()
         else:
             self._controller = None
 
@@ -806,6 +801,12 @@ class PiperEnv(gym.Env):
         # ---- Publish control command ----
         # Skip move_arm during teleoperation: the ROS node drives the puppet arms
         # directly via /master/joint_left|right; publishing here would conflict.
+        if self.config.continuous_publish_timing:
+            period = 1.0 / self.config.step_frequency
+            last_publish = getattr(self, "_last_action_publish_time", None)
+            if last_publish is not None:
+                time.sleep(max(0.0, period - (time.monotonic() - last_publish)))
+            self._last_action_publish_time = time.monotonic()
         if not self.config.is_dummy and not teleop_active:
             self._controller.move_arm(left_action, right_action)
         elif self.config.is_dummy:
@@ -814,10 +815,11 @@ class PiperEnv(gym.Env):
         self._num_steps += 1
 
         # ---- Rate control ----
-        step_time = time.time() - start_time
-        sleep_time = max(0.0, (1.0 / self.config.step_frequency) - step_time)
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+        if not self.config.continuous_publish_timing:
+            step_time = time.time() - start_time
+            sleep_time = max(0.0, (1.0 / self.config.step_frequency) - step_time)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
         # ---- Get observation ----
         observation = self._get_observation()
@@ -1021,6 +1023,15 @@ class PiperEnv(gym.Env):
     def num_steps(self) -> int:
         """Number of steps executed in the current episode."""
         return self._num_steps
+
+    def _create_controller(self) -> PiperController:
+        return PiperController(
+            ns_left=self.config.ns_left,
+            ns_right=self.config.ns_right,
+            use_robot_base=self.config.use_robot_base,
+            robot_base_topic=self.config.robot_base_topic,
+            joint_speed_pct=self.config.joint_speed_pct,
+        )
 
     @property
     def task_description(self) -> str:

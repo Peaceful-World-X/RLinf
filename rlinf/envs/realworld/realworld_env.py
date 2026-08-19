@@ -356,6 +356,7 @@ class RealWorldEnv(gym.Env):
 
         raw_chunk_intervene_actions = []
         raw_chunk_intervene_flag = []
+        raw_chunk_action_executed = []
         previous_intervene_flag = None
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
@@ -375,6 +376,13 @@ class RealWorldEnv(gym.Env):
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
 
+            action_executed = np.ones(self.num_envs, dtype=bool)
+            if isinstance(infos, dict) and "piperx_action_executed" in infos:
+                action_executed = np.asarray(
+                    infos["piperx_action_executed"], dtype=bool
+                ).reshape(self.num_envs)
+            raw_chunk_action_executed.append(torch.as_tensor(action_executed))
+
             if (
                 self.break_chunk_on_intervention_change
                 and current_intervene_flag is not None
@@ -384,6 +392,11 @@ class RealWorldEnv(gym.Env):
                 break
             if current_intervene_flag is not None:
                 previous_intervene_flag = current_intervene_flag.clone()
+
+            if isinstance(infos, dict) and bool(
+                np.asarray(infos.get("piperx_break_chunk", False)).any()
+            ):
+                break
 
             if (terminations | truncations).any():
                 break
@@ -416,7 +429,9 @@ class RealWorldEnv(gym.Env):
 
         infos_last = infos_list[-1] if infos_list else {}
         valid_mask = torch.zeros(self.num_envs, chunk_size, dtype=torch.bool)
-        valid_mask[:, : len(obs_list)] = True
+        if raw_chunk_action_executed:
+            executed_mask = torch.stack(raw_chunk_action_executed, dim=1)
+            valid_mask[:, : executed_mask.shape[1]] = executed_mask
         infos_last["chunk_valid_mask"] = valid_mask
         infos_last["executed_chunk_actions"] = torch.as_tensor(
             chunk_actions, dtype=torch.float32

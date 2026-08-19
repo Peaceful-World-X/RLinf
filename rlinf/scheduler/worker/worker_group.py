@@ -266,6 +266,9 @@ class WorkerGroup(Generic[WorkerClsType]):
                 ),
                 "NODE_GROUP_LABEL": placement.node_group_label,
             }
+            for key in ("RLINF_PIPERX_TERMINAL", "RLINF_PIPERX_KEY_FIFO"):
+                if key in os.environ:
+                    env_vars[key] = os.environ[key]
             env_vars.update(
                 AcceleratorUtil.get_accelerator_env_var(
                     accelerator_type, placement.visible_accelerators

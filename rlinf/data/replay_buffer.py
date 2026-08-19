@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from rlinf.data.embodied_io_struct import Trajectory
+from rlinf.data.replay_video import decode_h264_images_in_dict
 from rlinf.utils.logging import get_logger
 
 
@@ -572,7 +573,9 @@ class TrajectoryReplayBuffer:
             if cached is not None:
                 return cached
         info = self._trajectory_index[int(trajectory_id)]
-        trajectory = self._load_trajectory(int(trajectory_id), info["model_weights_id"])
+        trajectory = self._load_trajectory(
+            int(trajectory_id), info["model_weights_id"], decode_images=False
+        )
         flat = self._flatten_trajectory(trajectory)
         if self._flat_trajectory_cache is not None:
             self._flat_trajectory_cache.put(int(trajectory_id), flat)
@@ -741,7 +744,13 @@ class TrajectoryReplayBuffer:
             with open(trajectory_path, "wb") as f:
                 pkl.dump(trajectory_dict, f)
 
-    def _load_trajectory(self, trajectory_id: int, model_weights_id: str) -> Trajectory:
+    def _load_trajectory(
+        self,
+        trajectory_id: int,
+        model_weights_id: str,
+        *,
+        decode_images: bool = True,
+    ) -> Trajectory:
         """Load a trajectory from disk and reconstruct Trajectory object."""
 
         # Get trajectory info from index
@@ -775,6 +784,10 @@ class TrajectoryReplayBuffer:
         )
         for field_name, value in trajectory_dict.items():
             setattr(trajectory, field_name, value)
+        if decode_images:
+            decode_h264_images_in_dict(trajectory.curr_obs)
+            decode_h264_images_in_dict(trajectory.next_obs)
+            decode_h264_images_in_dict(trajectory.forward_inputs)
         self._ensure_mc_returns(trajectory)
 
         return self._transform_trajectory(trajectory)
@@ -1104,7 +1117,9 @@ class TrajectoryReplayBuffer:
             cursor = 0
             for tid in miss_traj_ids:
                 model_weights_id = self._trajectory_index[tid]["model_weights_id"]
-                trajectory = self._load_trajectory(tid, model_weights_id)
+                trajectory = self._load_trajectory(
+                    tid, model_weights_id, decode_images=False
+                )
                 flat_trajectory = self._flatten_trajectory(trajectory)
                 miss_flats.append(flat_trajectory)
                 traj_offsets[tid] = cursor
@@ -1155,7 +1170,9 @@ class TrajectoryReplayBuffer:
             info = self._trajectory_index.get(trajectory_id, None)
             if info is None:
                 continue
-            trajectory = self._load_trajectory(trajectory_id, info["model_weights_id"])
+            trajectory = self._load_trajectory(
+                trajectory_id, info["model_weights_id"], decode_images=False
+            )
             self._ensure_mc_returns(trajectory)
             mc_return = getattr(trajectory, "forward_inputs", {}).get("mc_return", None)
             if torch.is_tensor(mc_return) and bool(
@@ -1191,7 +1208,9 @@ class TrajectoryReplayBuffer:
             pick = int(torch.randint(0, len(ids), (1,), generator=rng).item())
             tid = int(ids[pick])
             info = self._trajectory_index[tid]
-            trajectory = self._load_trajectory(tid, info["model_weights_id"])
+            trajectory = self._load_trajectory(
+                tid, info["model_weights_id"], decode_images=False
+            )
             flat = self._flatten_trajectory(trajectory)
             num_samples = min(int(info["num_samples"]), self._flat_num_samples(flat))
             available = (
@@ -1275,7 +1294,9 @@ class TrajectoryReplayBuffer:
             info = self._trajectory_index.get(trajectory_id, None)
             if info is None:
                 continue
-            trajectory = self._load_trajectory(trajectory_id, info["model_weights_id"])
+            trajectory = self._load_trajectory(
+                trajectory_id, info["model_weights_id"], decode_images=False
+            )
             self._ensure_mc_returns(trajectory)
             mc_return = getattr(trajectory, "forward_inputs", {}).get("mc_return", None)
             if not torch.is_tensor(mc_return):
@@ -1361,7 +1382,9 @@ class TrajectoryReplayBuffer:
                         ).item()
                     )
 
-            trajectory = self._load_trajectory(int(tid), info["model_weights_id"])
+            trajectory = self._load_trajectory(
+                int(tid), info["model_weights_id"], decode_images=False
+            )
             flats.append(self._flatten_trajectory(trajectory))
             buffer_indices.append(int(local))
 
@@ -1443,7 +1466,9 @@ class TrajectoryReplayBuffer:
             if bool(torch.randint(0, 2, (1,), generator=rng).item()):
                 pair_order.reverse()
             for tid, info, local, sign in pair_order:
-                trajectory = self._load_trajectory(int(tid), info["model_weights_id"])
+                trajectory = self._load_trajectory(
+                    int(tid), info["model_weights_id"], decode_images=False
+                )
                 flats.append(self._flatten_trajectory(trajectory))
                 buffer_indices.append(int(local))
                 pair_ids.append(pair_idx)
@@ -2000,7 +2025,9 @@ class TrajectoryReplayBuffer:
                     model_weights_id = self._trajectory_index[trajectory_id][
                         "model_weights_id"
                     ]
-                    trajectory = self._load_trajectory(trajectory_id, model_weights_id)
+                    trajectory = self._load_trajectory(
+                        trajectory_id, model_weights_id, decode_images=False
+                    )
                     flat_trajectory = self._flatten_trajectory(trajectory)
                     self._flat_trajectory_cache.put(
                         trajectory_id,
