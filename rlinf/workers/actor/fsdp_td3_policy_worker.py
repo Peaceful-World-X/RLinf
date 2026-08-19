@@ -584,6 +584,17 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             action = action.clamp(-clip, clip)
         return action
 
+    def _mask_unexecuted_actions(self, batch, actions):
+        mask = (batch.get("forward_inputs", None) or {}).get(
+            "chunk_valid_mask", None
+        )
+        if not torch.is_tensor(mask):
+            return actions, None
+        mask = mask.to(device=actions.device, dtype=actions.dtype)
+        while mask.dim() < actions.dim():
+            mask = mask.unsqueeze(-1)
+        return actions * mask, mask
+
     def _action_norm_tensors(self, device, dtype):
         cache = getattr(self, "_td3_action_norm_cache", None)
         if cache is None:
@@ -711,6 +722,9 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             batch["actions"].to(self.device, dtype=self.torch_dtype),
             "batch.actions",
         )
+        sampled_actions, valid_mask = self._mask_unexecuted_actions(
+            batch, sampled_actions
+        )
         ref_action = self.get_ref_action(
             curr_obs,
             sampled_actions,
@@ -733,6 +747,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             use_target=False,
             compute_recon_loss=compute_recon_loss,
         )
+        actions_for_loss = actions if valid_mask is None else actions * valid_mask
 
         q_pi = None
         q_pi_mean = 0.0
@@ -745,15 +760,19 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             q1, q2 = self.model(
                 forward_type=ForwardType.TD3_Q,
                 rl_state=critic_rl_state,
-                action=actions,
+                action=actions_for_loss,
             )
             q_pi = torch.minimum(q1, q2)
             q_pi_mean = q_pi.mean().item()
 
-        bc_loss = torch.nn.functional.mse_loss(actions, sampled_actions)
+        if valid_mask is None:
+            bc_loss = torch.nn.functional.mse_loss(actions, sampled_actions)
+        else:
+            denom = valid_mask.expand_as(actions).sum().clamp_min(1.0)
+            bc_loss = (((actions - sampled_actions) ** 2) * valid_mask).sum() / denom
         robot_state = self.get_robot_state(curr_obs)
         smooth_loss, smooth_coef = self._actor_smooth_loss(
-            actions, sampled_actions, robot_state
+            actions_for_loss, sampled_actions, robot_state
         )
 
         actor_loss, actor_metrics = self.td3_algorithm.compose_actor_loss(q_pi, bc_loss)

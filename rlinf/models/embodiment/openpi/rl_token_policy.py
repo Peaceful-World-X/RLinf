@@ -842,6 +842,7 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         Rollout workers call policies with ``env_obs=...``. Keep ``obs`` as a
         compatibility alias for direct tests and older call sites.
         """
+        ttrtc_context = kwargs.pop("ttrtc_context", None)
         obs = env_obs if env_obs is not None else obs
         if obs is None:
             raise ValueError("predict_action_batch requires `env_obs` or `obs`.")
@@ -858,11 +859,14 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         if robot_state is not None and not isinstance(robot_state, torch.Tensor):
             robot_state = torch.tensor(robot_state, dtype=torch.float32)
         # Get VLA reference action ã = πvla(s) for actor conditioning and BC loss
-        ref_env_action = (
-            self._get_vla_ref_action(obs)
+        full_ref_env_action = (
+            self._get_vla_ref_action(obs, ttrtc_context=ttrtc_context)
             if hasattr(self, "_get_vla_ref_action")
             else None
         )
+        ref_env_action = full_ref_env_action
+        if ref_env_action is not None and ttrtc_context:
+            ref_env_action = ref_env_action[:, : int(self.config.action_horizon)]
         ref_action = None
         if ref_env_action is not None:
             ref_action = self._absolute_to_training_action(ref_env_action, robot_state)
@@ -897,6 +901,12 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
                     training_actions, robot_state
                 ).index_select(-1, index),
             )
+        if ttrtc_context:
+            from rlinf.models.embodiment.openpi.ttrtc import pin_actor_prefix
+
+            full_plan = full_ref_env_action.clone()
+            full_plan[:, : int(self.config.action_horizon)] = env_actions
+            env_actions = pin_actor_prefix(full_plan, ttrtc_context)
         flat_actions = training_actions.reshape(training_actions.shape[0], -1)
         ref_flat = ref_action.reshape(ref_action.shape[0], -1).to(
             device=flat_actions.device, dtype=flat_actions.dtype
@@ -929,6 +939,10 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         if ref_env_action is not None:
             forward_inputs["ref_env_action_absolute"] = ref_env_action.reshape(
                 ref_env_action.shape[0], -1
+            ).cpu()
+        if ttrtc_context and full_ref_env_action is not None:
+            forward_inputs["ttrtc_base_env_action"] = full_ref_env_action.reshape(
+                full_ref_env_action.shape[0], -1
             ).cpu()
         result = {
             "prev_logprobs": zero_scores,

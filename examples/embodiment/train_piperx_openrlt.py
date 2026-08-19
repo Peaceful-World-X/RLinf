@@ -36,7 +36,7 @@ from omegaconf import OmegaConf
 from rlinf.config import validate_cfg
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.workers.env.async_env_worker import AsyncEnvWorker
+from rlinf.workers.env.piperx_ttrtc_env_worker import PiperXTTRTCEnvWorker
 from rlinf.workers.rollout.hf.async_huggingface_worker import (
     AsyncMultiStepRolloutWorker,
 )
@@ -104,8 +104,13 @@ def validate_piperx_cfg(cfg) -> None:
     controlled = [int(value) for value in model.controlled_action_indices]
     if controlled != [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]:
         raise ValueError("PiperX OpenRLT must exclude both gripper dimensions")
-    if int(cfg.env.train.override_cfg.chunk_size) != int(model.num_action_chunks):
-        raise ValueError("PiperX chunk_size must match num_action_chunks")
+    if int(cfg.env.train.override_cfg.chunk_size) != int(cfg.rollout.ttrtc.action_horizon):
+        raise ValueError("PiperX chunk_size must match the TTRTC action horizon")
+    rtc = cfg.rollout.ttrtc
+    if not bool(rtc.enabled):
+        raise ValueError("PiperX TTRTC must be enabled")
+    if int(rtc.execute_horizon) != 10 or int(rtc.action_horizon) != 50:
+        raise ValueError("PiperX TTRTC defaults require action_horizon=50, execute_horizon=10")
     for split in (cfg.env.train, cfg.env.eval):
         if str(split.init_params.id) != "PiperXInterventionEnv-v1":
             raise ValueError("PiperX config must use PiperXInterventionEnv-v1")
@@ -163,7 +168,7 @@ def main(cfg) -> None:
             name=cfg.rollout.group_name,
             placement_strategy=placement.get_strategy("rollout"),
         )
-        env = AsyncEnvWorker.create_group(cfg).launch(
+        env = PiperXTTRTCEnvWorker.create_group(cfg).launch(
             cluster,
             name=cfg.env.group_name,
             placement_strategy=placement.get_strategy("env"),

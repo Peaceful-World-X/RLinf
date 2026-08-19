@@ -159,8 +159,8 @@ env:
       enable_human_intervention: true
       step_frequency: 30.0
       publish_rate: 30
-      chunk_size: 15
-      pos_lookahead_step: 15
+      chunk_size: 50
+      pos_lookahead_step: 50
       left_state_topic: /puppet/joint_left
       right_state_topic: /puppet/joint_right
       left_end_pose_topic: /puppet/end_pose_left
@@ -180,8 +180,8 @@ env:
         - /camera_l/color/image_raw
         - /camera_r/color/image_raw
       obs_img_resolution: [224, 224]
-      sliding_window_action_buffer: true
-      smooth_action_chunk: true
+      sliding_window_action_buffer: false
+      smooth_action_chunk: false
       use_tcp_reset_pose_pool: false
       tcp_reset_pose_pool_path: "/home/focal/shared_disk/users/kwj/RLinf/assets/piper_tcp_reset_poses_10cm.json"
       tcp_reset_random_seed: 20260620
@@ -215,6 +215,19 @@ rollout:
   pipeline_stage_num: 1
   collect_transitions: true
   collect_prev_infos: false
+  ttrtc:
+    enabled: true
+    filter_enabled: true
+    action_horizon: 50
+    execute_horizon: 10
+    trained_delay_max: 10
+    initial_delay: 8
+    min_prefix_steps: 10
+    delay_window_size: 20
+    delay_quantile: 0.9
+    delay_margin_steps: 0
+    prefix_tolerance: 0.0001
+    max_consecutive_stale: 2
   warm_up_chunk_steps: 16
   vla_warmup_chunk_steps: 16
   online_control:
@@ -299,7 +312,7 @@ actor:
       num_images_in_input: 3
       noise_level: 0.3
       train_expert_only: True
-      action_chunk: ${actor.model.num_action_chunks}
+      action_chunk: ${rollout.ttrtc.action_horizon}
       action_env_dim: ${actor.model.env_action_dim}
       num_steps: ${actor.model.num_steps}
       detach_critic_input: null

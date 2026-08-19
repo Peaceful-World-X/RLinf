@@ -1071,6 +1071,14 @@ class TD3Algorithm:
             batch["actions"].to(device, dtype=dtype),
             "batch.actions",
         )
+        valid_action_mask = (batch.get("forward_inputs", None) or {}).get(
+            "chunk_valid_mask", None
+        )
+        if torch.is_tensor(valid_action_mask):
+            valid_action_mask = valid_action_mask.to(device=device, dtype=dtype)
+            while valid_action_mask.dim() < actions.dim():
+                valid_action_mask = valid_action_mask.unsqueeze(-1)
+            actions = actions * valid_action_mask
         batch_size = int(actions.shape[0])
         rewards = batch["rewards"]
         terminations = batch["terminations"]
@@ -1241,6 +1249,8 @@ class TD3Algorithm:
                     next_actions = next_actions.clamp(
                         -self.target_action_clip, self.target_action_clip
                     )
+                if torch.is_tensor(valid_action_mask):
+                    next_actions = next_actions * valid_action_mask
                 next_rl_state = next_actor_aux.get(
                     "critic_rl_state", next_actor_aux["rl_state"]
                 )

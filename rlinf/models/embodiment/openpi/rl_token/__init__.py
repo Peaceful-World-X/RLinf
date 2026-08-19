@@ -183,11 +183,15 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             )
             return prefix_output, prefix_pad_masks, past_key_values
 
-        def _get_vla_ref_action(self, obs):
+        def _get_vla_ref_action(self, obs, ttrtc_context=None):
             """Run VLA flow matching to get reference action ã = πvla(s)."""
             actions, result = self.backbone.predict_action_batch(
                 obs, mode="eval", compute_values=False
             )
+            if ttrtc_context:
+                from rlinf.models.embodiment.openpi.ttrtc import prepare_basepolicy
+
+                actions = prepare_basepolicy(actions, ttrtc_context)
             return actions
 
     model = OpenPiRLTokenPolicyWithBackbone(rl_cfg)

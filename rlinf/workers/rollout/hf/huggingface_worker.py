@@ -75,9 +75,14 @@ class MultiStepRolloutWorker(Worker):
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
         self.enable_eval = cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
 
+        ttrtc_cfg = cfg.rollout.get("ttrtc", {})
+        train_step_horizon = (
+            int(ttrtc_cfg.get("execute_horizon", 10))
+            if bool(ttrtc_cfg.get("enabled", False))
+            else int(cfg.actor.model.num_action_chunks)
+        )
         self.n_train_chunk_steps = (
-            cfg.env.train.max_steps_per_rollout_epoch
-            // cfg.actor.model.num_action_chunks
+            cfg.env.train.max_steps_per_rollout_epoch // train_step_horizon
         )
         self.n_eval_chunk_steps = (
             cfg.env.eval.max_steps_per_rollout_epoch
@@ -246,7 +251,10 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("predict")
     def predict(
-        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
+        self,
+        env_obs: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
+        **predict_kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         kwargs = (
             self._train_sampling_params
@@ -296,6 +304,7 @@ class MultiStepRolloutWorker(Worker):
             else:
                 actions, result = self.hf_model.predict_action_batch(
                     env_obs=env_obs,
+                    **predict_kwargs,
                     **kwargs,
                 )
 
@@ -394,7 +403,11 @@ class MultiStepRolloutWorker(Worker):
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
-                actions, result = self.predict(env_output["obs"])
+                context = env_output.get("ttrtc_context")
+                actions, result = self.predict(
+                    env_output["obs"],
+                    **({"ttrtc_context": context} if context else {}),
+                )
 
                 save_flags = None
                 if result.get("expert_label_flag", False):
@@ -426,7 +439,11 @@ class MultiStepRolloutWorker(Worker):
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
         for _ in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
-            actions, result = self.predict(env_output["obs"])
+            context = env_output.get("ttrtc_context")
+            actions, result = self.predict(
+                env_output["obs"],
+                **({"ttrtc_context": context} if context else {}),
+            )
 
             rollout_result = RolloutResult(
                 actions=actions,
@@ -584,7 +601,13 @@ class MultiStepRolloutWorker(Worker):
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
 
-        return {"obs": merged_obs, "final_obs": merged_final_obs}
+        merged = {"obs": merged_obs, "final_obs": merged_final_obs}
+        contexts = [batch.get("ttrtc_context") for batch in obs_batches]
+        if any(context is not None for context in contexts):
+            if len(contexts) != 1 or contexts[0] is None:
+                raise ValueError("TTRTC currently requires one PiperX env shard.")
+            merged["ttrtc_context"] = contexts[0]
+        return merged
 
     def send_chunk_actions(
         self,
