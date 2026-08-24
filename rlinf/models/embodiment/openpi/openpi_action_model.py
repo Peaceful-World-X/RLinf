@@ -16,6 +16,7 @@ import math
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from types import MethodType
 from typing import Any, Literal
 
 import jax
@@ -31,6 +32,36 @@ from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
+
+
+def _token_conditioned_rmsnorm_forward(self, inputs, cond=None):
+    """Run AdaRMS with either per-batch or per-action-token conditioning."""
+    dtype = inputs.dtype
+    normed_inputs = self._norm(inputs)
+    if cond is None or self.dense is None:
+        normed_inputs = normed_inputs * (1.0 + self.weight.float())
+        return normed_inputs.to(dtype), None
+
+    if cond.shape[-1] != self.cond_dim:
+        raise ValueError(
+            f"Expected condition dimension {self.cond_dim}, got {cond.shape[-1]}"
+        )
+    modulation = self.dense(cond)
+    if inputs.dim() == 3 and cond.dim() == 2:
+        modulation = modulation.unsqueeze(1)
+    scale, shift, gate = torch.chunk(modulation, 3, dim=-1)
+    normed_inputs = normed_inputs * (1 + scale.float()) + shift.float()
+    return normed_inputs.to(dtype), gate.to(dtype)
+
+
+def _batch_ttrtc_prev_action(action) -> np.ndarray:
+    """Normalize a single-environment TTRTC action chunk to [B, H, D]."""
+    previous = np.asarray(action, dtype=np.float32).copy()
+    if previous.ndim == 2:
+        previous = previous[None]
+    if previous.ndim != 3 or previous.shape[0] != 1:
+        raise ValueError("PI0.5 TTRTC currently requires a single environment")
+    return previous
 
 
 @dataclass(frozen=True)
@@ -132,6 +163,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         sample_actions_func = self.sample_actions
         super().__init__(config)
         self.sample_actions = sample_actions_func
+        if self.pi05:
+            for module in self.paligemma_with_expert.gemma_expert.model.modules():
+                if module.__class__.__name__ == "GemmaRMSNorm":
+                    module.forward = MethodType(
+                        _token_conditioned_rmsnorm_forward, module
+                    )
         self.logger = get_logger()
         self.global_step = 0
         # assert
@@ -234,6 +271,46 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
             path_parts = name.split(".")
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
+
+    def embed_suffix(self, state, noisy_actions, timestep):
+        """Support per-action TTRTC timesteps for PI0.5 prefix conditioning."""
+        if timestep.dim() == 1:
+            return super().embed_suffix(state, noisy_actions, timestep)
+        if not self.pi05 or timestep.shape != noisy_actions.shape[:2]:
+            raise ValueError(
+                "Per-action timesteps require PI0.5 tensors shaped [B, action_horizon]"
+            )
+
+        action_emb = self._apply_checkpoint(self.action_in_proj, noisy_actions)
+        dim = int(self.action_in_proj.out_features)
+        fraction = torch.linspace(
+            0.0, 1.0, dim // 2, dtype=torch.float32, device=timestep.device
+        )
+        period = 4e-3 * (4.0 / 4e-3) ** fraction
+        angles = timestep.to(torch.float32)[..., None] * (
+            2.0 * math.pi / period
+        )
+        time_emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+        time_emb = time_emb.to(dtype=timestep.dtype)
+
+        def time_mlp_func(value):
+            value = torch.nn.functional.silu(self.time_mlp_in(value))
+            return torch.nn.functional.silu(self.time_mlp_out(value))
+
+        adarms_cond = self._apply_checkpoint(time_mlp_func, time_emb)
+        batch_size, action_horizon = action_emb.shape[:2]
+        pad_masks = torch.ones(
+            batch_size,
+            action_horizon,
+            dtype=torch.bool,
+            device=action_emb.device,
+        )
+        att_masks = torch.tensor(
+            [1] + [0] * (action_horizon - 1),
+            dtype=action_emb.dtype,
+            device=action_emb.device,
+        )[None].expand(batch_size, -1)
+        return action_emb, pad_masks, att_masks, adarms_cond
 
     def set_global_step(self, global_step):
         self.global_step = global_step
@@ -527,10 +604,26 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         compute_values=True,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        ttrtc_context = kwargs.pop("ttrtc_context", None)
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
+        ttrtc_prev_action = None
+        ttrtc_prefix_steps = 0
+        if ttrtc_context and ttrtc_context.get("prev_base_action") is not None:
+            previous = _batch_ttrtc_prev_action(
+                ttrtc_context["prev_base_action"]
+            )
+            to_process_obs["actions"] = previous
+            ttrtc_prefix_steps = min(
+                int(ttrtc_context.get("predicted_delay", 0)),
+                int(ttrtc_context.get("execute_horizon", 0)),
+                previous.shape[1],
+                int(self.config.action_horizon),
+            )
         processed_obs = self.input_transform(
             to_process_obs, transpose=False
         )  # policy input obs -> model input obs
+        if "actions" in processed_obs:
+            ttrtc_prev_action = processed_obs.pop("actions")
         processed_obs = self.precision_processor(
             processed_obs
         )  # obs precision processor
@@ -569,7 +662,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         else:
             # Non-DSRL or eval mode
             outputs = self.sample_actions(
-                observation, mode=mode, compute_values=compute_values
+                observation,
+                mode=mode,
+                compute_values=compute_values,
+                ttrtc_prev_action=ttrtc_prev_action,
+                ttrtc_prefix_steps=ttrtc_prefix_steps,
             )
             actions = self.output_transform(
                 {"actions": outputs["actions"], "state": observation.state}
@@ -621,6 +718,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="train",
         compute_values=True,
+        ttrtc_prev_action=None,
+        ttrtc_prefix_steps: int = 0,
     ) -> torch.Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
@@ -642,6 +741,28 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         )
 
         x_t = noise
+        ttrtc_prefix = None
+        ttrtc_prefix_mask = None
+        if ttrtc_prev_action is not None and int(ttrtc_prefix_steps) > 0:
+            previous = torch.as_tensor(
+                ttrtc_prev_action, device=device, dtype=x_t.dtype
+            )
+            if previous.dim() == 2:
+                previous = previous.unsqueeze(0)
+            if previous.dim() != 3 or previous.shape[0] != bsize:
+                raise ValueError(
+                    "TTRTC model-space prefix must have shape [B, H, D]"
+                )
+            ttrtc_prefix = torch.zeros_like(x_t)
+            copy_steps = min(previous.shape[1], x_t.shape[1])
+            copy_dim = min(previous.shape[2], x_t.shape[2])
+            ttrtc_prefix[:, :copy_steps, :copy_dim] = previous[
+                :, :copy_steps, :copy_dim
+            ]
+            prefix_steps = min(int(ttrtc_prefix_steps), copy_steps)
+            ttrtc_prefix_mask = (
+                torch.arange(x_t.shape[1], device=device) < prefix_steps
+            )[None, :, None]
         # add sde sample and traj collect
         chains = []
         log_probs = []
@@ -692,6 +813,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 sample_method = self.config.noise_method
             else:
                 sample_method = "flow_ode"
+            if ttrtc_prefix_mask is not None:
+                x_t = torch.where(ttrtc_prefix_mask, ttrtc_prefix, x_t)
             x_t_prev = x_t
             x_t_mean, x_t_std, value_t, v_t = self.sample_mean_var_val(
                 x_t,
@@ -702,9 +825,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 sample_method,
                 num_steps,
                 compute_values,
+                ttrtc_prefix_mask=ttrtc_prefix_mask,
             )
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
+            if ttrtc_prefix_mask is not None:
+                x_t = torch.where(ttrtc_prefix_mask, ttrtc_prefix, x_t)
             if collect_nft_traces:
                 mask = flow_rand_idx == idx
                 mask_bc = mask[:, None, None]
@@ -772,6 +898,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         sample_method,
         denoise_steps,
         compute_values=True,
+        ttrtc_prefix_mask=None,
     ):
         """
         Sample the mean, variance and value of the action at a given timestep.
@@ -792,8 +919,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         t_input = timesteps[idx]
         delta = timesteps[idx] - timesteps[idx + 1]
         # velocity prediction
+        velocity_timestep = t_input
+        if ttrtc_prefix_mask is not None:
+            velocity_timestep = t_input[:, None].expand(-1, x_t.shape[1])
+            velocity_timestep = torch.where(
+                ttrtc_prefix_mask[..., 0],
+                torch.zeros_like(velocity_timestep),
+                velocity_timestep,
+            )
         v_t, suffix_out = self.get_velocity(
-            state, x_t, t_input, prefix_pad_masks, past_key_values
+            state, x_t, velocity_timestep, prefix_pad_masks, past_key_values
         )
         # value prediction
         if (

@@ -451,6 +451,9 @@ class MultiStepRolloutWorker(Worker):
                 bootstrap_values=self.get_bootstrap_values(
                     env_output.get("final_obs", None)
                 ),
+                forward_inputs=(
+                    result["forward_inputs"] if self.collect_transitions else None
+                ),
             )
             self.send_rollout_result(output_channel, rollout_result, mode="train")
 

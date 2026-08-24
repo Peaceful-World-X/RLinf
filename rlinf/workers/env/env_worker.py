@@ -15,6 +15,7 @@
 import asyncio
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal
 
 import numpy as np
@@ -31,7 +32,11 @@ from rlinf.data.embodied_io_struct import (
     RolloutResult,
     Trajectory,
 )
-from rlinf.data.replay_video import encode_h264_tensor
+from rlinf.data.replay_video import (
+    DeferredH264Payload,
+    StreamingH264TensorEncoder,
+    encode_h264_tensor,
+)
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
@@ -108,6 +113,14 @@ class EnvWorker(Worker):
             raise ValueError(
                 "algorithm.replay_buffer.image_encoding must be 'raw' or 'h264'"
             )
+        self.replay_video_fps = int(
+            round(float(self.cfg.env.train.override_cfg.get("step_frequency", 30.0)))
+        )
+        self._replay_video_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="replay-h264"
+        )
+        self._action_jitter_history = {}
+        self._action_jitter_total = {}
         self._online_action_norm_cache = None
         actor_model_cfg = self.cfg.actor.get("model", {})
         self.rollout_control_mode = str(
@@ -598,14 +611,97 @@ class EnvWorker(Worker):
             if not values or values[0] is None:
                 continue
             if all(torch.is_tensor(value) for value in values):
+                if self.replay_image_encoding == "h264" and "images" in key:
+                    # Feed frames individually so no chunk-sized raw image stack is made.
+                    first = values[0].cpu()
+                    encoder = StreamingH264TensorEncoder(
+                        first, fps=self.replay_video_fps
+                    )
+                    for value in values:
+                        encoder.append(value)
+                    if values:
+                        for _ in range(len(values), self._target_chunk_steps()):
+                            encoder.append(values[-1])
+                    stacked[f"substep_{key}"] = encoder.finish()
+                    continue
                 stacked_value = torch.stack([value.cpu() for value in values], dim=1)
-                stacked[f"substep_{key}"] = self._pad_time_dim(
+                stacked_value = self._pad_time_dim(
                     stacked_value,
                     dim=1,
                     target_len=target_steps,
                     repeat_last=True,
                 )
+                stacked[f"substep_{key}"] = stacked_value
         return stacked
+
+    def _encode_replay_observation(self, obs: dict[str, Any]) -> dict[str, Any]:
+        stored = dict(obs)
+        if self.replay_image_encoding != "h264":
+            return stored
+        for key in ("main_images", "wrist_images", "extra_view_images"):
+            value = stored.get(key)
+            if isinstance(value, torch.Tensor):
+                stored[key] = DeferredH264Payload(
+                    self._replay_video_executor.submit(
+                        encode_h264_tensor,
+                        value,
+                        fps=self.replay_video_fps,
+                        time_dim=None,
+                    )
+                )
+        return stored
+
+    def _stream_replay_step(self):
+        encoders = {}
+        last_images = {}
+        last_obs = None
+
+        def callback(obs, infos, _step):
+            nonlocal last_obs
+            last_obs = obs
+            if (
+                self.replay_image_encoding != "h264"
+                or not self.save_online_substep_obs
+                or not isinstance(obs, dict)
+            ):
+                return obs, infos
+            stored = dict(obs)
+            for key in ("main_images", "wrist_images", "extra_view_images"):
+                value = stored.get(key)
+                if not isinstance(value, torch.Tensor):
+                    continue
+                if key not in encoders:
+                    encoders[key] = self._replay_video_executor.submit(
+                        StreamingH264TensorEncoder,
+                        value,
+                        fps=self.replay_video_fps,
+                    )
+                self._replay_video_executor.submit(
+                    lambda future=encoders[key], frame=value: future.result().append(
+                        frame
+                    )
+                )
+                last_images[key] = value
+                stored.pop(key, None)
+            return stored, infos
+
+        def finish():
+            payloads = {}
+            if self.replay_image_encoding == "h264" and self.save_online_substep_obs:
+                for key, encoder_future in encoders.items():
+
+                    def finish_encoder(future=encoder_future, last=last_images[key]):
+                        enc = future.result()
+                        for _ in range(enc.frame_count, self._target_chunk_steps()):
+                            enc.append(last)
+                        return enc.finish()
+
+                    payloads[f"substep_{key}"] = DeferredH264Payload(
+                        self._replay_video_executor.submit(finish_encoder)
+                    )
+            return payloads
+
+        return callback, finish, lambda: last_obs
 
     def _maybe_print_online_env_status(
         self,
@@ -1783,6 +1879,81 @@ class EnvWorker(Worker):
         adjusted_rewards[:, -1] += self.cfg.algorithm.gamma * final_values
         return adjusted_rewards
 
+    def _apply_action_jitter_penalty(
+        self,
+        rewards: torch.Tensor | None,
+        forward_inputs: dict[str, Any],
+        dones: torch.Tensor | None,
+        stage_id: int,
+    ) -> torch.Tensor | None:
+        cfg = self.cfg.algorithm.get("action_jitter_penalty", None)
+        if rewards is None or not cfg or not bool(cfg.get("enabled", False)):
+            return rewards
+
+        actions = forward_inputs.get("executed_env_action_absolute", None)
+        reference = forward_inputs.get("ref_env_action_absolute", None)
+        if not torch.is_tensor(actions) or not torch.is_tensor(reference):
+            return rewards
+        batch_size, horizon = rewards.shape
+        if actions.numel() % (batch_size * horizon) != 0:
+            raise ValueError("Executed action shape is incompatible with reward shape")
+        action_dim = actions.numel() // (batch_size * horizon)
+        actions = actions.reshape(batch_size, horizon, action_dim).to(rewards)
+        reference = reference.reshape(batch_size, horizon, action_dim).to(rewards)
+        residual = actions - reference
+        valid_mask = forward_inputs.get("chunk_valid_mask", None)
+        if valid_mask is None:
+            valid_mask = torch.ones_like(rewards, dtype=torch.bool)
+        else:
+            valid_mask = valid_mask.reshape(batch_size, horizon).to(torch.bool)
+
+        excluded = {int(index) for index in cfg.get("exclude_action_indices", [])}
+        controlled = [index for index in range(action_dim) if index not in excluded]
+        if not controlled:
+            raise ValueError("Action jitter penalty excludes every action dimension")
+        histories = self._action_jitter_history.setdefault(
+            stage_id, [[] for _ in range(batch_size)]
+        )
+        if len(histories) != batch_size:
+            histories = [[] for _ in range(batch_size)]
+            self._action_jitter_history[stage_id] = histories
+        totals = self._action_jitter_total.setdefault(
+            stage_id, [0.0 for _ in range(batch_size)]
+        )
+        if len(totals) != batch_size:
+            totals = [0.0 for _ in range(batch_size)]
+            self._action_jitter_total[stage_id] = totals
+
+        adjusted_rewards = rewards.clone()
+        threshold = float(cfg.get("threshold", 0.05))
+        scale = float(cfg.get("scale", 8.0))
+        max_per_step = float(cfg.get("max_per_step", 0.1))
+        max_per_episode = float(cfg.get("max_per_episode", float("inf")))
+        for batch_idx in range(batch_size):
+            history = histories[batch_idx]
+            for step_idx in range(horizon):
+                if not bool(valid_mask[batch_idx, step_idx]):
+                    continue
+                frame = residual[batch_idx, step_idx]
+                if len(history) == 2:
+                    second_difference = frame - 2 * history[-1] + history[-2]
+                    jitter = second_difference[controlled].abs().amax()
+                    penalty = torch.clamp(
+                        (jitter - threshold) * scale,
+                        min=0.0,
+                        max=max_per_step,
+                    )
+                    remaining = max(0.0, max_per_episode - totals[batch_idx])
+                    penalty = torch.clamp(penalty, max=remaining)
+                    adjusted_rewards[batch_idx, step_idx] -= penalty
+                    totals[batch_idx] += float(penalty)
+                history.append(frame.detach().clone())
+                del history[:-2]
+                if dones is not None and bool(dones[batch_idx, step_idx]):
+                    history.clear()
+                    totals[batch_idx] = 0.0
+        return adjusted_rewards
+
     def finish_rollout(self, mode="train"):
         # reset
         if mode == "train":
@@ -1997,17 +2168,6 @@ class EnvWorker(Worker):
             self.actor_split_num
         )
         for trajectory in trajectories:
-            if self.replay_image_encoding == "h264":
-                for values in (
-                    trajectory.curr_obs,
-                    trajectory.next_obs,
-                    trajectory.forward_inputs,
-                ):
-                    for key, value in list(values.items()):
-                        if not torch.is_tensor(value) or "images" not in key:
-                            continue
-                        time_dim = 2 if key.startswith("substep_") else 0
-                        values[key] = encode_h264_tensor(value, time_dim=time_dim)
             channel.put(trajectory, async_op=True)
 
     @Worker.timer("run_interact_once")
@@ -2020,6 +2180,8 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
+        self._action_jitter_history.clear()
+        self._action_jitter_total.clear()
         self.rollout_results: list[EmbodiedRolloutResult] = [
             EmbodiedRolloutResult(
                 max_episode_length=self.cfg.env.train.max_episode_steps,
@@ -2102,6 +2264,12 @@ class EnvWorker(Worker):
                         )
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
+                    )
+                    rewards = self._apply_action_jitter_penalty(
+                        rewards,
+                        rollout_result.forward_inputs,
+                        env_output.dones,
+                        stage_id,
                     )
                     chunk_step_result = ChunkStepResult(
                         actions=rollout_result.forward_inputs.get("action", None),
@@ -2191,10 +2359,14 @@ class EnvWorker(Worker):
                                 self.rollout_results[stage_id].append_transitions(
                                     p_curr, p_next
                                 )
-                            pending_transition[stage_id] = (curr_obs, next_obs)
+                            pending_transition[stage_id] = (
+                                self._encode_replay_observation(curr_obs),
+                                self._encode_replay_observation(next_obs),
+                            )
                         else:
                             self.rollout_results[stage_id].append_transitions(
-                                curr_obs, next_obs
+                                self._encode_replay_observation(curr_obs),
+                                self._encode_replay_observation(next_obs),
                             )
 
                     env_outputs[stage_id] = env_output

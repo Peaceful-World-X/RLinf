@@ -88,6 +88,35 @@ from rlinf.utils.utils import (
 from rlinf.workers.rollout.utils import RankMapper
 
 
+def _filter_rollout_state_dict(state_dict, include_patterns):
+    if not include_patterns:
+        return state_dict
+    filtered = {
+        name: tensor
+        for name, tensor in state_dict.items()
+        if any(pattern in name for pattern in include_patterns)
+    }
+    if not filtered:
+        raise ValueError(
+            f"No rollout weights matched sync patterns: {list(include_patterns)}"
+        )
+    return filtered
+
+
+def _selected_rollout_state_dict(model, include_patterns):
+    selected = {}
+    for name, tensor in (*model.named_parameters(), *model.named_buffers()):
+        if not any(pattern in name for pattern in include_patterns):
+            continue
+        clean_name = name.replace("_fsdp_wrapped_module.", "")
+        selected[clean_name] = tensor.detach().clone()
+    if not selected:
+        raise ValueError(
+            f"No rollout weights matched sync patterns: {list(include_patterns)}"
+        )
+    return selected
+
+
 def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     """
     original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
@@ -1055,9 +1084,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self._cfg.get("sync_precision", None) is not None:
             rollout_dtype = torch_dtype_from_precision(self._cfg.sync_precision)
 
-        rollout_state_dict = self.get_model_state_dict(
-            cpu_offload=False, full_state_dict=False
-        )
+        include_patterns = self._cfg.get("sync_weight_include_patterns", None)
+        if include_patterns:
+            rollout_state_dict = _selected_rollout_state_dict(
+                self.model, include_patterns
+            )
+        else:
+            rollout_state_dict = self.get_model_state_dict(
+                cpu_offload=False, full_state_dict=False
+            )
         model_bucket_list = self.divide_model_to_bucket(rollout_state_dict)
         del rollout_state_dict
 

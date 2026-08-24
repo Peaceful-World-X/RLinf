@@ -369,7 +369,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     llm_mlp_linear = state_dict.pop(f"llm/layers/mlp_{num_expert}/linear{suffix}")
 
     # Check if we have Dense layers (for pi05/adaptive normalization) or scale layers (for regular pi0)
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization
         llm_input_layernorm_bias = state_dict.pop(
             f"llm/layers/pre_attention_norm_{num_expert}/Dense_0/bias{suffix}"
@@ -432,7 +432,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             f"paligemma_with_expert.gemma_expert.model.layers.{i}.mlp.down_proj.weight"
         ] = llm_mlp_linear[i].transpose()
 
-        if "pi05" in checkpoint_dir:
+        if pi05:
             # Pi05 with adaptive normalization - use Dense layer parameters directly
             state_dict[
                 f"paligemma_with_expert.gemma_expert.model.layers.{i}.input_layernorm.dense.bias"
@@ -456,7 +456,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             ] = llm_post_attention_layernorm[i]
 
     # Handle final norm layer
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization - use Dense layer parameters directly
         final_norm_bias = state_dict.pop(
             f"llm/final_norm_{num_expert}/Dense_0/bias{suffix}"

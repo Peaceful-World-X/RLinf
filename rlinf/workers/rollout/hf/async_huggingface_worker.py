@@ -41,6 +41,8 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         )
         self._weight_sync_requested = False
         self._weight_sync_work = None
+        self._weight_sync_requested_version = 0
+        self._weight_sync_work_version = 0
         self._weight_sync_apply_total = 0
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
@@ -152,10 +154,11 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             return
 
         self._weight_sync_requested = False
+        self._weight_sync_work_version = self._weight_sync_requested_version
         self._weight_sync_work = asyncio.create_task(self.recv_actor_buckets())
 
     def _apply_synced_model_weights(self, param_state_dict):
-        self.hf_model.load_state_dict(param_state_dict)
+        self.hf_model.load_state_dict(param_state_dict, strict=False)
 
         del param_state_dict
         gc.collect()
@@ -172,13 +175,16 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         param_state_dict = await self._weight_sync_work
         self._weight_sync_work = None
         self._apply_synced_model_weights(param_state_dict)
+        self.set_global_step(self._weight_sync_work_version)
         self._weight_sync_apply_total += 1
 
         self._start_background_weight_sync_if_needed()
 
-    async def request_actor_sync_model(self):
+    async def request_actor_sync_model(self, global_step: int | None = None):
         self._weight_sync_request_total += 1
         if self._weight_sync_requested or self._weight_sync_work is not None:
             self._weight_sync_coalesced_total += 1
+        if global_step is not None:
+            self._weight_sync_requested_version = int(global_step)
         self._weight_sync_requested = True
         self._start_background_weight_sync_if_needed()

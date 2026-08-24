@@ -71,6 +71,10 @@ class AsyncEmbodiedTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
 
         with self._replay_buffer_add_lock:
             self.replay_buffer.add_trajectories(recv_list)
+            self._ingested_trajectory_total = getattr(
+                self, "_ingested_trajectory_total", 0
+            ) + len(recv_list)
+            self._record_critic_warmup_outcomes(recv_list)
             self._maybe_delete_last_replay_trajectory_from_keyboard()
             if self.demo_buffer is not None:
                 intervene_list = []
@@ -148,6 +152,9 @@ class AsyncEmbodiedTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
             self.update_step += 1
 
         mean_metrics = self.process_train_metrics(metrics)
+        mean_metrics["replay_buffer/ingested_trajectories"] = float(
+            getattr(self, "_ingested_trajectory_total", 0)
+        )
         torch.cuda.synchronize()
         torch.distributed.barrier()
         torch.cuda.empty_cache()

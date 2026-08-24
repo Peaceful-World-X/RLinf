@@ -788,6 +788,12 @@ class TrajectoryReplayBuffer:
             decode_h264_images_in_dict(trajectory.curr_obs)
             decode_h264_images_in_dict(trajectory.next_obs)
             decode_h264_images_in_dict(trajectory.forward_inputs)
+        else:
+            decode_h264_images_in_dict(trajectory.curr_obs, self.cache_obs_keys)
+            decode_h264_images_in_dict(trajectory.next_obs, self.cache_obs_keys)
+            decode_h264_images_in_dict(
+                trajectory.forward_inputs, self.cache_forward_input_keys
+            )
         self._ensure_mc_returns(trajectory)
 
         return self._transform_trajectory(trajectory)

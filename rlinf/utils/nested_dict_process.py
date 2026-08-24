@@ -16,6 +16,12 @@ from typing import Any
 
 import torch
 
+from rlinf.data.replay_video import (
+    is_h264_payload,
+    split_h264_payload,
+    stack_h264_payloads,
+)
+
 # Keys that we have already warned about in concat_batch, so each missing key
 # only produces a single warning per process (avoid log spam in the replay /
 # demo batch pipeline).
@@ -56,6 +62,8 @@ def put_tensor_device(data_dict, device):
 
     if isinstance(data_dict, torch.Tensor):
         return data_dict.to(device=device).contiguous()
+    if is_h264_payload(data_dict):
+        return data_dict
     for key, value in data_dict.items():
         if isinstance(value, dict):
             data_dict[key] = put_tensor_device(value, device)
@@ -67,7 +75,9 @@ def put_tensor_device(data_dict, device):
 def split_dict_to_chunk(data: dict, split_size, dim=0):
     splited_list = [{} for _ in range(split_size)]
     for key, value in data.items():
-        if isinstance(value, torch.Tensor):
+        if is_h264_payload(value):
+            split_vs = split_h264_payload(value, split_size, dim)
+        elif isinstance(value, torch.Tensor):
             split_vs = [
                 chunk.contiguous() for chunk in torch.chunk(value, split_size, dim=dim)
             ]
@@ -124,7 +134,9 @@ def stack_list_of_dict_tensor(list_of_dict: list, dim=0):
     ret = {}
     for key in keys:
         _v0 = list_of_dict[0][key]
-        if isinstance(_v0, torch.Tensor):
+        if is_h264_payload(_v0):
+            ret[key] = stack_h264_payloads([d[key] for d in list_of_dict], dim=dim)
+        elif isinstance(_v0, torch.Tensor):
             v_list = [d[key] for d in list_of_dict]
             ret[key] = torch.stack(v_list, dim=dim)
         elif isinstance(_v0, dict):

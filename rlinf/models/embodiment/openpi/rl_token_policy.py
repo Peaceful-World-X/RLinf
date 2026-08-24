@@ -422,6 +422,7 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         if self.replay_embedding_mode not in {
             "full_prefix",
             "frozen_image_last_linear",
+            "frozen_last_token",
         }:
             raise ValueError(
                 f"Unsupported replay_embedding_mode: {self.replay_embedding_mode}"
@@ -850,7 +851,10 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
         features = self._select_token_features(prefix_output)
         visual_latent = self._select_prefix_features(prefix_output)
         replay_embeddings = None
-        if self.replay_embedding_mode == "frozen_image_last_linear":
+        if self.replay_embedding_mode in {
+            "frozen_image_last_linear",
+            "frozen_last_token",
+        }:
             replay_embeddings = self._encode_replay_embeddings_from_features(features)
             rl_token = replay_embeddings[REPLAY_ACTOR_TOKEN_KEY]
         else:
@@ -930,7 +934,10 @@ class OpenPiRLTokenPolicy(torch.nn.Module, BasePolicy):
             "actor_ref_mse": actor_ref_mse.cpu(),
             "rollout_control_source": rollout_source.cpu(),
         }
-        if self.replay_embedding_mode == "frozen_image_last_linear":
+        if self.replay_embedding_mode in {
+            "frozen_image_last_linear",
+            "frozen_last_token",
+        }:
             forward_inputs.update(
                 {key: value.detach().cpu() for key, value in replay_embeddings.items()}
             )

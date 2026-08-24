@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import concurrent.futures
 
 import numpy as np
@@ -44,6 +45,7 @@ class PiperXTTRTCEnvWorker(AsyncEnvWorker):
         self._request_context = None
         self._request_obs = None
         self._live_obs = None
+        self._live_final_obs = None
         self._step_records = []
         self._executed_actions = []
         self._store_current = True
@@ -52,14 +54,29 @@ class PiperXTTRTCEnvWorker(AsyncEnvWorker):
         self._break_cycle = False
         self._consecutive_stale = 0
         self._last_intervening = None
+        self._intervention_active = False
+        self._inference_suppressed = False
+        self._suppress_single_step_substep_encoding = False
+        self._replay_stream_callback = None
+        self._replay_stream_finish = None
 
     def bootstrap_step(self):
         self._reset_ttrtc_state()
         return super().bootstrap_step()
 
+    def _force_vla_rollout_result_for_warmup(
+        self, rollout_result, chunk_step_idx, obs_source=None
+    ) -> bool:
+        """Skip the legacy 15-frame mix; TTRTC already composes the 50-frame plan."""
+        return False
+
     def send_env_batch(self, rollout_channel, env_batch, mode="train"):
         if mode != "train":
             return super().send_env_batch(rollout_channel, env_batch, mode)
+        if self._intervention_active:
+            self._actor_plan = None
+            self._base_plan = None
+            self._plan_index = 0
         previous_actor = previous_base = None
         if self._actor_plan is not None and self._plan_index < len(self._actor_plan):
             previous_actor = self._actor_plan[self._plan_index :].copy()
@@ -82,41 +99,75 @@ class PiperXTTRTCEnvWorker(AsyncEnvWorker):
         self._live_obs = env_batch["obs"]
         payload = dict(env_batch)
         payload["ttrtc_context"] = context
+        self._inference_suppressed = self._intervention_active
+        if self._inference_suppressed:
+            return None
         return super().send_env_batch(rollout_channel, payload, mode)
 
     def recv_rollout_results(self, input_channel, mode="train"):
         if mode != "train":
             return super().recv_rollout_results(input_channel, mode)
-        future = self._executor.submit(
-            super().recv_rollout_results, input_channel, mode
-        )
+        future = None
+        if not self._inference_suppressed:
+            future = self._executor.submit(
+                super().recv_rollout_results, input_channel, mode
+            )
         bootstrap_only = self._cycle_count >= self.n_train_chunk_steps
         self._step_records = []
         self._executed_actions = []
+        stream_callback, self._replay_stream_finish, _ = self._stream_replay_step()
+        self._replay_stream_callback = stream_callback
         while (
-            not future.done()
+            future is not None
+            and not future.done()
             and not bootstrap_only
             and not self._episode_ended
             and not self._break_cycle
         ):
-            if self._actor_plan is None:
+            plan = self._execution_plan()
+            if plan is None:
                 break
-            if self._plan_index >= len(self._actor_plan):
+            if self._plan_index >= len(plan):
                 raise RuntimeError("TTRTC action plan depleted during inference")
-            self._execute_one(self._actor_plan[self._plan_index])
+            self._execute_one(plan[self._plan_index])
             self._plan_index += 1
-        result = future.result()
+        result = (
+            copy.copy(self._current_rollout_result)
+            if future is None
+            else future.result()
+        )
+        if result is None:
+            raise RuntimeError("Cannot suppress PiperX inference before the first result")
+        if future is None:
+            result.forward_inputs = dict(result.forward_inputs)
         self._current_rollout_result = result
         if bootstrap_only:
             self._cycle_count = 0
         return result
 
+    def _execution_plan(self):
+        if self._force_actor_enabled or self._manual_actor_enabled:
+            return self._actor_plan
+        return self._base_plan
+
     def _execute_one(self, action):
         tensor = torch.as_tensor(action, dtype=torch.float32)[None, None]
-        output, info, online = super().env_interact_step(tensor, 0, self._live_obs)
+        self._suppress_single_step_substep_encoding = True
+        try:
+            output, info, online = super().env_interact_step(
+                tensor, 0, self._live_obs
+            )
+        finally:
+            self._suppress_single_step_substep_encoding = False
+        self._live_obs = output.obs
+        self._live_final_obs = output.final_obs
+        output.obs, info = self._replay_stream_callback(
+            output.obs, info, len(self._step_records)
+        )
+        if self.replay_image_encoding == "h264" and output.final_obs is not None:
+            output.final_obs = self._without_replay_images(output.final_obs)
         self._step_records.append((output, info, online))
         self._executed_actions.append(np.asarray(action, dtype=np.float32).copy())
-        self._live_obs = output.obs
         if output.dones is not None and bool(output.dones.any()):
             self._episode_ended = True
         flags = output.intervene_flags
@@ -128,9 +179,22 @@ class PiperXTTRTCEnvWorker(AsyncEnvWorker):
             ):
                 self._break_cycle = True
             self._last_intervening = intervening
+            self._intervention_active = intervening
         valid = online.get("chunk_valid_mask")
         if torch.is_tensor(valid) and not bool(valid.any()):
             self._break_cycle = True
+
+    def _stack_substep_obs(self, obs_list):
+        if self._suppress_single_step_substep_encoding:
+            return {}
+        return super()._stack_substep_obs(obs_list)
+
+    @staticmethod
+    def _without_replay_images(obs):
+        if not isinstance(obs, dict):
+            return obs
+        image_keys = {"main_images", "wrist_images", "extra_view_images"}
+        return {key: value for key, value in obs.items() if key not in image_keys}
 
     def env_interact_step(self, chunk_actions, stage_id, curr_obs=None):
         if stage_id != 0:
@@ -166,8 +230,8 @@ class PiperXTTRTCEnvWorker(AsyncEnvWorker):
             raise RuntimeError(f"TTRTC prefix mismatch: {mismatch}")
 
         stale = previous_actor is not None and elapsed > prefix
-        self._store_current = (
-            not stale and not self._episode_ended and not self._break_cycle
+        self._store_current = self._episode_ended or (
+            not stale and not self._break_cycle
         )
         if self._break_cycle:
             self._actor_plan = None
@@ -190,14 +254,25 @@ class PiperXTTRTCEnvWorker(AsyncEnvWorker):
             and not self._episode_ended
             and not self._break_cycle
         ):
-            if self._actor_plan is None or self._plan_index >= len(self._actor_plan):
+            plan = self._execution_plan()
+            if plan is None or self._plan_index >= len(plan):
                 raise RuntimeError("TTRTC action plan depleted before execute horizon")
-            self._execute_one(self._actor_plan[self._plan_index])
+            self._execute_one(plan[self._plan_index])
             self._plan_index += 1
 
+        cycle_broken = self._break_cycle
+        if self._episode_ended:
+            self._store_current = True
+        elif cycle_broken:
+            self._store_current = False
         output, info, online = self._aggregate_steps(curr_obs)
         self._cycle_count += 1
         self._write_executed_replay_fields(curr_obs, online)
+        if cycle_broken:
+            self._actor_plan = None
+            self._base_plan = None
+            self._plan_index = 0
+            self._break_cycle = False
         return output, info, online
 
     def _aggregate_steps(self, curr_obs):
@@ -226,7 +301,7 @@ class PiperXTTRTCEnvWorker(AsyncEnvWorker):
             flag_values = []
             for out in outputs:
                 action_values.append(
-                    out.intervene_actions
+                    self._reshape_intervene_action_step(out.intervene_actions)
                     if out.intervene_actions is not None
                     else torch.zeros((1, 1, 14), dtype=torch.float32)
                 )
@@ -252,14 +327,15 @@ class PiperXTTRTCEnvWorker(AsyncEnvWorker):
             "executed_env_action_absolute": actions.reshape(1, -1),
             "executed_action_stats": self._executed_action_stats(actions),
         }
-        online.update(self._stack_substep_obs([out.obs for out in outputs]))
-        final_obs = next(
-            (out.final_obs for out in reversed(outputs) if out.final_obs is not None),
-            None,
-        )
+        if self.replay_image_encoding == "h264":
+            online.update(self._replay_stream_finish())
+            self._replay_stream_callback = None
+            self._replay_stream_finish = None
+        else:
+            online.update(self._stack_substep_obs([out.obs for out in outputs]))
         output = EnvOutput(
-            obs=outputs[-1].obs,
-            final_obs=final_obs,
+            obs=self._live_obs,
+            final_obs=self._live_final_obs,
             rewards=rewards,
             dones=dones,
             terminations=terms,
@@ -271,6 +347,10 @@ class PiperXTTRTCEnvWorker(AsyncEnvWorker):
         for _, step_info, _ in self._step_records:
             info.update(step_info)
         return output, info, online
+
+    def _reshape_intervene_action_step(self, action):
+        env_dim = int(self.cfg.actor.model.env_action_dim)
+        return action.reshape(action.shape[0], -1, env_dim)
 
     def _write_executed_replay_fields(self, curr_obs, online):
         result = self._current_rollout_result
@@ -287,6 +367,12 @@ class PiperXTTRTCEnvWorker(AsyncEnvWorker):
         result.forward_inputs["env_action_absolute"] = executed_env
         result.forward_inputs["executed_env_action_absolute"] = executed_env
         result.forward_inputs["chunk_valid_mask"] = online["chunk_valid_mask"]
+        source = int(self._force_actor_enabled or self._manual_actor_enabled)
+        source_value = result.forward_inputs.get("rollout_control_source")
+        source_shape = source_value.shape if torch.is_tensor(source_value) else (1, 1)
+        result.forward_inputs["rollout_control_source"] = torch.full(
+            source_shape, source, dtype=torch.long
+        )
 
     def _append_step_result_if_trainable(self, *args, **kwargs):
         if not self._store_current:

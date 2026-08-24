@@ -119,6 +119,9 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         self._replay_delete_key = "d"
         self._replay_delete_enabled = False
         self._deferred_preload_checkpoint_path = None
+        self._critic_warmup_successes = 0
+        self._critic_warmup_failures = 0
+        self._critic_warmup_outcomes = []
 
     # ------------------------------------------------------------------
     # Initialization
@@ -327,16 +330,20 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         mode = str(
             self.cfg.actor.model.get("replay_embedding_mode", "full_prefix")
         ).lower()
-        self._compressed_replay_enabled = mode == "frozen_image_last_linear"
+        self._compressed_replay_enabled = mode in {
+            "frozen_image_last_linear",
+            "frozen_last_token",
+        }
         if mode == "full_prefix":
             return
-        if mode != "frozen_image_last_linear":
+        if not self._compressed_replay_enabled:
             raise ValueError(f"Unsupported replay_embedding_mode: {mode}")
-        if str(self.cfg.actor.model.get("rl_token_source", "")).lower() != (
-            "image_last_linear"
-        ):
+        expected_source = (
+            "image_last_linear" if mode == "frozen_image_last_linear" else "last_token"
+        )
+        if str(self.cfg.actor.model.get("rl_token_source", "")).lower() != expected_source:
             raise ValueError(
-                "Compressed replay requires rl_token_source='image_last_linear'"
+                f"{mode} requires rl_token_source='{expected_source}'"
             )
         if bool(self.cfg.actor.model.get("actor_train_prefix_token_linear", False)):
             raise ValueError(
@@ -462,6 +469,10 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         else:
             result = self.replay_buffer.delete_last_trajectory()
         if result.get("deleted", False):
+            if self._critic_warmup_outcomes:
+                successes, failures = self._critic_warmup_outcomes.pop()
+                self._critic_warmup_successes -= successes
+                self._critic_warmup_failures -= failures
             self.log_on_first_rank(
                 "[replay-buffer] key='{}' deleted trajectory_id={} "
                 "samples={} file_deleted={} remaining_trajectories={} "
@@ -652,6 +663,45 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         loss = torch.nn.functional.mse_loss(pred_vel, target_vel)
         return loss, coef
 
+    def _actor_residual_jerk_loss(self, actions, ref_action, valid_mask):
+        coef = float(
+            self.cfg.actor.model.get("actor_residual_jerk_loss_coef", 0.0)
+        )
+        if coef <= 0.0 or actions.shape[1] < 3:
+            return actions.new_zeros(()), 0.0
+        residual = actions - ref_action
+        jerk = residual[:, 2:] - 2 * residual[:, 1:-1] + residual[:, :-2]
+        per_step_loss = jerk.square().amax(dim=-1, keepdim=True)
+        if valid_mask is None:
+            return per_step_loss.mean(), coef
+        jerk_mask = valid_mask[:, 2:] * valid_mask[:, 1:-1] * valid_mask[:, :-2]
+        denom = jerk_mask.sum().clamp_min(1.0)
+        return (per_step_loss * jerk_mask).sum() / denom, coef
+
+    def _record_critic_warmup_outcomes(self, trajectories) -> None:
+        for trajectory in trajectories:
+            if trajectory.rewards is None or trajectory.dones is None:
+                self._critic_warmup_outcomes.append((0, 0))
+                continue
+            terminal_rewards = trajectory.rewards[trajectory.dones.to(torch.bool)]
+            successes = int((terminal_rewards > 0).sum().item())
+            failures = int((terminal_rewards <= 0).sum().item())
+            self._critic_warmup_successes += successes
+            self._critic_warmup_failures += failures
+            self._critic_warmup_outcomes.append((successes, failures))
+
+    def _critic_warmup_ready(self) -> bool:
+        cfg = self.cfg.algorithm.get("critic_warmup", None)
+        if not cfg or not bool(cfg.get("enabled", False)):
+            return True
+        return (
+            int(self.replay_buffer.total_samples) >= int(cfg.get("min_samples", 0))
+            and self._critic_warmup_successes
+            >= int(cfg.get("min_success_episodes", 0))
+            and self._critic_warmup_failures
+            >= int(cfg.get("min_failure_episodes", 0))
+        )
+
     @Worker.timer("forward_critic")
     def forward_critic(self, batch):
         critic_loss, q1, q2, target_q, aux = self.td3_algorithm.compute_critic_loss(
@@ -765,11 +815,17 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             q_pi = torch.minimum(q1, q2)
             q_pi_mean = q_pi.mean().item()
 
+        bc_target_name = str(
+            self.cfg.algorithm.get("actor_bc_target", "behavior")
+        ).lower()
+        if bc_target_name not in {"behavior", "reference"}:
+            raise ValueError(f"Unsupported actor_bc_target: {bc_target_name}")
+        bc_target = ref_action if bc_target_name == "reference" else sampled_actions
         if valid_mask is None:
-            bc_loss = torch.nn.functional.mse_loss(actions, sampled_actions)
+            bc_loss = torch.nn.functional.mse_loss(actions, bc_target)
         else:
             denom = valid_mask.expand_as(actions).sum().clamp_min(1.0)
-            bc_loss = (((actions - sampled_actions) ** 2) * valid_mask).sum() / denom
+            bc_loss = (((actions - bc_target) ** 2) * valid_mask).sum() / denom
         robot_state = self.get_robot_state(curr_obs)
         smooth_loss, smooth_coef = self._actor_smooth_loss(
             actions_for_loss, sampled_actions, robot_state
@@ -778,6 +834,11 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         actor_loss, actor_metrics = self.td3_algorithm.compose_actor_loss(q_pi, bc_loss)
         if smooth_coef > 0.0:
             actor_loss = actor_loss + smooth_coef * smooth_loss
+        residual_jerk_loss, residual_jerk_coef = self._actor_residual_jerk_loss(
+            actions, ref_action, valid_mask
+        )
+        if residual_jerk_coef > 0.0:
+            actor_loss = actor_loss + residual_jerk_coef * residual_jerk_loss
 
         if recon_coef > 0.0 and "recon_loss" in actor_aux:
             recon_loss = actor_aux["recon_loss"]
@@ -787,6 +848,8 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         actor_metrics["bc_loss"] = bc_loss.item()
         actor_metrics["smooth_loss"] = smooth_loss.item()
         actor_metrics["smooth_coef"] = smooth_coef
+        actor_metrics["residual_jerk_loss"] = residual_jerk_loss.item()
+        actor_metrics["residual_jerk_coef"] = residual_jerk_coef
         actor_metrics["actor_ref_action_mse"] = torch.nn.functional.mse_loss(
             actions, ref_action
         ).item()
@@ -915,7 +978,10 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
 
         # Actor update (policy delay)
         actor_updated = False
-        freeze_actor = bool(self.cfg.algorithm.get("stage_freeze_actor", False))
+        critic_warmup_ready = self._critic_warmup_ready()
+        freeze_actor = bool(
+            self.cfg.algorithm.get("stage_freeze_actor", False)
+        ) or not critic_warmup_ready
         if (
             self.td3_algorithm.should_update_actor(self.update_step)
             and not freeze_actor
@@ -944,6 +1010,15 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             )
         elif freeze_actor:
             metrics_data["actor/frozen"] = 1.0
+            metrics_data["actor/critic_warmup_active"] = float(
+                not critic_warmup_ready
+            )
+            metrics_data["actor/critic_warmup_successes"] = float(
+                self._critic_warmup_successes
+            )
+            metrics_data["actor/critic_warmup_failures"] = float(
+                self._critic_warmup_failures
+            )
 
         # Target soft update
         tau = self.td3_algorithm.get_target_update_tau(
@@ -987,6 +1062,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
 
     def add_trajectories(self, trajectories: list):
         self.replay_buffer.add_trajectories(trajectories)
+        self._record_critic_warmup_outcomes(trajectories)
         self._maybe_delete_last_replay_trajectory_from_keyboard()
 
     async def recv_rollout_trajectories(self, input_channel: Channel):
@@ -1001,6 +1077,7 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             recv_list.append(trajectory)
 
         self.replay_buffer.add_trajectories(recv_list)
+        self._record_critic_warmup_outcomes(recv_list)
         self._maybe_delete_last_replay_trajectory_from_keyboard()
 
         if self.demo_buffer is not None:

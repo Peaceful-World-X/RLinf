@@ -793,9 +793,7 @@ class PiperEnv(gym.Env):
         left_action, right_action = split_dual_arm_action(action)
 
         # ---- Check teleop state once (ROS node owns channel when active) ----
-        teleop_active = not self.config.is_dummy and rospy.get_param(
-            "/enable_message_publish", False
-        )
+        teleop_active = self._teleop_active()
         self._last_teleop_active = bool(teleop_active)
 
         # ---- Publish control command ----

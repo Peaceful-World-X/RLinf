@@ -54,6 +54,21 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
         self.sync_weight_no_wait = self.cfg.actor.get("sync_weight_no_wait", False)
+        self.sync_weight_on_episode_end = self.cfg.actor.get(
+            "sync_weight_on_episode_end", False
+        )
+        self._last_synced_trajectory_total = 0
+
+    def _should_sync_rollout_weights(self, actor_metrics: dict) -> bool:
+        if not self.sync_weight_on_episode_end:
+            return self.global_step % self.weight_sync_interval == 0
+        trajectory_total = int(
+            actor_metrics.get("replay_buffer/ingested_trajectories", 0)
+        )
+        if trajectory_total <= self._last_synced_trajectory_total:
+            return False
+        self._last_synced_trajectory_total = trajectory_total
+        return True
 
     def get_env_metrics(self) -> tuple[dict, list[dict], list[dict]]:
         results: list[dict] = []
@@ -120,15 +135,13 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             return super().update_rollout_weights()
 
         self._weight_sync_request_total += 1
-        if not self._cleanup_pending_rollout_weight_sync(no_wait):
+        if not self._cleanup_pending_rollout_weight_sync(no_wait=True):
             self._weight_sync_coalesced_total += 1
-            self.logger.info(
-                f"Weight sync coalesced {self._weight_sync_coalesced_total} times.\n"
-                f"Request total {self._weight_sync_request_total} times."
-            )
             return
 
-        rollout_handle: Handle = self.rollout.request_actor_sync_model()
+        rollout_handle: Handle = self.rollout.request_actor_sync_model(
+            self.global_step
+        )
         actor_handle: Handle = self.actor.sync_model_to_rollout()
         self._pending_rollout_weight_sync = (rollout_handle, actor_handle)
 
@@ -173,14 +186,13 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
 
                 if not skip_step:
                     self.global_step += 1
-                    if self.global_step % self.weight_sync_interval == 0:
+                    actor_metrics = self._aggregate_numeric_metrics(actor_result)
+                    if self._should_sync_rollout_weights(actor_metrics):
                         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
 
                     training_metrics = {
                         f"train/{k}": v
-                        for k, v in self._aggregate_numeric_metrics(
-                            actor_result
-                        ).items()
+                        for k, v in actor_metrics.items()
                     }
 
                     run_val, save_model, _ = check_progress(

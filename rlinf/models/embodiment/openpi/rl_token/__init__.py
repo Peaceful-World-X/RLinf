@@ -186,7 +186,10 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         def _get_vla_ref_action(self, obs, ttrtc_context=None):
             """Run VLA flow matching to get reference action ã = πvla(s)."""
             actions, result = self.backbone.predict_action_batch(
-                obs, mode="eval", compute_values=False
+                obs,
+                mode="eval",
+                compute_values=False,
+                ttrtc_context=ttrtc_context,
             )
             if ttrtc_context:
                 from rlinf.models.embodiment.openpi.ttrtc import prepare_basepolicy

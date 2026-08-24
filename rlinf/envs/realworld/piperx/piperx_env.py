@@ -56,6 +56,7 @@ class PiperXRobotConfig(PiperRobotConfig):
     intervention_mode_topic: str = "/piper/intervene_mode"
     subtask_reward_topic: str = "/piper/subtask_reward"
     subtask_reward_value: float = 0.0
+    failure_reward: float = 0.0
     publish_policy_actions: bool = False
     external_reset: bool = True
     wait_enter_after_reset: bool = True
@@ -334,10 +335,11 @@ class PiperXEnv(PiperEnv):
         while True:
             key = self._consume_control_key(("1", "0"))
             if key is not None:
-                reward = float(key == "1")
+                success = key == "1"
+                reward = 1.0 if success else float(self.config.failure_reward)
                 self._operator_print(
                     f"[PIPERX RESULT] "
-                    f"{'SUCCESS' if reward else 'FAILURE'} reward={reward:.1f}"
+                    f"{'SUCCESS' if success else 'FAILURE'} reward={reward:.1f}"
                 )
                 return reward
             time.sleep(poll)
@@ -415,6 +417,21 @@ class PiperXEnv(PiperEnv):
                 {
                     "piperx_actor_enabled": self._piperx_actor_enabled,
                     "piperx_force_actor": self._piperx_force_actor,
+                },
+            )
+
+        if self._last_teleop_active and not self._teleop_active():
+            self._last_teleop_active = False
+            return (
+                self._get_observation(),
+                0.0,
+                False,
+                False,
+                {
+                    "piperx_break_chunk": True,
+                    "piperx_actor_enabled": self._piperx_actor_enabled,
+                    "piperx_force_actor": self._piperx_force_actor,
+                    "piperx_action_executed": False,
                 },
             )
 
