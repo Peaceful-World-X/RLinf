@@ -76,10 +76,10 @@ algorithm:
   target_action_clip: 1.2
   critic_target_action_source: "data_next"
   behavior_action_clip: null
-  bc_coef: 30.0
+  bc_coef: 1.0
   actor_bc_target: "reference"
   # Failure reward is -10, so keep the Q gradient below the reference anchor.
-  actor_q_coef: 0.0002
+  actor_q_coef: 0.002
   critic_action_contrastive:
     coef: 0.5
     margin: 0.01
@@ -109,8 +109,11 @@ algorithm:
     min_samples: 128
     min_success_episodes: 3
     min_failure_episodes: 3
-  tail_curriculum:
+  balanced_return_sampling:
     enabled: true
+    failure_ratio: 0.30
+  tail_curriculum:
+    enabled: false
     start_window: 20
     end_window: 20
     hold_steps: 0
@@ -119,9 +122,9 @@ algorithm:
   replay_buffer:
     image_encoding: h264
     enable_cache: True
-    cache_size: 10
+    cache_size: 1024
     min_buffer_size: 2
-    sample_window_size: 10
+    sample_window_size: 15
     auto_save: True
     delete_last_on_key: True
     delete_last_key: "d"
@@ -268,7 +271,7 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 8
-  global_batch_size: 64
+  global_batch_size: 128
   seed: 1234
   enable_offload: false
   sync_weight_no_wait: true

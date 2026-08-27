@@ -694,12 +694,26 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         cfg = self.cfg.algorithm.get("critic_warmup", None)
         if not cfg or not bool(cfg.get("enabled", False)):
             return True
-        return (
+        ready = (
             int(self.replay_buffer.total_samples) >= int(cfg.get("min_samples", 0))
             and self._critic_warmup_successes
             >= int(cfg.get("min_success_episodes", 0))
             and self._critic_warmup_failures
             >= int(cfg.get("min_failure_episodes", 0))
+        )
+        balanced_cfg = self.cfg.algorithm.get("balanced_return_sampling", None) or {}
+        if not ready or not bool(balanced_cfg.get("enabled", False)):
+            return ready
+        batch_size = int(self.cfg.actor.global_batch_size) // int(self._world_size)
+        failure_ratio = float(balanced_cfg.get("failure_ratio", 0.5))
+        failure_required = int(np.ceil(batch_size * failure_ratio))
+        success_required = batch_size - failure_required
+        counts = self.replay_buffer.count_balanced_mc_return_samples(
+            tail_window_size=0
+        )
+        return (
+            int(counts["failure"]) >= failure_required
+            and int(counts["success"]) >= success_required
         )
 
     @Worker.timer("forward_critic")
@@ -912,12 +926,15 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                     bin_weights=list(return_bin_cfg.get("bin_weights", [])),
                     tail_window_size=tail_window_size,
                 )
-            elif bool(balanced_cfg.get("enabled", False)) and hasattr(
-                self.replay_buffer, "sample_balanced_mc_return"
+            elif (
+                bool(balanced_cfg.get("enabled", False))
+                and self._critic_warmup_ready()
+                and hasattr(self.replay_buffer, "sample_balanced_mc_return")
             ):
                 global_batch = self.replay_buffer.sample_balanced_mc_return(
                     global_batch_size_per_rank,
                     tail_window_size=tail_window_size,
+                    failure_ratio=float(balanced_cfg.get("failure_ratio", 0.5)),
                 )
             else:
                 global_batch = next(self.buffer_dataloader_iter)
@@ -1123,7 +1140,6 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
                 f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping"
             )
             return {}
-
         train_actor_steps = max(
             min_buffer_size, self.cfg.algorithm.get("train_actor_steps", 0)
         )

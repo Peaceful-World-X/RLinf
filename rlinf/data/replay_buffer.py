@@ -15,6 +15,7 @@
 
 import copy
 import json
+import math
 import os
 import pickle as pkl
 import shutil
@@ -1176,11 +1177,8 @@ class TrajectoryReplayBuffer:
             info = self._trajectory_index.get(trajectory_id, None)
             if info is None:
                 continue
-            trajectory = self._load_trajectory(
-                trajectory_id, info["model_weights_id"], decode_images=False
-            )
-            self._ensure_mc_returns(trajectory)
-            mc_return = getattr(trajectory, "forward_inputs", {}).get("mc_return", None)
+            flat = self._get_flat_trajectory_for_sampling(trajectory_id)
+            mc_return = flat.get("forward_inputs", {}).get("mc_return", None)
             if torch.is_tensor(mc_return) and bool(
                 (mc_return.float() > 1e-6).any().item()
             ):
@@ -1191,48 +1189,132 @@ class TrajectoryReplayBuffer:
         self._return_balanced_failure_ids = failure_ids
         self._return_balanced_cache_version = self._index_version
 
+    def _return_balanced_entries(
+        self, trajectory_ids: list[int], tail_window_size: int = 0
+    ) -> list[tuple[int, int]]:
+        entries: list[tuple[int, int]] = []
+        tail_window_size = max(0, int(tail_window_size))
+        for trajectory_id in trajectory_ids:
+            info = self._trajectory_index[int(trajectory_id)]
+            flat = self._get_flat_trajectory_for_sampling(int(trajectory_id))
+            num_samples = min(int(info["num_samples"]), self._flat_num_samples(flat))
+            valid = self._valid_local_indices_for_filter(flat, num_samples)
+            if valid is None:
+                valid = torch.arange(num_samples, dtype=torch.long)
+            if tail_window_size > 0:
+                offset = max(0, num_samples - min(num_samples, tail_window_size))
+                valid = valid[valid >= offset]
+            entries.extend(
+                (int(trajectory_id), int(local_idx)) for local_idx in valid.tolist()
+            )
+        return entries
+
+    def count_balanced_mc_return_samples(
+        self, tail_window_size: int = 0
+    ) -> dict[str, int]:
+        self._ensure_return_balanced_ids()
+        success_entries = self._return_balanced_entries(
+            list(getattr(self, "_return_balanced_success_ids", [])),
+            tail_window_size,
+        )
+        failure_entries = self._return_balanced_entries(
+            list(getattr(self, "_return_balanced_failure_ids", [])),
+            tail_window_size,
+        )
+        return {
+            "success": len(success_entries),
+            "failure": len(failure_entries),
+        }
+
+    def _recent_balanced_entries(
+        self,
+        trajectory_ids: list[int],
+        required_count: int,
+        tail_window_size: int = 0,
+    ) -> list[tuple[int, int]]:
+        window_size = max(0, int(self.sample_window_size))
+        if window_size <= 0:
+            return self._return_balanced_entries(trajectory_ids, tail_window_size)
+
+        recent_ids = set(self._trajectory_id_list[-window_size:])
+        recent_class_ids = [tid for tid in trajectory_ids if tid in recent_ids]
+        entries = self._return_balanced_entries(recent_class_ids, tail_window_size)
+        if len(entries) >= required_count:
+            return entries
+
+        for trajectory_id in reversed(trajectory_ids):
+            if trajectory_id in recent_ids:
+                continue
+            entries.extend(
+                self._return_balanced_entries([trajectory_id], tail_window_size)
+            )
+            if len(entries) >= required_count:
+                break
+        return entries
+
     def sample_balanced_mc_return(
-        self, num_chunks: int, tail_window_size: int = 0
+        self,
+        num_chunks: int,
+        tail_window_size: int = 0,
+        failure_ratio: float = 0.5,
     ) -> dict[str, torch.Tensor]:
         self._ensure_return_balanced_ids()
         success_ids = list(getattr(self, "_return_balanced_success_ids", []))
         failure_ids = list(getattr(self, "_return_balanced_failure_ids", []))
         if not success_ids or not failure_ids:
-            return self.sample_chunks(num_chunks)
+            return {}
+
+        failure_ratio = min(max(float(failure_ratio), 0.0), 1.0)
+        failure_count = int(math.ceil(int(num_chunks) * failure_ratio))
+        success_count = int(num_chunks) - failure_count
+        success_entries = self._recent_balanced_entries(
+            success_ids, success_count, tail_window_size
+        )
+        failure_entries = self._recent_balanced_entries(
+            failure_ids, failure_count, tail_window_size
+        )
+        if len(success_entries) < success_count or len(failure_entries) < failure_count:
+            return {}
 
         flats: list[dict] = []
         buffer_indices: list[int] = []
         rng = self.random_generator
-        id_groups = (success_ids, failure_ids)
-        group_offsets = torch.randint(0, 2, (1,), generator=rng).item()
+        success_order = torch.randperm(len(success_entries), generator=rng)[
+            :success_count
+        ].tolist()
+        failure_order = torch.randperm(len(failure_entries), generator=rng)[
+            :failure_count
+        ].tolist()
+        selected_success = [success_entries[idx] for idx in success_order]
+        selected_failure = [failure_entries[idx] for idx in failure_order]
 
-        # Interleave success and failure samples. The TD3 worker splits the global
-        # batch into micro-batches, so putting all positives before all zero-return
-        # samples prevents per-micro-batch margin losses from ever seeing both.
-        for sample_idx in range(int(num_chunks)):
-            ids = id_groups[(int(sample_idx) + int(group_offsets)) % 2]
-            pick = int(torch.randint(0, len(ids), (1,), generator=rng).item())
-            tid = int(ids[pick])
-            info = self._trajectory_index[tid]
-            trajectory = self._load_trajectory(
-                tid, info["model_weights_id"], decode_images=False
-            )
-            flat = self._flatten_trajectory(trajectory)
-            num_samples = min(int(info["num_samples"]), self._flat_num_samples(flat))
-            available = (
-                min(num_samples, int(tail_window_size))
-                if int(tail_window_size) > 0
-                else num_samples
-            )
-            offset = max(0, num_samples - available)
-            local = (
-                int(torch.randint(0, available, (1,), generator=rng).item()) + offset
-            )
-            local = self._sample_local_from_filter(flat, num_samples, local)
-            flats.append(flat)
+        success_idx = 0
+        failure_idx = 0
+        accumulator = 0
+        failure_flags = []
+        for _ in range(int(num_chunks)):
+            accumulator += failure_count
+            use_failure = accumulator >= int(num_chunks)
+            if use_failure:
+                accumulator -= int(num_chunks)
+                tid, local = selected_failure[failure_idx]
+                failure_idx += 1
+            else:
+                tid, local = selected_success[success_idx]
+                success_idx += 1
+            flats.append(self._get_flat_trajectory_for_sampling(tid))
             buffer_indices.append(local)
+            failure_flags.append(use_failure)
 
-        return self._sample_from_flat_specs(flats, buffer_indices)
+        return self._sample_from_flat_specs(
+            flats,
+            buffer_indices,
+            sample_meta={
+                "sample_is_failure": torch.as_tensor(
+                    failure_flags, dtype=torch.bool
+                ).reshape(-1, 1)
+            },
+        )
 
     def _flat_num_samples(self, flat: dict) -> int:
         lengths: list[int] = []
