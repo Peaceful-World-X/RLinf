@@ -259,7 +259,10 @@ def old_to_new_state_dict(
     # ``paligemma.lm_head``, width = PaliGemma width, e.g. 2048). The action
     # expert's 1024-wide head must not be used as the embedder.
     lm_head_key = None
-    if "paligemma_with_expert.paligemma.lm_head.weight" in openpi_pytorch_state_dict:
+    embedding_key = _PALI_LLM + "embed_tokens.weight"
+    if embedding_key in openpi_pytorch_state_dict:
+        lm_head_key = embedding_key
+    elif "paligemma_with_expert.paligemma.lm_head.weight" in openpi_pytorch_state_dict:
         lm_head_key = "paligemma_with_expert.paligemma.lm_head.weight"
     elif (
         "paligemma_with_expert.gemma_expert.lm_head.weight" in openpi_pytorch_state_dict

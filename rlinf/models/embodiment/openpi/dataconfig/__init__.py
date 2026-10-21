@@ -73,11 +73,22 @@ from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.ur7_dataconfig import (
+    LeRobotUR7DataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.yam_dataconfig import (
     LeRobotYamDataConfig,
 )
 
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_ur7",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
+        data=LeRobotUR7DataConfig(
+            repo_id="ur7",
+            assets=AssetsConfig(asset_id="assets"),
+        ),
+    ),
     TrainConfig(
         name="pi0_libero",
         model=pi0_config.Pi0Config(),

@@ -611,7 +611,8 @@ class Pi0(model.BaseModel):
 
     @property
     def device(self) -> torch.device:
-        return next(self.parameters()).device
+        # FSDP-offloaded parameter storage is on CPU between forwards.
+        return getattr(self.img, "compute_device", next(self.parameters()).device)
 
     @property
     def _no_split_modules(self) -> list[str] | None:
@@ -681,7 +682,8 @@ class Pi0(model.BaseModel):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         self._require_rlt()
         rlt_param = next(self.rlt_module.parameters())
-        prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
+        device = getattr(self.rlt_module, "compute_device", rlt_param.device)
+        prefix_output = prefix_output.to(device=device, dtype=rlt_param.dtype)
         rlt_mask = prefix_mask if self.rlt_cfg.rlt_use_mask else None
         return self.rlt_module(prefix_output, rlt_mask)
 
