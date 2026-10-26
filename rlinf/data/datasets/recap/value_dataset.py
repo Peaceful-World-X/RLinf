@@ -59,6 +59,13 @@ _MODEL_TYPE_MAP = {
 }
 
 _REPACK_KEYS = {
+    "ur7": {
+        "observation/image": "observation.images.base",
+        "observation/wrist_image": "observation.images.wrist",
+        "observation/state": "observation.state",
+        "actions": "action",
+        "prompt": "prompt",
+    },
     "libero": {
         "observation/image": "image",
         "observation/wrist_image": "wrist_image",
@@ -331,6 +338,10 @@ class ValueDataset(Dataset):
                     model_type=model_type_enum,
                 )
             )
+        elif robot == "ur7":
+            from rlinf.models.embodiment.openpi.policies.ur7_policy import UR7Inputs
+
+            transforms_list.append(UR7Inputs())
 
         transforms_list.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
         transforms_list.append(_openpi_transforms.PadStatesAndActions(action_dim))

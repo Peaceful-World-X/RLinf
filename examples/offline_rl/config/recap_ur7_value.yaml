@@ -1,0 +1,105 @@
+# Run: .venv/bin/python examples/offline_rl/advantage_labeling/recap/ur7_value.py all
+defaults:
+  - model/recap_value_model@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/offline_rl/config/
+
+task:
+  dataset: /16T-2/sudu/code/.data/bund_20260917_n906_v21_new
+  output_root: /16T-2/sudu/code/.result2/RECAP/RLinf
+  failure_episodes: [198, 357]
+  test_episode: 0
+  validation_episodes: 91
+  failure_reward: -300.0
+  patience: 5
+  min_delta: 0.001
+  min_steps: 2000
+  siglip_revision: 78e403963a4f6a3640d07803284752326fdf4edf
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 2-3
+
+runner:
+  task_type: sft
+  max_steps: 8000
+  max_epochs: -1
+  save_interval: 500
+  val_check_interval: 500
+  logger:
+    log_path: /16T-2/sudu/code/.result2/RECAP/RLinf
+    project_name: rlinf
+    experiment_name: ur7_value
+    logger_backends: [tensorboard]
+
+data:
+  tag: ur7_fail300
+  robot_type: ur7
+  model_type: pi05
+  action_dim: 32
+  action_horizon: 1
+  balance_weights: false
+  seed: 42
+  train_num_workers: 4
+  eval_num_workers: 2
+  persistent_workers: false
+  pin_memory: true
+  prefetch_factor: 2
+  gamma: 1.0
+  normalize_to_minus_one_zero: true
+  include_state: true
+  include_next_obs: false
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  seed: 42
+  micro_batch_size: 2
+  global_batch_size: 32
+  enable_offload: false
+  model:
+    precision: bf16
+    freeze_vlm: false
+    siglip_path: /16T-2/sudu/code/.data/recap_models/siglip2-so400m-patch14-224
+    gemma3_path: /16T-2/sudu/code/.data/evo_rl_models/gemma-3-270m
+    tokenizer_path: /16T-2/sudu/code/.data/evo_rl_models/gemma-3-270m
+    action_dim: 32
+    action_horizon: 1
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    use_orig_params: false
+    gradient_checkpointing: false
+    cpu_offload: false
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: bf16
+      buffer_dtype: bf16
+  optim:
+    lr: 5.0e-5
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: constant
+    lr_warmup_steps: 500
+    total_training_steps: 8000
+
+reward:
+  use_reward_model: false
+critic:
+  use_critic_model: false
