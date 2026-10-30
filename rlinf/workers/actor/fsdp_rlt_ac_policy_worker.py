@@ -100,7 +100,9 @@ class RLTACLossMixin:
         actions: torch.Tensor,
         ref_chunk: torch.Tensor,
         intervene_flags: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+        bc_weight: float = 1.0,
+        success_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         chunk_len, action_dim = self._chunk_shape()
         pi_chunk = self._flatten_chunk(pi).reshape(-1, chunk_len, action_dim)
         action_chunk = self._flatten_chunk(actions).reshape(-1, chunk_len, action_dim)
@@ -121,11 +123,42 @@ class RLTACLossMixin:
                 .any(dim=-1)
             )
 
+        human_weight = self.cfg.algorithm.get("human_bc_weight", None)
+        autonomous_weight = self.cfg.algorithm.get("autonomous_bc_weight", None)
+        valid_mask = torch.ones_like(human_mask)
+        step_weights = pi_chunk.new_full(human_mask.shape, bc_weight)
+        if human_weight is not None or autonomous_weight is not None:
+            if human_weight is None or autonomous_weight is None:
+                raise ValueError("Set both human_bc_weight and autonomous_bc_weight")
+            human_weight, autonomous_weight = (
+                float(human_weight),
+                float(autonomous_weight),
+            )
+            if not all(
+                0 <= w < float("inf") for w in (human_weight, autonomous_weight)
+            ):
+                raise ValueError(
+                    "Human/autonomous BC weights must be finite and nonnegative"
+                )
+            if (
+                success_mask is None
+                or success_mask.dtype != torch.bool
+                or success_mask.shape != human_mask.shape
+            ):
+                raise ValueError(
+                    "Weighted BC requires boolean forward_inputs.bc_success [batch, horizon]; prepare the labeled replay first"
+                )
+            valid_mask = success_mask.to(device=pi_chunk.device)
+            step_weights = torch.where(human_mask, human_weight, autonomous_weight)
+            step_weights = step_weights * valid_mask
         bc_target = torch.where(human_mask[..., None], action_chunk, bc_ref_chunk)
         bc_error = torch.mean(torch.square(pi_chunk - bc_target), dim=-1)
-        bc_loss = torch.mean(bc_error)
+        # One shared denominator preserves the configured per-step weight ratio.
+        weighted_bc = torch.mean(bc_error * step_weights)
+        bc_loss = torch.mean(bc_error * valid_mask)
 
-        policy_mask = ~human_mask
+        policy_mask = ~human_mask & valid_mask
+        human_mask = human_mask & valid_mask
         ref_error = torch.mean(torch.square(pi_chunk - bc_ref_chunk), dim=-1)
         human_error = torch.mean(torch.square(pi_chunk - action_chunk), dim=-1)
         bc_ref = torch.sum(ref_error * policy_mask.to(ref_error.dtype)) / torch.clamp(
@@ -141,9 +174,45 @@ class RLTACLossMixin:
             "bc_ref_loss": bc_ref.detach().item(),
             "bc_human_loss": bc_human.detach().item(),
             "human_mask_ratio": human_ratio,
-            "policy_mask_ratio": 1.0 - human_ratio,
+            "policy_mask_ratio": policy_mask.float().mean().item(),
         }
-        return bc_loss, metrics
+        if human_weight is not None:
+            metrics.update(
+                human_bc_weight=human_weight,
+                autonomous_bc_weight=autonomous_weight,
+                bc_excluded_ratio=(~valid_mask).float().mean().item(),
+            )
+        execution_loss = pi_chunk.new_zeros(())
+        execution_cfg = self.cfg.algorithm.get("execution_loss", None)
+        if execution_cfg is not None:
+            indices = list(execution_cfg.action_indices)
+            scale = pi_chunk.new_tensor(list(execution_cfg.action_scale))
+            if (
+                not indices
+                or len(indices) != scale.numel()
+                or min(indices) < 0
+                or max(indices) >= action_dim
+                or not torch.isfinite(scale).all()
+                or (scale <= 0).any()
+            ):
+                raise ValueError("Execution loss requires valid action indices/scales")
+            # Affine offsets cancel; compare selected joints in physical units.
+            error = (pi_chunk - bc_target)[..., indices] * scale
+            joint_loss = (error.square().mean(-1) * valid_mask).mean()
+            delta_loss = (
+                (error[:, 1:] - error[:, :-1]).square().mean(-1)
+                * (valid_mask[:, 1:] & valid_mask[:, :-1])
+            ).mean()
+            execution_loss = (
+                float(execution_cfg.joint_weight) * joint_loss
+                + float(execution_cfg.delta_weight) * delta_loss
+            )
+            metrics.update(
+                joint_abs_loss=joint_loss.detach().item(),
+                delta_loss=delta_loss.detach().item(),
+                weighted_execution_loss=execution_loss.detach().item(),
+            )
+        return weighted_bc, execution_loss, metrics
 
     def _actor_objective_weights(self) -> tuple[float, float, dict[str, float]]:
         """Resolve RLT actor-objective BC/Q weights."""
@@ -228,6 +297,7 @@ class RLTACLossMixin:
         return self.model(
             forward_type=ForwardType.SAC,
             obs=next_obs,
+            deterministic=self.cfg.algorithm.get("deterministic_actor", False),
         )
 
     @Worker.timer("forward_critic")
@@ -311,6 +381,7 @@ class RLTACLossMixin:
             obs=curr_obs,
             apply_reference_dropout=True,
             reference_dropout_prob=reference_dropout_prob,
+            deterministic=self.cfg.algorithm.get("deterministic_actor", False),
         )
         if log_pi.ndim == 1:
             log_pi = log_pi.unsqueeze(-1)
@@ -342,17 +413,19 @@ class RLTACLossMixin:
         metrics["q_pi"] = qf_pi.mean().item()
 
         ref_chunk = self._ref_chunk(curr_obs)
-        bc_loss, rlt_metrics = self._bc_metrics(
+        bc_weight, q_weight, weight_metrics = self._actor_objective_weights()
+        weighted_bc, execution_loss, rlt_metrics = self._bc_metrics(
             pi=pi,
             actions=batch["actions"],
             ref_chunk=ref_chunk,
             intervene_flags=batch.get("intervene_flags", None),
+            bc_weight=bc_weight,
+            success_mask=batch.get("forward_inputs", {}).get("bc_success", None),
         )
         metrics.update(rlt_metrics)
 
         entropy = -log_pi.mean()
-        bc_weight, q_weight, weight_metrics = self._actor_objective_weights()
-        actor_loss = -q_weight * qf_pi.mean() + bc_weight * bc_loss
+        actor_loss = -q_weight * qf_pi.mean() + weighted_bc + execution_loss
         metrics.update(weight_metrics)
         metrics["action_ref_abs_mean"] = (
             (self._flatten_chunk(pi) - self._flatten_chunk(ref_chunk))
@@ -362,7 +435,7 @@ class RLTACLossMixin:
             .item()
         )
         metrics["weighted_q"] = (q_weight * qf_pi.mean()).detach().item()
-        metrics["weighted_bc"] = (bc_weight * bc_loss).detach().item()
+        metrics["weighted_bc"] = weighted_bc.detach().item()
         metrics["reference_dropout_prob"] = reference_dropout_prob
 
         return actor_loss, entropy, metrics

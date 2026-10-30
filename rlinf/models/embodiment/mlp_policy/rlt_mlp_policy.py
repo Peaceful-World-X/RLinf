@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
@@ -37,6 +39,10 @@ class RLTMLPPolicy(MLPPolicy):
         add_q_head: bool = True,
         q_head_type: str = "default",
         fixed_std: float = 0.002,
+        action_anchor: str = "none",
+        action_output_scale: float = 1.0,
+        action_output_activation: str = "tanh",
+        zero_init_actor: bool = False,
     ):
         if not add_q_head:
             raise ValueError(
@@ -77,6 +83,22 @@ class RLTMLPPolicy(MLPPolicy):
         self.fixed_std = float(fixed_std)
         if self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
+        if action_anchor not in {"none", "state", "reference"}:
+            raise ValueError(f"Unsupported action_anchor: {action_anchor!r}")
+        if action_anchor == "state" and proprio_dim != step_action_dim:
+            raise ValueError("State anchors require matching state/action coordinates.")
+        if not math.isfinite(action_output_scale) or action_output_scale <= 0:
+            raise ValueError("action_output_scale must be finite and positive.")
+        self.action_anchor = action_anchor
+        self.action_output_scale = float(action_output_scale)
+        if action_output_activation not in {"tanh", "linear"}:
+            raise ValueError(
+                f"Unsupported action activation: {action_output_activation}"
+            )
+        self.action_output_activation = action_output_activation
+        if zero_init_actor:
+            torch.nn.init.zeros_(self.actor_mean.weight)
+            torch.nn.init.zeros_(self.actor_mean.bias)
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -135,6 +157,20 @@ class RLTMLPPolicy(MLPPolicy):
     def _format_chunk_actions(self, actions: torch.Tensor) -> torch.Tensor:
         return actions.reshape(-1, self.chunk_len, self.step_action_dim)
 
+    def _compose_actions(self, actions: torch.Tensor, obs: dict) -> torch.Tensor:
+        """Return final actions in replay coordinates, including any fixed anchor.
+
+        State anchors require proprio and actions to use the same affine units.
+        Reference dropout affects network inputs, never the execution anchor.
+        """
+        actions = actions * self.action_output_scale
+        if self.action_anchor == "reference":
+            return actions + self._get_ref_chunk(obs)
+        if self.action_anchor == "state":
+            anchor = self._get_proprio(obs).unsqueeze(1)
+            return actions + anchor.expand(-1, self.chunk_len, -1).reshape_as(actions)
+        return actions
+
     def sac_forward(
         self,
         obs,
@@ -154,7 +190,9 @@ class RLTMLPPolicy(MLPPolicy):
         probs = Normal(action_mean, action_std)
         action = action_mean if deterministic else probs.rsample()
         chunk_logprobs = probs.log_prob(action)
-        action = torch.tanh(action)
+        if self.action_output_activation == "tanh":
+            action = torch.tanh(action)
+        action = self._compose_actions(action, obs)
         return action, chunk_logprobs, None
 
     def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):
@@ -201,6 +239,7 @@ class RLTMLPPolicy(MLPPolicy):
         )
         actor_state = self._actor_state(obs)
         pred_actions = self.actor_mean(self.backbone(actor_state))
+        pred_actions = self._compose_actions(pred_actions, obs)
         return F.mse_loss(pred_actions, target_actions, reduction="none")
 
     @torch.inference_mode()

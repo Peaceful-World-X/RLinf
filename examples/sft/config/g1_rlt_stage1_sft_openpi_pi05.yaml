@@ -1,0 +1,123 @@
+defaults:
+  - model/pi0_5@actor.model
+  - hybrid_engines/openpi_fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 2                                                    # 训练卡编号；工作流入口覆盖为 0–3
+
+runner:
+  task_type: sft
+  logger:
+    # 阶段 1 的日志与权重输出目录
+    log_path: "/16T-2/sudu/code/.result2/RLT/RLinf/zd_20261026/stage1"
+    project_name: rlinf-rlt
+    experiment_name: "train"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: -1
+  max_steps: 5000                                               # 训练更新次数上限
+  val_check_interval: -1                                        # -1 表示关闭训练入口的定期验证
+  save_interval: 500                                            # 每隔多少步保存权重
+
+data:
+  # LeRobot 数据集根目录，包含 data/ 和 meta/
+  train_data_paths: "/16T-2/sudu/code/.data/zd_20260826_0908_merged_d14_lerobotv3"
+  # 固定训练与验证轨迹划分，避免相邻窗口泄漏
+  episode_split_path: "/16T-2/sudu/code/.result2/RLT/RLinf/zd_20261026/episode_split.json"
+  num_workers: 0
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1                                           # 每卡单次前向的样本数，影响显存占用
+  global_batch_size: 1                                          # 所有卡合计 batch；工作流入口覆盖为 4
+  seed: 42                                                      # 随机种子，用于复现实验
+
+  model:
+    load_to_device: False
+    precision: fp32                                             # 模型加载精度；具体模块精度由下方规则控制
+    model_type: "openpi"
+    is_lora: False
+    # 转换后的 G1 pi0.5 PyTorch 权重目录
+    model_path: "/16T-2/sudu/code/.data/.model/g1_zip_tie_20k_rlinf"
+    num_action_chunks: 1
+    action_dim: 16                                              # 真实动作维度：14 个关节＋2 个夹爪
+    add_value_head: False
+    num_steps: 4                                                # VLA 动作推理的去噪步数
+    openpi_data:
+      # 归一化资产标识，阶段 2 与推理需保持一致
+      repo_id: "g1"
+      # 与 VLA 权重配套的状态、动作归一化统计文件
+      norm_stats_path: "/16T-2/sudu/code/.result/pi05_h20_zd_20260826_0908_merged_d14/20000/assets/norm_stats.json"
+
+    openpi:
+      embed_dtype: bf16                                         # VLA 图像和语言编码的计算精度
+      task: sft
+      config_name: "pi05_g1_dualgripper"
+      num_images_in_input: 3                                    # 三路相机：高位、左腕、右腕
+      torch_compile: False
+      train_expert_only: False
+      noise_method: "flow_noise"
+      noise_params: [0.16, 0.12, 200]
+      joint_logprob: True
+      detach_critic_input: True
+      action_horizon: 50                                        # VLA 预测长度，与阶段 2 执行长度不同
+      action_chunk: ${actor.model.num_action_chunks}
+      action_env_dim: ${actor.model.action_dim}
+      num_steps: ${actor.model.num_steps}
+      model_action_dim: 32
+      paligemma_variant: "gemma_2b"
+      action_expert_variant: "gemma_300m"
+      max_token_len: 200
+      discrete_state_input: True
+
+      use_rlt: True                                             # 开启 RLToken 特征重构
+      rlt_alpha: 1.0                                            # VLA loss 系数；总损失＝RLT loss＋系数×VLA loss
+      rlt_prefix_seq_len: 1024                                  # RLT 重构序列的配置长度
+      rlt_image_only: False                                     # false 表示保留图像和语言前缀
+      rlt_use_mask: True                                        # 使用有效位置掩码，排除填充位置
+
+  optim:
+    lr: 1e-5                                                    # 峰值学习率
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: ${runner.max_steps}
+    lr_warmup_steps: 500                                        # 学习率预热步数
+    lr_scheduler: "cosine"
+    num_cycles: 0.5
+    min_lr: 2.5e-6                                              # 学习率衰减的下限
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"                               # 不分片，每卡保留完整模型参数
+    use_orig_params: True
+    cpu_offload: True                                           # 将参数卸载到 CPU，节省 GPU 显存
+    gradient_checkpointing: False
+    wrappers:
+      rlt_features:
+        module_names: [rlt_module]
+        wrap_mode: individual
+      rlt_blocks:
+        module_classes: [RLTSelfAttentionLayer]
+        wrap_mode: individual
+    mixed_precision_rules:
+      rlt_features: fp32                                        # RLT 模块使用 FP32
+      rlt_blocks: fp32                                          # RLT 注意力层使用 FP32
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32

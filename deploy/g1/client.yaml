@@ -1,0 +1,43 @@
+server:
+  uri: ws://127.0.0.1:8014  # 改为运行 RLinf 服务的机器地址。
+  connect_timeout_s: 10.0
+  timeout_s: 30.0  # 仅网络后台线程等待；首次 GPU 推理可能较慢。
+prompt: Fasten the zip tie.
+control:
+  hz: 30.0
+  clip_gripper: true  # 夹爪裁剪到 0～100；关节越界仍暂停。
+rtc:
+  enabled: true  # 客户端异步预取，不向模型传 RTC 前缀。
+  prefetch_remaining_steps: 9
+  blend_steps: 2  # 只融合同模式的关节动作，夹爪不融合。
+  max_response_age_s: 0.5  # 观测到动作返回的最长允许时间，超时保持并由回车恢复。
+robot:
+  network_interface: eth0  # 改为连接 G1 的网卡；使用 rt/arm_sdk，仅接管双臂。
+  domain_id: 0
+  connect_timeout_s: 10.0
+  state_timeout_s: 0.5
+  arm_hz: 250.0
+  gripper_hz: 200.0
+  max_joint_velocity_rad_s: 1.0
+  gripper:
+    closed_rad: [0.0, 0.0]  # 左、右；数据集 0 = 闭合。
+    open_rad: [5.4, 5.4]  # 数据集 100 = 张开。
+    max_velocity_rad_s: 5.4
+cameras:
+  width: 640
+  height: 480
+  fps: 30
+  max_age_s: 0.5
+  connect_timeout_s: 10.0
+  serials:  # 压缩包中的示例序列号，按实际头部/左腕/右腕核对。
+    cam_high: '339522301180'
+    cam_left_wrist: '230422271412'
+    cam_right_wrist: '230322276189'
+reset:
+  # source_cache/dataset episode 000, frame 0, observation.state；前左7、右7，最后双夹爪。
+  state: [0.4667975604534149, 0.2040673941373825, 0.05032176151871681, -0.5809472799301147, -0.3648237884044647, 0.2745106518268585, -0.2407870590686798, 0.39217180013656616, -0.14352308213710785, 0.003787015099078417, -0.37787461280822754, 0.021152157336473465, -0.03807388246059418, 0.18881146609783173, 0.18926726281642914, 0.258152574300766]
+  max_joint_velocity_rad_s: 1.0
+  gripper_speed: 50.0
+  joint_tolerance_rad: 0.03
+  gripper_tolerance: 2.0
+  timeout_s: 15.0

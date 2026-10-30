@@ -1,0 +1,7 @@
+# Client only; install Unitree's Python SDK separately in the same environment.
+numpy==1.26.4
+PyYAML>=6,<7
+msgpack>=1,<2
+websockets>=14,<16
+pin==2.7.0
+pyrealsense2>=2.54,<3

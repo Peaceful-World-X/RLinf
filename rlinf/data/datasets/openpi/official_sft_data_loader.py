@@ -17,11 +17,16 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
 
-from rlinf.data.storage.lerobot import resolve_lerobot_repo_id
+from rlinf.data.storage.lerobot import (
+    resolve_lerobot_dataset_root,
+    resolve_lerobot_repo_id,
+)
 from rlinf.models.embodiment.openpi.transforms.pipeline import (
     norm_stats_path_from_data_kwargs,
     select_openpi_norm_stats,
@@ -36,7 +41,6 @@ def build_official_openpi_sft_dataloader(
     eval_dataset: bool = False,
 ) -> tuple[Any, Any]:
     """Build the SFT loader provided by OpenPI for a LeRobot dataset."""
-    del rank
     repo_id = resolve_lerobot_repo_id(data_paths)
     if repo_id is None:
         raise ValueError(
@@ -75,10 +79,84 @@ def build_official_openpi_sft_dataloader(
     )
     _validate_openpi_model_shape(model_cfg, config)
 
-    data_loader = openpi_data_loader.create_data_loader(
-        config, framework="pytorch", shuffle=not eval_dataset
+    root = resolve_lerobot_dataset_root(repo_id)
+    info_path = root / "meta/info.json"
+    is_v3 = (
+        info_path.is_file()
+        and json.loads(info_path.read_text()).get("codebase_version") == "v3.0"
     )
+    episode_indices = _episode_indices(cfg, eval_dataset)
+    if is_v3:
+        import openpi.transforms as transforms
+        from torch.utils.data.distributed import DistributedSampler
+
+        from rlinf.data.datasets.openpi.lerobot_v3_dataset import LeRobotV3Dataset
+
+        data_config = config.data.create(config.assets_dirs, config.model)
+        dataset = LeRobotV3Dataset(
+            root,
+            config.model.action_horizon,
+            data_config.action_sequence_keys,
+            episode_indices=episode_indices,
+            video_cache_size=int(
+                OmegaConf.select(cfg, "data.video_cache_size", default=3)
+            ),
+        )
+        if data_config.prompt_from_task:
+            dataset = openpi_data_loader.TransformedDataset(
+                dataset, [transforms.PromptFromLeRobotTask(dataset.tasks)]
+            )
+        dataset = openpi_data_loader.transform_dataset(dataset, data_config)
+        sampler = (
+            DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=not eval_dataset,
+                seed=config.seed,
+                drop_last=True,
+            )
+            if world_size > 1
+            else None
+        )
+        inner = openpi_data_loader.TorchDataLoader(
+            dataset,
+            local_batch_size=batch_size,
+            shuffle=sampler is None and not eval_dataset,
+            sampler=sampler,
+            num_workers=config.num_workers,
+            seed=config.seed,
+            framework="pytorch",
+        )
+        data_loader = openpi_data_loader.DataLoaderImpl(data_config, inner)
+    else:
+        if episode_indices is not None:
+            raise ValueError(
+                "Episode selection currently requires a local LeRobot v3 dataset"
+            )
+        data_loader = openpi_data_loader.create_data_loader(
+            config, framework="pytorch", shuffle=not eval_dataset
+        )
     return data_loader, data_loader.data_config()
+
+
+def _episode_indices(cfg: Any, eval_dataset: bool) -> list[int] | None:
+    key = "val_episode_indices" if eval_dataset else "train_episode_indices"
+    selected = OmegaConf.select(cfg, f"data.{key}", default=None)
+    split_path = OmegaConf.select(cfg, "data.episode_split_path", default=None)
+    if split_path:
+        if any(
+            OmegaConf.select(cfg, f"data.{name}", default=None) is not None
+            for name in ("train_episode_indices", "val_episode_indices")
+        ):
+            raise ValueError(
+                "Use episode_split_path or explicit episode lists, not both"
+            )
+        split = json.loads(Path(split_path).expanduser().read_text())
+        if key not in split:
+            raise ValueError(f"Missing {key} in episode split {split_path}")
+        selected = split[key]
+    return None if selected is None else list(selected)
 
 
 def get_official_openpi_sft_num_batches(data_loader: Any) -> int:

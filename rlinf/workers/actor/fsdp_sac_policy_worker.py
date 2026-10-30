@@ -43,7 +43,11 @@ from rlinf.utils.nested_dict_process import (
     put_tensor_device,
     split_dict_to_chunk,
 )
-from rlinf.utils.utils import clear_memory, collect_param_names_need_sync
+from rlinf.utils.utils import (
+    clear_memory,
+    collect_param_names_need_sync,
+    seed_everything,
+)
 from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 
 
@@ -66,12 +70,21 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.demo_buffer = None
         self.alpha_optimizer = None
         self.update_step = 0
+        self.actor_update_step = 0
         self.enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
 
     def init_worker(self):
+        seed_global_rng = self.cfg.actor.get("seed_global_rng", False)
+        if seed_global_rng:
+            seed_everything(self.cfg.actor.seed)
         self.setup_model_and_optimizer(initialize_target=True)
         self.setup_sac_components()
         self.soft_update_target_model(tau=1.0)
+        if seed_global_rng:
+            seed_everything(self.cfg.actor.seed + self._rank)
+            self.log_info(
+                f"Seeded actor rank {self._rank}: {self.cfg.actor.seed + self._rank}"
+            )
         if self.use_dsrl:
             self._init_target_shadow()
         if self.cfg.actor.get("enable_offload", False):
@@ -198,6 +211,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 "trajectory_format", "pt"
             ),
         )
+        replay_load_path = self.cfg.algorithm.replay_buffer.get("load_path", None)
+        if replay_load_path is not None:
+            self.replay_buffer.load_checkpoint(
+                replay_load_path,
+                is_distributed=True,
+                local_rank=self._rank,
+                world_size=self._world_size,
+            )
 
         min_demo_buffer_size = 0
         if self.cfg.algorithm.get("demo_buffer", None) is not None:
@@ -224,6 +245,27 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     is_distributed=True,
                     local_rank=self._rank,
                     world_size=self._world_size,
+                )
+
+        if self.cfg.runner.task_type == "offline":
+            min_replay_size = max(
+                1,
+                self.cfg.algorithm.replay_buffer.min_buffer_size,
+                self.cfg.algorithm.get("train_actor_steps", 0),
+            )
+            if not self.replay_buffer.is_ready(min_replay_size):
+                raise ValueError(
+                    f"Offline replay on rank {self._rank} contains "
+                    f"{len(self.replay_buffer)} trajectories; "
+                    f"at least {min_replay_size} are required to train actor and critic."
+                )
+            if self.demo_buffer is not None and not self.demo_buffer.is_ready(
+                max(1, min_demo_buffer_size)
+            ):
+                raise ValueError(
+                    f"Offline demo buffer on rank {self._rank} contains "
+                    f"{len(self.demo_buffer)} trajectories; "
+                    f"at least {max(1, min_demo_buffer_size)} are required."
                 )
 
         if self.cfg.algorithm.replay_buffer.get("enable_preload", False):
@@ -624,6 +666,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 max_norm=self.cfg.actor.optim.clip_grad
             )
             self.optimizer.step()
+            self.actor_update_step += 1
             self.lr_scheduler.step()
 
             # Update temperature parameter if using automatic entropy tuning
@@ -746,6 +789,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             metrics_data = self.update_one_epoch(train_actor=train_actor)
             append_to_dict(metrics, metrics_data)
             self.update_step += 1
+            if self.cfg.runner.task_type == "offline":
+                metrics["learner/critic_updates"] = [self.update_step]
+                metrics["learner/actor_updates"] = [self.actor_update_step]
 
         mean_metric_dict = self.process_train_metrics(metrics)
 
@@ -811,6 +857,18 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
         )
         self.replay_buffer.save_checkpoint(buffer_save_path)
+        if self.cfg.runner.task_type == "offline":
+            torch.save(
+                {
+                    "update_step": self.update_step,
+                    "actor_update_step": self.actor_update_step,
+                    "replay_rng": self.replay_buffer.random_generator.get_state(),
+                    "critic_rng": self.critic_sample_generator.get_state(),
+                },
+                os.path.join(
+                    save_base_path, f"sac_components/learner_rank_{self._rank}.pt"
+                ),
+            )
 
     def load_checkpoint(self, load_base_path):
         # load model
@@ -853,3 +911,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
         )
         self.replay_buffer.load_checkpoint(buffer_load_path)
+        if self.cfg.runner.task_type == "offline":
+            learner = torch.load(
+                os.path.join(
+                    load_base_path, f"sac_components/learner_rank_{self._rank}.pt"
+                ),
+                map_location="cpu",
+                weights_only=True,
+            )
+            self.update_step = int(learner["update_step"])
+            self.actor_update_step = int(learner["actor_update_step"])
+            self.replay_buffer.random_generator.set_state(learner["replay_rng"])
+            self.critic_sample_generator.set_state(learner["critic_rng"])

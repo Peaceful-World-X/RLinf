@@ -80,6 +80,9 @@ jobs:
               - 'toolkits/auto_placement/**'
             embodied_filter: &embodied
               - *shared
+              - 'deploy/g1/**'
+              - 'toolkits/g1_rlt_*.py'
+              - 'examples/embodiment/config/g1_rlt_stage2_offline_ac_mlp.yaml'
               - 'rlinf/robotics/**'
               - 'rlinf/workers/actor/async_ppo_fsdp_worker.py'
               - 'rlinf/workers/actor/fsdp_iql_policy_worker.py'

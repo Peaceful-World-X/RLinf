@@ -53,10 +53,24 @@ def main(cfg) -> None:
         from rlinf.workers.actor.fsdp_iql_policy_worker import EmbodiedIQLFSDPPolicy
 
         actor_worker_cls = EmbodiedIQLFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_ac":
+        from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACFSDPPolicy
+
+        if not OmegaConf.select(cfg, "algorithm.replay_buffer.load_path"):
+            raise ValueError(
+                "Offline RLT requires algorithm.replay_buffer.load_path to contain "
+                "transitions encoded by the trained Stage 1 model."
+            )
+        if OmegaConf.select(cfg, "algorithm.rlt_schedule.enable", default=False):
+            raise ValueError(
+                "Offline RLT requires algorithm.rlt_schedule.enable=false; "
+                "the online schedule waits for newly collected transitions."
+            )
+        actor_worker_cls = RLTACFSDPPolicy
     else:
         raise NotImplementedError(
             f"Unsupported offline algorithm.loss_type={cfg.algorithm.loss_type!r}. "
-            "Current train_offline_rl entry only supports 'offline_iql'."
+            "Supported values are 'offline_iql' and 'rlt_ac'."
         )
     actor_group = actor_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.actor.group_name, placement_strategy=actor_placement

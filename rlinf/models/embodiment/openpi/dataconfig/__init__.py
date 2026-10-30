@@ -43,6 +43,9 @@ from rlinf.models.embodiment.openpi.dataconfig.franka_co_training_dataconfig imp
 from rlinf.models.embodiment.openpi.dataconfig.franka_dataconfig import (
     CustomDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.g1_dataconfig import (
+    LeRobotG1DataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.gsenv_dataconfig import (
     LeRobotGSEnvDataConfig,
 )
@@ -81,6 +84,20 @@ from rlinf.models.embodiment.openpi.dataconfig.yam_dataconfig import (
 )
 
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_g1_dualgripper",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=200,
+            discrete_state_input=True,
+        ),
+        data=LeRobotG1DataConfig(
+            repo_id="g1",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+    ),
     TrainConfig(
         name="pi05_ur7",
         model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),

@@ -35,6 +35,10 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_q_head=cfg.get("add_q_head", True),
             q_head_type=cfg.get("q_head_type", "default"),
             fixed_std=cfg.get("fixed_std", 0.002),
+            action_anchor=cfg.get("action_anchor", "none"),
+            action_output_scale=cfg.get("action_output_scale", 1.0),
+            action_output_activation=cfg.get("action_output_activation", "tanh"),
+            zero_init_actor=cfg.get("zero_init_actor", False),
         )
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(
