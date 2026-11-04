@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
@@ -74,6 +76,54 @@ def build_official_openpi_sft_dataloader(
         seed=int(OmegaConf.select(cfg, "actor.seed", default=config.seed)),
     )
     _validate_openpi_model_shape(model_cfg, config)
+
+    info_path = Path(repo_id) / "meta/info.json"
+    if (
+        info_path.is_file()
+        and json.loads(info_path.read_text()).get("codebase_version") == "v3.0"
+    ):
+        import torch
+
+        from rlinf.data.datasets.openpi.lerobot_v3_dataset import LeRobotV3Dataset
+
+        data_config = config.data.create(config.assets_dirs, config.model)
+        split_path = OmegaConf.select(cfg, "data.episode_split_path", default=None)
+        episode_ids = None
+        if split_path is not None:
+            split = json.loads(Path(split_path).read_text())
+            episode_ids = split["validation" if eval_dataset else "train"]
+        dataset = LeRobotV3Dataset(
+            repo_id,
+            config.model.action_horizon,
+            episode_ids=episode_ids,
+        )
+        dataset = openpi_data_loader.transform_dataset(dataset, data_config)
+        sampler = None
+        if torch.distributed.is_initialized():
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset, shuffle=not eval_dataset, drop_last=not eval_dataset
+            )
+            resume_step = int(OmegaConf.select(cfg, "data.resume_step", default=0))
+            if resume_step and not eval_dataset:
+                # Offline validation restarts the official entry between checkpoints.
+                # Continue the same sampler order instead of replaying its prefix.
+                offset = resume_step * int(cfg.actor.global_batch_size) // world_size
+                indices = list(sampler)
+                if not 0 <= offset < len(indices):
+                    raise ValueError(
+                        "data.resume_step must remain within the first data epoch"
+                    )
+                sampler = indices[offset:]
+        loader = openpi_data_loader.TorchDataLoader(
+            dataset,
+            local_batch_size=batch_size,
+            sampler=sampler,
+            shuffle=sampler is None and not eval_dataset,
+            num_workers=config.num_workers,
+            seed=config.seed,
+            framework="pytorch",
+        )
+        return openpi_data_loader.DataLoaderImpl(data_config, loader), data_config
 
     data_loader = openpi_data_loader.create_data_loader(
         config, framework="pytorch", shuffle=not eval_dataset

@@ -75,6 +75,14 @@ def _load_jax_params(checkpoint_dir: str | pathlib.Path) -> dict:
     # peel a single ``params`` wrapper when present.
     if "PaliGemma" not in restored and isinstance(restored.get("params"), dict):
         restored = restored["params"]
+    # OpenPI NNX training checkpoints store each parameter under a value leaf.
+    from flax import traverse_util
+
+    flat_params = traverse_util.flatten_dict(restored)
+    if flat_params and all(path[-1] == "value" for path in flat_params):
+        restored = traverse_util.unflatten_dict(
+            {path[:-1]: value for path, value in flat_params.items()}
+        )
     return restored
 
 

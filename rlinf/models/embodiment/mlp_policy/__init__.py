@@ -24,7 +24,18 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
 
     iql_config = cfg.get("iql_config", None)
     if cfg.model_type == "rlt_mlp_policy":
-        model = RLTMLPPolicy(
+        model_class, coordinate_kwargs = RLTMLPPolicy, {}
+        if (
+            cfg.get("g1_action_mode") is not None
+            or cfg.get("g1_action_norm_stats_path") is not None
+        ):
+            from rlinf.models.embodiment.openpi.dataconfig.g1_dataconfig import (
+                G1RLTMLPPolicy,
+            )
+
+            model_class = G1RLTMLPPolicy
+            coordinate_kwargs["coordinate_config"] = cfg
+        model = model_class(
             z_dim=cfg.z_dim,
             proprio_dim=cfg.proprio_dim,
             action_dim=cfg.action_dim,
@@ -35,6 +46,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_q_head=cfg.get("add_q_head", True),
             q_head_type=cfg.get("q_head_type", "default"),
             fixed_std=cfg.get("fixed_std", 0.002),
+            **coordinate_kwargs,
         )
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(

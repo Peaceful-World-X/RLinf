@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import math
 import queue
 
 import torch
@@ -29,7 +30,7 @@ from rlinf.utils.metric_utils import (
     compute_split_num,
     trajectory_has_bool_tensor,
 )
-from rlinf.utils.utils import clear_memory
+from rlinf.utils.utils import clear_memory, seed_everything
 from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
     AsyncEmbodiedSACFSDPPolicy,
 )
@@ -100,6 +101,7 @@ class RLTACLossMixin:
         actions: torch.Tensor,
         ref_chunk: torch.Tensor,
         intervene_flags: torch.Tensor | None,
+        trajectory_success: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         chunk_len, action_dim = self._chunk_shape()
         pi_chunk = self._flatten_chunk(pi).reshape(-1, chunk_len, action_dim)
@@ -143,10 +145,71 @@ class RLTACLossMixin:
             "human_mask_ratio": human_ratio,
             "policy_mask_ratio": 1.0 - human_ratio,
         }
+        split_weights = self._split_bc_weights()
+        if split_weights is not None:
+            if (
+                trajectory_success is None
+                or trajectory_success.numel() != pi_chunk.shape[0]
+            ):
+                raise ValueError(
+                    "Split BC requires one trajectory_success label per replay chunk"
+                )
+            if not torch.all((trajectory_success == 0) | (trajectory_success == 1)):
+                raise ValueError(
+                    "trajectory_success must contain only boolean outcome labels"
+                )
+            successful = trajectory_success.to(pi_chunk.device).bool().reshape(-1, 1)
+            policy_mask = policy_mask & successful
+            human_weight, policy_weight = split_weights
+            human_term = (bc_error * human_mask).mean()
+            policy_term = (bc_error * policy_mask).mean()
+            bc_loss = human_weight * human_term + policy_weight * policy_term
+            metrics.update(
+                bc_loss=(human_term + policy_term).detach().item(),
+                bc_ref_loss=(ref_error * policy_mask).sum().detach().item()
+                / max(int(policy_mask.sum()), 1),
+                policy_mask_ratio=policy_mask.float().mean().item(),
+                bc_excluded_mask_ratio=(~(human_mask | policy_mask))
+                .float()
+                .mean()
+                .item(),
+                weighted_bc_human=(human_weight * human_term).detach().item(),
+                weighted_bc_policy=(policy_weight * policy_term).detach().item(),
+            )
         return bc_loss, metrics
+
+    def _split_bc_weights(self) -> tuple[float, float] | None:
+        """Optional per-frame BC coefficients; absent fields retain uniform BC."""
+        human = self.cfg.algorithm.get("bc_human_weight")
+        policy = self.cfg.algorithm.get("bc_policy_weight")
+        if human is None and policy is None:
+            return None
+        if human is None or policy is None:
+            raise ValueError(
+                "bc_human_weight and bc_policy_weight must be supplied together"
+            )
+        weights = (float(human), float(policy))
+        if any(not math.isfinite(w) or w < 0 for w in weights):
+            raise ValueError("Split BC weights must be finite and nonnegative")
+        if self.cfg.algorithm.get("actor_weight_schedule", {}).get("enable", False):
+            raise ValueError("Split BC requires actor_weight_schedule.enable=false")
+        return weights
 
     def _actor_objective_weights(self) -> tuple[float, float, dict[str, float]]:
         """Resolve RLT actor-objective BC/Q weights."""
+        split_weights = self._split_bc_weights()
+        if split_weights is not None:
+            q_weight = float(self.cfg.algorithm.get("q_weight", 1.0))
+            return (
+                1.0,
+                q_weight,
+                {
+                    "bc_weight": 1.0,
+                    "bc_human_weight": split_weights[0],
+                    "bc_policy_weight": split_weights[1],
+                    "q_weight": q_weight,
+                },
+            )
         schedule_cfg = self.cfg.algorithm.get("actor_weight_schedule", {})
         schedule_enabled = bool(schedule_cfg.get("enable", False))
         if not schedule_enabled:
@@ -347,6 +410,9 @@ class RLTACLossMixin:
             actions=batch["actions"],
             ref_chunk=ref_chunk,
             intervene_flags=batch.get("intervene_flags", None),
+            trajectory_success=batch.get("forward_inputs", {}).get(
+                "trajectory_success"
+            ),
         )
         metrics.update(rlt_metrics)
 
@@ -684,11 +750,109 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         self._warmup_ready_total_episodes: int | None = None
         self.pending_update_budget = 0
 
+    def init_worker(self):
+        offline = self.cfg.runner.task_type == "offline"
+        if offline:
+            seed_everything(self.cfg.actor.seed)
+        super().init_worker()
+        if offline:
+            seed_everything(self.cfg.actor.seed + self._rank)
+            self.log_info(
+                f"Seeded offline RLT rank {self._rank}: "
+                f"{self.cfg.actor.seed + self._rank}"
+            )
+
     def setup_sac_components(self):
         """Initialize replay components and let RLT schedule own readiness."""
         super().setup_sac_components()
         if self.use_rlt_schedule:
             self.buffer_dataset.min_replay_buffer_size = 1
+        if self.cfg.runner.task_type == "offline":
+            self.replay_buffer.load_checkpoint(
+                self.cfg.algorithm.replay_buffer.load_path,
+                is_distributed=True,
+                local_rank=self._rank,
+                world_size=self._world_size,
+            )
+            minimum = max(
+                self.cfg.algorithm.replay_buffer.min_buffer_size,
+                self.cfg.algorithm.get("train_actor_steps", 1),
+            )
+            if not self.replay_buffer.is_ready(minimum):
+                raise ValueError(f"Rank {self._rank} has insufficient offline replay")
+            self.log_info(
+                f"Offline replay rank={self._rank}: {len(self.replay_buffer)} trajectories"
+            )
+
+    def set_global_step(self, global_step: int) -> None:
+        super().set_global_step(global_step)
+        if self.cfg.runner.task_type == "offline":
+            self.update_step = int(global_step) * int(self.cfg.algorithm.update_epoch)
+
+    @torch.no_grad()
+    def evaluate_offline(self) -> dict[str, float]:
+        """Evaluate held-out actions using only unmodified model references."""
+        if not hasattr(self, "_offline_validation"):
+            self._offline_validation = torch.load(
+                self.cfg.algorithm.offline_validation_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+        data = self._offline_validation
+        length = len(data["actions"])
+        if length == 0:
+            raise ValueError("Offline validation must contain held-out chunks")
+        was_training = self.model.training
+        self.model.eval()
+        predictions = []
+        for start in range(0, length, self.cfg.actor.micro_batch_size):
+            end = start + self.cfg.actor.micro_batch_size
+            obs = {k: v[start:end].to(self.device) for k, v in data["curr_obs"].items()}
+            action, _, _ = self.model(
+                forward_type=ForwardType.SAC, obs=obs, deterministic=True
+            )
+            predictions.append(action.cpu().reshape(-1, *data["actions"].shape[1:]))
+        self.model.train(was_training)
+        predicted = torch.cat(predictions)
+        model_cfg = self.cfg.actor.model
+        default_mode = (
+            "base_residual"
+            if model_cfg.get("g1_action_norm_stats_path") is not None
+            else "state_delta"
+        )
+        unit_bounded = model_cfg.get("g1_action_mode", default_mode) == "state_delta"
+        if not torch.isfinite(predicted).all() or (
+            unit_bounded and (predicted.abs() > 1).any()
+        ):
+            raise ValueError("Offline actor predictions must be finite and bounded")
+        errors = (predicted - data["actions"]).square()
+        baseline = (data["curr_obs"]["ref_chunk"] - data["actions"]).square()
+        human = data["intervene_flags"].bool()
+        if not human.any():
+            raise ValueError("Offline selection requires held-out intervention actions")
+        scale = data["action_scale"]
+        physical = (predicted - data["actions"]) * scale
+        return {
+            "human_mse": float(errors[human].mean()),
+            "reference_human_mse": float(baseline[human].mean()),
+            "all_mse": float(errors.mean()),
+            "reference_all_mse": float(baseline.mean()),
+            "joint_mae_radians": float(physical[..., :14].abs().mean()),
+            "joint_mse_radians": float(physical[..., :14].square().mean()),
+            "human_joint_mse_radians": float(
+                physical[..., :14][human[..., :14]].square().mean()
+            ),
+            "actor_updates": float(
+                self.update_step // self.cfg.algorithm.critic_actor_ratio
+            ),
+            **(
+                {"gripper_mae": float(physical[..., 14:].abs().mean())}
+                if physical.shape[-1] > 14
+                else {}
+            ),
+            "chunks": float(length),
+            "critic_updates": float(self.update_step),
+        }
 
     @Worker.timer("actor/recv_traj")
     async def recv_rollout_trajectories(self, input_channel):

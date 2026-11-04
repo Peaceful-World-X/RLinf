@@ -53,10 +53,18 @@ def main(cfg) -> None:
         from rlinf.workers.actor.fsdp_iql_policy_worker import EmbodiedIQLFSDPPolicy
 
         actor_worker_cls = EmbodiedIQLFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_ac":
+        from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACFSDPPolicy
+
+        if not cfg.algorithm.replay_buffer.get("load_path"):
+            raise ValueError("Offline RLT requires algorithm.replay_buffer.load_path")
+        if cfg.algorithm.get("rlt_schedule", {}).get("enable", False):
+            raise ValueError("Offline RLT cannot wait for online rollout data")
+        actor_worker_cls = RLTACFSDPPolicy
     else:
         raise NotImplementedError(
             f"Unsupported offline algorithm.loss_type={cfg.algorithm.loss_type!r}. "
-            "Current train_offline_rl entry only supports 'offline_iql'."
+            "Current train_offline_rl entry supports 'offline_iql' and 'rlt_ac'."
         )
     actor_group = actor_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.actor.group_name, placement_strategy=actor_placement

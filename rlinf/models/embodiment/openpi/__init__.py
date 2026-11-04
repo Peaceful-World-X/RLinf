@@ -263,7 +263,11 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     elif safetensors_path is not None:
         load_base_safetensors(model, safetensors_path)
 
-    _freeze_after_load(model, task)
+    _freeze_after_load(
+        model,
+        task,
+        freeze_vla=bool(OmegaConf.select(model_cfg, "freeze_vla", default=False)),
+    )
     _apply_openpi_param_dtypes(model, target_dtype)
 
     n_params = sum(param.numel() for param in model.parameters())
@@ -283,8 +287,17 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     return model
 
 
-def _freeze_after_load(model, task: str) -> None:
+def _freeze_after_load(model, task: str, freeze_vla: bool = False) -> None:
     """Freeze after weights load so ``requires_grad`` is the post-load truth."""
+    if freeze_vla:
+        if task not in ("sft", "eval") or getattr(model, "rlt_module", None) is None:
+            raise ValueError(
+                "openpi.freeze_vla requires task=sft/eval and use_rlt=true"
+            )
+        model.requires_grad_(False)
+        model.rlt_module.requires_grad_(True)
+        logger.info("openpi[%s]: froze the VLA; only rlt_module is trainable", task)
+        return
     if task == "rl" and getattr(model, "rl_cfg", None) is not None:
         if model.rl_cfg.train_expert_only:
             frozen = model.freeze_vlm()

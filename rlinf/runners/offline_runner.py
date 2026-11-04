@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import math
 import os
 import queue
 import threading
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 from omegaconf.dictconfig import DictConfig
@@ -51,6 +54,13 @@ class OfflineRunner:
         self.rollout_channel = Channel.create("Rollout")
 
         self.global_step = 0
+        self.offline_eval_interval = int(cfg.runner.get("offline_eval_interval", 0))
+        self.offline_eval_state = {
+            "best": None,
+            "anchor": None,
+            "bad_checks": 0,
+            "best_step": 0,
+        }
 
         self.set_max_steps()
 
@@ -129,6 +139,9 @@ class OfflineRunner:
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
+        state_path = Path(resume_dir) / "offline_eval_state.json"
+        if self.offline_eval_interval and state_path.exists():
+            self.offline_eval_state = json.loads(state_path.read_text())
 
     def update_rollout_weights(self):
         if self.rollout is None:
@@ -262,7 +275,7 @@ class OfflineRunner:
             _step = self.global_step
             next_step = _step + 1
             if not worker_step_synced:
-                self.actor.set_global_step(_step)
+                self.actor.set_global_step(_step).wait()
 
             with self.timer("step"):
                 actor_training_handle: Handle = self.actor.run_training()
@@ -313,6 +326,18 @@ class OfflineRunner:
                     self.update_rollout_weights()
                     eval_metrics = {f"eval/{k}": v for k, v in self.evaluate().items()}
                     self.metric_logger.log(data=eval_metrics, step=_step)
+            should_stop = False
+            if self.offline_eval_interval and (
+                self.global_step % self.offline_eval_interval == 0 or is_train_end
+            ):
+                with self.timer("offline_eval"):
+                    offline_metrics = self.actor.evaluate_offline().wait()[0]
+                eval_metrics.update(
+                    {f"offline_eval/{k}": v for k, v in offline_metrics.items()}
+                )
+                self.metric_logger.log(data=eval_metrics, step=_step)
+                improved, should_stop = self._update_offline_selection(offline_metrics)
+                save_model = save_model or improved or should_stop
             if save_model:
                 self._save_checkpoint()
 
@@ -348,7 +373,43 @@ class OfflineRunner:
                     _step - 1, self.max_steps, start_time, logging_metrics, start_step
                 )
 
+            if should_stop:
+                self.logger.info(
+                    f"Offline early stop at {self.global_step}; best step {self.offline_eval_state['best_step']}"
+                )
+                break
+
         self._finish_run()
+
+    def _update_offline_selection(self, metrics: dict) -> tuple[bool, bool]:
+        settings = self.cfg.runner.get("offline_early_stop", {})
+        score = float(metrics[settings.get("metric", "human_mse")])
+        if not math.isfinite(score):
+            raise ValueError("Offline validation metric must be finite")
+        state = self.offline_eval_state
+        improved = state["best"] is None or score < state["best"]
+        if improved:
+            state.update(best=score, best_step=self.global_step)
+        threshold = float(settings.get("relative_improvement", 0.005))
+        if state["anchor"] is None or score < state["anchor"] * (1 - threshold):
+            state.update(anchor=score, bad_checks=0)
+        else:
+            state["bad_checks"] += 1
+        should_stop = (
+            bool(settings.get("enable", False))
+            and self.global_step >= int(settings.get("min_steps", 5000))
+            and state["bad_checks"] >= int(settings.get("patience", 5))
+        )
+        path = (
+            Path(self.cfg.runner.logger.log_path)
+            / self.cfg.runner.logger.experiment_name
+        )
+        path.mkdir(parents=True, exist_ok=True)
+        with (path / "offline_validation.jsonl").open("a") as stream:
+            stream.write(
+                json.dumps({"step": self.global_step, **metrics, **state}) + "\n"
+            )
+        return improved, should_stop
 
     def _finish_run(self) -> None:
         self.metric_logger.finish()
@@ -367,6 +428,17 @@ class OfflineRunner:
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        if self.offline_eval_interval:
+            output = Path(base_output_dir)
+            (output / "offline_eval_state.json").write_text(
+                json.dumps(self.offline_eval_state, indent=2) + "\n"
+            )
+            if self.offline_eval_state["best_step"] == self.global_step:
+                pointer = output.parent / "best_model"
+                temporary = output.parent / ".best_model.tmp"
+                temporary.unlink(missing_ok=True)
+                temporary.symlink_to(output.name, target_is_directory=True)
+                temporary.replace(pointer)
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1
