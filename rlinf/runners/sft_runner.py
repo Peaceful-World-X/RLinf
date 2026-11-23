@@ -93,6 +93,13 @@ class SFTRunner:
                 actor_metrics = actor_handle.wait()
 
                 self.global_step += 1
+                loss_path = self.cfg.runner.get("loss_log_path")
+                if loss_path:
+                    # Workers return the all-reduced training loss. Write once on the
+                    # driver, before this step can be marked as a complete checkpoint.
+                    loss = float(actor_metrics[0]["loss"])
+                    with open(loss_path, "a", encoding="utf-8") as journal:
+                        journal.write(f"{self.global_step},{loss}\n")
 
                 eval_model, save_model, _ = check_progress(
                     self.global_step,
@@ -192,6 +199,11 @@ class SFTRunner:
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        if self.cfg.runner.get("publish_completion_marker", False) and not is_best:
+            marker = os.path.join(base_output_dir, ".complete")
+            with open(marker + ".tmp", "w") as stream:
+                stream.write(str(self.global_step))
+            os.replace(marker + ".tmp", marker)
         if is_best and self.early_stop is not None:
             logger.info(
                 f"Saved best model (val_acc={self.early_stop.best_val_acc:.4f}) to {base_output_dir}"

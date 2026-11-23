@@ -805,13 +805,22 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         was_training = self.model.training
         self.model.eval()
         predictions = []
+        chunk_len, action_dim = self._chunk_shape()
+        score_horizon = int(data.get("score_horizon", chunk_len))
+        if not (0 < score_horizon <= chunk_len) or data["actions"].shape[-2:] != (
+            score_horizon,
+            action_dim,
+        ):
+            raise ValueError("Validation targets must match the scored action prefix")
         for start in range(0, length, self.cfg.actor.micro_batch_size):
             end = start + self.cfg.actor.micro_batch_size
             obs = {k: v[start:end].to(self.device) for k, v in data["curr_obs"].items()}
             action, _, _ = self.model(
                 forward_type=ForwardType.SAC, obs=obs, deterministic=True
             )
-            predictions.append(action.cpu().reshape(-1, *data["actions"].shape[1:]))
+            predictions.append(
+                action.cpu().reshape(-1, chunk_len, action_dim)[:, :score_horizon]
+            )
         self.model.train(was_training)
         predicted = torch.cat(predictions)
         model_cfg = self.cfg.actor.model
@@ -826,7 +835,9 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         ):
             raise ValueError("Offline actor predictions must be finite and bounded")
         errors = (predicted - data["actions"]).square()
-        baseline = (data["curr_obs"]["ref_chunk"] - data["actions"]).square()
+        baseline = (
+            data["curr_obs"]["ref_chunk"][:, :score_horizon] - data["actions"]
+        ).square()
         human = data["intervene_flags"].bool()
         if not human.any():
             raise ValueError("Offline selection requires held-out intervention actions")
@@ -837,6 +848,15 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
             "reference_human_mse": float(baseline[human].mean()),
             "all_mse": float(errors.mean()),
             "reference_all_mse": float(baseline.mean()),
+            "reference_joint_mse_radians": float(
+                (baseline[..., :14] * scale[:14].square()).mean()
+            ),
+            "autonomous_joint_mse_radians": float(
+                physical[..., :14][~human[..., :14]].square().mean()
+            )
+            if (~human[..., :14]).any()
+            else 0.0,
+            "score_horizon": float(score_horizon),
             "joint_mae_radians": float(physical[..., :14].abs().mean()),
             "joint_mse_radians": float(physical[..., :14].square().mean()),
             "human_joint_mse_radians": float(

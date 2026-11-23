@@ -165,7 +165,11 @@ def build_input_transforms(
 
     input_transforms = []
 
-    if env_type == "libero":
+    if env_type == "g1":
+        from rlinf.models.embodiment.openpi.dataconfig.g1_dataconfig import G1Inputs
+
+        input_transforms.append(G1Inputs())
+    elif env_type == "libero":
         input_transforms.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
         input_transforms.append(libero_policy.LiberoInputs(model_type=model_type_enum))
 

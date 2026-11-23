@@ -147,6 +147,8 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
         except (ImportError, AttributeError):
             pass
 
+        from hydra.utils import instantiate
+
         from rlinf.data.datasets.recap.value_dataset import ValueDataset
         from rlinf.models.embodiment.value_model.recap.data_collator import (
             ValueDataCollator,
@@ -154,6 +156,9 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
         from rlinf.models.embodiment.value_model.recap.processing import ValueProcessor
 
         data_cfg = self.cfg.get("data", {})
+        dataset_factory = (
+            instantiate(data_cfg.dataset) if data_cfg.get("dataset") else ValueDataset
+        )
         model_cfg = self.cfg.actor.model
         pin_memory = data_cfg.get("pin_memory", True)
         train_num_workers = int(data_cfg.get("train_num_workers", 0))
@@ -333,7 +338,7 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
                 "tag": data_cfg.get("tag", None),
             }
 
-            ds = ValueDataset(**entry_kwargs)
+            ds = dataset_factory(**entry_kwargs)
             datasets_with_weights.append((ds, weight))
             self.logger.info(
                 f"[ValueSFT] Loaded: {ds_path}  (type={ds_type}, {len(ds)} samples, weight={weight})"
@@ -404,7 +409,7 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
 
             ds_name = eval_entry.get("name", Path(eval_ds_path).stem)
 
-            eval_dataset = ValueDataset(
+            eval_dataset = dataset_factory(
                 dataset_path=eval_ds_path,
                 robot_type=eval_entry.get("robot_type", shared["robot_type"]),
                 model_type=eval_entry.get("model_type", shared["model_type"]),

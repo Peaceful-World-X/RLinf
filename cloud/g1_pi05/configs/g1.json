@@ -1,0 +1,12 @@
+{
+  "policy_config": "pi05_g1_dualgripper",
+  "cameras": ["cam_left_high", "cam_left_wrist", "cam_right_wrist"],
+  "action_dim": 16,
+  "horizon": 50,
+  "return_tag": "full_episode_gamma1_fail300",
+  "gamma": 1.0,
+  "failure_reward": -300.0,
+  "recap_quantile": 0.3,
+  "steam_k": 32,
+  "steam_members": 3
+}

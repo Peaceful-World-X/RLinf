@@ -24,6 +24,18 @@ from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
 from rlinf.models.embodiment.openpi.policies.aloha_policy import AlohaInputs
 
 
+G1_REPACK_KEYS = {
+    "images": {
+        "cam_high": "observation.images.cam_left_high",
+        "cam_left_wrist": "observation.images.cam_left_wrist",
+        "cam_right_wrist": "observation.images.cam_right_wrist",
+    },
+    "state": "observation.state",
+    "actions": "action",
+    "prompt": "prompt",
+}
+
+
 @dataclasses.dataclass(frozen=True)
 class G1Inputs(transforms.DataTransformFn):
     """Accept dataset images and the existing RLinf environment image contract."""
@@ -62,16 +74,7 @@ class LeRobotG1DataConfig(DataConfigFactory):
             repack_transforms=transforms.Group(
                 inputs=[
                     transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_left_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                            "prompt": "prompt",
-                        }
+                        G1_REPACK_KEYS
                     )
                 ]
             ),

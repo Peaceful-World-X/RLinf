@@ -325,6 +325,17 @@ def build_obs(
     Returns:
         Raw observation dict compatible with ValueCriticModel.infer()
     """
+    if robot_type == "g1":
+        from rlinf.models.embodiment.openpi.dataconfig.g1_dataconfig import G1_REPACK_KEYS
+
+        task = sample.get("task", sample.get("prompt"))
+        if task is None:
+            task = tasks[int(to_scalar(sample["task_index"]))]
+        return {
+            "images": {name: to_numpy(sample[key]) for name, key in G1_REPACK_KEYS["images"].items()},
+            "state": to_numpy(sample[G1_REPACK_KEYS["state"]]),
+            "prompt": str(task),
+        }
     if robot_type not in KEY_MAPPINGS:
         raise ValueError(
             f"Unknown robot_type {robot_type!r}. "

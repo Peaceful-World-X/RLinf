@@ -227,7 +227,9 @@ def tensor_range(value: torch.Tensor) -> dict:
     }
 
 
-def encode_trajectories(trajectories, features, coordinates, model_id, horizon):
+def encode_trajectories(
+    trajectories, features, coordinates, model_id, horizon, *, unit_bounded=True
+):
     """Use official intervention replacement and preserve pure reference for validation."""
     encoded = []
     for source in trajectories:
@@ -242,9 +244,13 @@ def encode_trajectories(trajectories, features, coordinates, model_id, horizon):
                 raise ValueError("Extracted proprio differs from recorded state")
             observations.append(obs)
         current, following = observations
+        for obs in observations:
+            obs["ref_chunk"] = obs["ref_chunk"][..., :horizon, :].clone()
         original_reference = current["ref_chunk"].clone()
         actions = coordinates.normalize(source.actions, current["states"])
-        if not torch.isfinite(actions).all() or (actions.abs() > 1.00001).any():
+        if not torch.isfinite(actions).all() or (
+            unit_bounded and (actions.abs() > 1.00001).any()
+        ):
             raise ValueError("Executed actions must be finite and inside actor bounds")
         if not torch.allclose(
             coordinates.denormalize(actions, current["states"]),
@@ -357,6 +363,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None)
     parser.add_argument("--finalize-only", action="store_true")
+    parser.add_argument(
+        "--feature-horizon",
+        type=int,
+        default=None,
+        help="Reference steps retained in the shared feature cache",
+    )
+    parser.add_argument(
+        "--features-dir", type=Path, help="Existing feature shards to finalize"
+    )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     model_cfg = load_config(args.config, args.checkpoint)
@@ -368,8 +383,14 @@ def main() -> None:
         int(stage2.actor.model.num_action_chunks),
         int(stage2.actor.model.ref_num_action_chunks),
     )
-    if horizon != 10 or ref_horizon != 10 or int(model_cfg.openpi.action_horizon) != 50:
-        raise ValueError("Expected G1 VLA H50 and actor ref10/action10")
+    vla_horizon = int(model_cfg.openpi.action_horizon)
+    cache_horizon = args.feature_horizon or ref_horizon
+    if not (0 < horizon == ref_horizon <= cache_horizon <= vla_horizon == 50):
+        raise ValueError(
+            "Expected matching actor/reference horizons within the VLA H50 cache"
+        )
+    if args.features_dir is not None and not args.finalize_only:
+        parser.error("--features-dir is only used with --finalize-only")
     raw = load_raw_replay(args.source_cache / "raw_replay")
     partition_replay(raw, args.holdout_episodes)
     dataset = LeRobotV3Dataset(args.source_cache / "dataset", action_horizon=1)
@@ -385,8 +406,7 @@ def main() -> None:
         "source_sha256": sha256(args.source_cache / "source_manifest.json"),
         "norm_sha256": sha256(Path(model_cfg.openpi_data.norm_stats_path)),
         "seed": args.seed,
-        "ref_horizon": ref_horizon,
-        "horizon": horizon,
+        "feature_horizon": cache_horizon,
     }
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     if not args.finalize_only:
@@ -411,7 +431,7 @@ def main() -> None:
                     16,
                 ):
                     raise ValueError("Invalid Stage 1 feature shape")
-                result["ref_chunk"] = result["ref_chunk"][:, :ref_horizon]
+                result["ref_chunk"] = result["ref_chunk"][:, :cache_horizon]
                 if not all(torch.isfinite(v).all() for v in result.values()):
                     raise ValueError("Nonfinite feature or model reference")
                 features[index] = {k: v.float().cpu() for k, v in result.items()}
@@ -430,7 +450,7 @@ def main() -> None:
         return
 
     features = {}
-    shards = sorted(args.output.glob("features_rank*.pt"))
+    shards = sorted((args.features_dir or args.output).glob("features_rank*.pt"))
     for path in shards:
         shard = torch.load(path, map_location="cpu", weights_only=True)
         if shard["fingerprint"] != fingerprint or len(shards) != shard["world_size"]:
@@ -440,11 +460,19 @@ def main() -> None:
         if features.keys() & shard["features"].keys():
             raise ValueError("Duplicate feature frame across ranks")
         features.update(shard["features"])
-    if set(features) != set(indices):
-        raise ValueError("Feature shards do not cover every t and t+10 observation")
+    if not set(indices).issubset(features):
+        raise ValueError(
+            "Feature shards do not cover every current and horizon-next observation"
+        )
     checkpoint_hash = sha256(weights)
     encoded = encode_trajectories(
-        trajectories, features, coordinates, checkpoint_hash[:16], horizon
+        trajectories,
+        features,
+        coordinates,
+        checkpoint_hash[:16],
+        horizon,
+        unit_bounded=stage2.actor.model.get("g1_action_mode", "state_delta")
+        == "state_delta",
     )
     groups = partition_replay(encoded, args.holdout_episodes)
     for role, group in groups.items():
@@ -476,6 +504,8 @@ def main() -> None:
         "checkpoint_sha256": checkpoint_hash,
         "reload_exact": True,
         "chunking": audit,
+        "horizon": horizon,
+        "ref_horizon": ref_horizon,
         "unique_frames": len(indices),
         "physical_delta_joints": 14,
         "gripper_range": [0, 100],

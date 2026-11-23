@@ -41,6 +41,7 @@ from openpi.transforms import DataTransformFn
 from torch.utils.data import Dataset
 
 from rlinf.data.storage.lerobot import episode_boundaries
+from rlinf.models.embodiment.openpi.dataconfig.g1_dataconfig import G1Inputs, G1_REPACK_KEYS
 from rlinf.models.embodiment.openpi.policies import franka_policy, libero_policy
 
 from .common import BaseDataLoaderImpl, ReCapMixtureDataset
@@ -59,6 +60,7 @@ _MODEL_TYPE_MAP = {
 }
 
 _REPACK_KEYS = {
+    "g1": G1_REPACK_KEYS,
     "libero": {
         "observation/image": "image",
         "observation/wrist_image": "wrist_image",
@@ -320,7 +322,9 @@ class ValueDataset(Dataset):
             )
         transforms_list.append(_openpi_transforms.RepackTransform(repack_keys))
 
-        if robot in ("libero", "libero_v2"):
+        if robot == "g1":
+            transforms_list.append(G1Inputs())
+        elif robot in ("libero", "libero_v2"):
             transforms_list.append(
                 libero_policy.LiberoInputs(model_type=model_type_enum)
             )

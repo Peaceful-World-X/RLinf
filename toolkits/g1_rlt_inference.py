@@ -51,11 +51,13 @@ def load_actor(config: Path, checkpoint: Path, device: str):
         raise ValueError("Nonfinite actor/critic checkpoint")
     model.load_state_dict(state, strict=True)
     if (
-        (model.chunk_len, model.ref_chunk_len) != (10, 10)
+        not (0 < model.chunk_len == model.ref_chunk_len <= 50)
         or model.step_action_dim not in (14, 16)
         or model.proprio_dim != model.step_action_dim
     ):
-        raise ValueError("Expected G1 H10 with matching 14D or 16D actions/proprio")
+        raise ValueError(
+            "Expected G1 matching action/reference horizons up to 50 and 14D or 16D actions/proprio"
+        )
     return model.to(device).eval().requires_grad_(False)
 
 
@@ -80,7 +82,7 @@ class G1RLTPolicy:
         result = self.features.extract_rlt_obs(env_obs)
         state = result["proprio"]
         result["ref_chunk"] = self.coordinates.normalize(
-            result["ref_chunk"][:, :10], state
+            result["ref_chunk"][:, : self.actor.chunk_len], state
         )
         result["proprio"] = self.coordinates.proprio(state)
         result["states"] = state
@@ -119,13 +121,16 @@ class G1RLTPolicy:
                 [normalized, result["forward_inputs"]["gripper_reference"]], dim=-1
             )
         physical = self.coordinates.denormalize(full_actions, state)
-        if physical.shape != (count, 10, 16) or not torch.isfinite(physical).all():
-            raise ValueError("Expected finite physical actions [B,10,16]")
+        if (
+            physical.shape != (count, self.actor.chunk_len, 16)
+            or not torch.isfinite(physical).all()
+        ):
+            raise ValueError("Expected finite physical actions [B,H,16]")
         result["normalized_actions"] = normalized
         return physical, result
 
     def predict(self, images: dict, state, task: str, *, insertion: bool):
-        """Single observation interface returning physical [10,16] actions."""
+        """Single observation interface returning physical [H,16] actions."""
         import numpy as np
 
         env = {
@@ -151,7 +156,7 @@ class G1OpenPIPolicy:
         import numpy as np
 
         if kwargs:
-            raise ValueError("RLT H10 serving does not support RTC prefix inpainting")
+            raise ValueError("RLT serving does not support RTC prefix inpainting")
         names = ("cam_left_high", "cam_left_wrist", "cam_right_wrist")
         if "images" in observation:
             raw = observation["images"]
@@ -218,14 +223,32 @@ def evaluate_cache(actor, cache: Path, device: str) -> dict:
         }
         rows.append(actor.predict_action_batch(obs, mode="eval")[0].cpu())
     prediction = torch.cat(rows)
+    score_horizon = int(data.get("score_horizon", prediction.shape[-2]))
+    if (
+        not (0 < score_horizon <= prediction.shape[-2])
+        or data["actions"].shape[-2] != score_horizon
+    ):
+        raise ValueError("Invalid evaluation score horizon")
+    prediction = prediction[:, :score_horizon]
+    reference = data["curr_obs"]["ref_chunk"][:, :score_horizon]
     if not torch.isfinite(prediction).all():
         raise ValueError("Nonfinite actor prediction")
     error = (prediction - data["actions"]).square()
-    ref_error = (data["curr_obs"]["ref_chunk"] - data["actions"]).square()
+    ref_error = (reference - data["actions"]).square()
     human = data["intervene_flags"].bool()
     physical = (prediction - data["actions"]) * data["action_scale"]
     result = {
         "chunks": len(prediction),
+        "score_horizon": score_horizon,
+        "frames": len(prediction) * score_horizon,
+        "reference_joint_mse_radians": float(
+            (ref_error[..., :14] * data["action_scale"][:14].square()).mean()
+        ),
+        "autonomous_joint_mse_radians": float(
+            physical[..., :14][~human[..., :14]].square().mean()
+        )
+        if (~human[..., :14]).any()
+        else None,
         "all_mse": float(error.mean()),
         "reference_all_mse": float(ref_error.mean()),
         "human_mse": float(error[human].mean()),
@@ -237,19 +260,16 @@ def evaluate_cache(actor, cache: Path, device: str) -> dict:
         ),
         "reference_human_joint_mse_radians": float(
             (
-                (
-                    (data["curr_obs"]["ref_chunk"] - data["actions"])
-                    * data["action_scale"]
-                )[..., :14][human[..., :14]]
+                ((reference - data["actions"]) * data["action_scale"])[..., :14][
+                    human[..., :14]
+                ]
             )
             .square()
             .mean()
         ),
         "action_mode": getattr(actor, "action_mode", "state_delta"),
         "reference_joint_mae_radians": float(
-            ((data["curr_obs"]["ref_chunk"] - data["actions"]) * data["action_scale"])[
-                ..., :14
-            ]
+            ((reference - data["actions"]) * data["action_scale"])[..., :14]
             .abs()
             .mean()
         ),
@@ -263,8 +283,12 @@ def evaluate_cache(actor, cache: Path, device: str) -> dict:
     if physical.shape[-1] > 14:
         result["gripper_mae"] = float(physical[..., 14:].abs().mean())
     result["offline_target_passed"] = (
-        result["human_mse"] < result["reference_human_mse"]
-        and result["all_mse"] <= 1.1 * result["reference_all_mse"]
+        result["joint_mse_radians"] < result["reference_joint_mse_radians"]
+        if "score_horizon" in data
+        else (
+            result["human_mse"] < result["reference_human_mse"]
+            and result["all_mse"] <= 1.1 * result["reference_all_mse"]
+        )
     )
     return result
 
@@ -286,7 +310,6 @@ def main() -> None:
     torch.set_num_threads(4)
     if args.serve:
         from openpi.serving.websocket_policy_server import WebsocketPolicyServer
-
         from toolkits.g1_rlt_features import sha256
 
         if args.feature_config is None or args.evaluation_cache is not None:
@@ -302,8 +325,8 @@ def main() -> None:
             port=args.port,
             metadata={
                 "policy": "RLinf G1 RLT actor/critic",
-                "action_horizon": 10,
-                "reference_horizon": 10,
+                "action_horizon": policy.actor.chunk_len,
+                "reference_horizon": policy.actor.ref_chunk_len,
                 "vla_horizon": 50,
                 "action_dim": 16,
                 "actor_action_dim": policy.actor.step_action_dim,
@@ -329,8 +352,9 @@ def main() -> None:
         actor = load_actor(args.actor_config, args.actor_checkpoint, args.device)
         report = evaluate_cache(actor, args.evaluation_cache, args.device)
     else:
-        from rlinf.data.datasets.openpi.lerobot_v3_dataset import LeRobotV3Dataset
         from toolkits.g1_rlt_features import episode_id, load_raw_replay, sample_to_env
+
+        from rlinf.data.datasets.openpi.lerobot_v3_dataset import LeRobotV3Dataset
 
         if args.cache is None or args.feature_config is None:
             parser.error("Image inference requires --cache and --feature-config")
