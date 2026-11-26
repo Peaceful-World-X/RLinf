@@ -93,7 +93,7 @@ def stage_checkout(repo, dest):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("algorithm", choices=["recap", "steam"])
-    p.add_argument("mode", choices=["env-only", "smoke", "train"])
+    p.add_argument("mode", choices=["env-only", "smoke", "train", "policy"])
     p.add_argument("--run-id", required=True, type=identifier)
     p.add_argument(
         "--manifest", type=Path, help="Override the committed assets/manifest.json"
@@ -125,13 +125,34 @@ def main():
     gpu_type = os.getenv("GPU_TYPE", "a100").lower()
     if n not in (2, 4, 8):
         raise ValueError("GPU_COUNT must be 2, 4, or 8")
-    if a.mode == "train":
+    if a.mode == "policy":
+        if a.algorithm != "recap":
+            raise ValueError("Prelabelled policy mode requires RECAP")
+        if a.manifest is None:
+            a.manifest = (
+                Path(__file__).resolve().parent / "assets" / "recap_g1_v4000.json"
+            )
+        release = json.loads(a.manifest.read_text())
+        data = release["dataset"]
+        for key, value in {
+            "DATA_URI": data["uri"],
+            "DATA_BYTES": str(data["bytes"]),
+            "DATA_SHA256": data["sha256"],
+        }.items():
+            if key in env and env[key] != value:
+                raise ValueError(f"{key} differs from the prelabelled release manifest")
+            env[key] = value
+        env.setdefault("POLICY_STEPS", "10000")
+        env.setdefault("POLICY_BATCH", "256")
+        env.setdefault("POLICY_MICRO_BATCH", "2")
+        env.setdefault("SAVE_INTERVAL", "1000")
+    if a.mode in ("train", "policy"):
         for k in (
             "DATA_URI",
             "DATA_BYTES",
             "DATA_SHA256",
             "POLICY_STEPS",
-            "VALUE_STEPS",
+            *(("VALUE_STEPS",) if a.mode == "train" else ()),
         ):
             if not env.get(k):
                 raise ValueError("Set " + k)
@@ -141,7 +162,11 @@ def main():
             "[a-f0-9]{64}", env["DATA_SHA256"]
         ):
             raise ValueError("Invalid DATA_URI or DATA_SHA256")
-        for k in ("DATA_BYTES", "POLICY_STEPS", "VALUE_STEPS"):
+        for k in (
+            "DATA_BYTES",
+            "POLICY_STEPS",
+            *(("VALUE_STEPS",) if a.mode == "train" else ()),
+        ):
             if int(env[k]) <= 0:
                 raise ValueError(k + " must be positive")
     env.update(
@@ -155,6 +180,11 @@ def main():
         if a.manifest:
             shutil.copyfile(a.manifest, manifest_path)
         manifest = json.loads(manifest_path.read_text())
+        if (
+            a.mode == "policy"
+            and manifest.get("prelabelled_tag") != "recap_g1_v4000_n10_q30"
+        ):
+            raise ValueError("Select the verified 20k RECAP release manifest")
         if manifest.get("schema") != 2 or "source" in manifest["objects"]:
             raise ValueError("Use a Git-workflow asset manifest (schema 2)")
         print(f"Submitting Git commit {env['RLINF_GIT_COMMIT']}", file=sys.stderr)

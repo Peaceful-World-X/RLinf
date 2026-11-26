@@ -48,7 +48,7 @@ TEMPLATES = dict(
 )
 
 
-def input_specs(root):
+def input_specs(root, *, prelabelled=False):
     import numpy as np
     from openpi.shared import normalize
 
@@ -58,6 +58,11 @@ def input_specs(root):
             arr = np.asarray(getattr(stats[key], field))
             if arr.ndim != 1 or len(arr) < 16 or not np.isfinite(arr).all():
                 raise ValueError(f"Invalid G1 normalization: {key}.{field}")
+    split = (
+        json.loads((root / "episode_split.json").read_text())["sources"]
+        if prelabelled
+        else {}
+    )
     specs = []
     for item in json.loads((root / "datasets.json").read_text()):
         path = (root / item["path"]).resolve()
@@ -103,7 +108,23 @@ def input_specs(root):
             or any(x["dataset_path"] == str(path) for x in specs)
         ):
             raise ValueError("Invalid weight or repeated dataset")
-        specs.append(dict(dataset_path=str(path), type=item["type"], weight=weight))
+        spec = {"dataset_path": str(path), "type": item["type"], "weight": weight}
+        if prelabelled:
+            partition = split[path.name]
+            episodes = item["episodes"]
+            complete = partition["train"] + partition["val"]
+            if (
+                episodes != partition["train"]
+                or not episodes
+                or sorted(complete) != list(range(meta["total_episodes"]))
+            ):
+                raise ValueError(f"{path}: invalid training episode whitelist")
+            if not (
+                path / "meta" / f"advantages_{G1['prelabelled_tag']}.parquet"
+            ).is_file():
+                raise FileNotFoundError(f"{path}: missing precomputed advantages")
+            spec["episodes"] = episodes
+        specs.append(spec)
     if not specs:
         raise ValueError("Empty training set")
     return specs
@@ -115,7 +136,16 @@ def configure(repo, home, job, alg, smoke, n):
         from make_smoke_data import generate
 
         generate(root, G1["cameras"])
-    data = input_specs(root)
+    prelabelled = os.environ.get("JOB_MODE") == "policy"
+    data = input_specs(root, prelabelled=prelabelled)
+    if prelabelled:
+        from assets_io import sha
+
+        release = json.loads(Path(os.environ["RELEASE_MANIFEST"]).read_text())
+        if sha(root / "norm_stats.json") != release["objects"]["pi05_norm"]["sha256"]:
+            raise ValueError(
+                "The dataset action normalization differs from the policy checkpoint"
+            )
     base = job / "pi05"
     base.mkdir(exist_ok=True)
     for filename in ("config.json", "model.safetensors"):
@@ -134,18 +164,20 @@ def configure(repo, home, job, alg, smoke, n):
     )
     if not pi.data.create(pi.assets_dirs, pi.model).norm_stats:
         raise ValueError("OpenPI did not load G1 norm stats")
-    value_steps = 1 if smoke else int(os.environ["VALUE_STEPS"])
+    value_steps = 0 if prelabelled else (1 if smoke else int(os.environ["VALUE_STEPS"]))
     policy_steps = 1 if smoke else int(os.environ["POLICY_STEPS"])
-    if min(value_steps, policy_steps, n) <= 0:
+    if min(policy_steps, n) <= 0 or (not prelabelled and value_steps <= 0):
         raise ValueError("Step budgets and GPU count must be positive")
     order = (["returns"] if alg == "recap" else []) + [
         alg + "_value",
         alg + "_adv",
         "policy",
     ]
+    if prelabelled:
+        order = ["policy"]
     configs = job / "configs"
     configs.mkdir(exist_ok=True)
-    tag = f"{alg}_g1"
+    tag = G1["prelabelled_tag"] if prelabelled else f"{alg}_g1"
     gemma = str(home / "models/gemma")
     vision = str(home / "models" / (alg + "_vision"))
     for stage in order:
@@ -242,6 +274,9 @@ def configure(repo, home, job, alg, smoke, n):
             model = actor["model"]
             if policy:
                 cfg["data"].update(advantage_tag=tag, num_workers=1 if smoke else 4)
+                if prelabelled:
+                    # Weights in this release are probabilities per source.
+                    cfg["data"]["balance_dataset_weights"] = False
                 model.update(model_path=str(base), num_action_chunks=50, action_dim=16)
                 model["openpi"].update(
                     config_name=G1["policy_config"], num_images_in_input=3
@@ -363,7 +398,7 @@ def main():
     identity["manifest"] = sha(os.environ["RELEASE_MANIFEST"])
     store = RunStore(job, identity)
     store.begin()
-    for key in ("value", "policy"):
+    for key in ("policy",) if mode == "policy" else ("value", "policy"):
         checkpoint = store.restore(key) if os.getenv("RESUME") == "1" else 0
         if not checkpoint:
             restore_history(job, key, [])
@@ -383,7 +418,24 @@ def main():
         run_stages(repo, job, n, order, vs, ps, store)
     publish(job, store.uri)
     result = job / "result.json"
-    save_json(result, dict(algorithm=alg, mode=mode, policy_step=ps, value_step=vs))
+    summary = {"algorithm": alg, "mode": mode, "policy_step": ps, "value_step": vs}
+    if mode == "policy":
+        subprocess.run(
+            [sys.executable, str(HERE / "eval_holdout.py"), str(job), str(ps)],
+            check=True,
+        )
+        oss(
+            "cp",
+            job / "holdout-actions.json",
+            store.uri + "/holdout-actions.json",
+            "-f",
+        )
+        summary.update(
+            source_value_step=4000,
+            advantage_tag=G1["prelabelled_tag"],
+            holdout="holdout-actions.json",
+        )
+    save_json(result, summary)
     oss("cp", result, store.uri + "/result.json", "-f")
 
 

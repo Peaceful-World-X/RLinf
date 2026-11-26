@@ -1,0 +1,157 @@
+{
+  "dataset": {
+    "bytes": 32408473600,
+    "sha256": "85a5cf850031ea91c390e2c86ab440a24bf1c42e98fe5d331095a6f5d921d2ca",
+    "uri": "oss://tipalgog/sudu/rlinf-cloud/datasets/recap_g1_v4000_n10_q30/85a5cf850031ea91c390e2c86ab440a24bf1c42e98fe5d331095a6f5d921d2ca/train.tar"
+  },
+  "logging": {
+    "columns": [
+      "stage",
+      "step",
+      "loss"
+    ],
+    "journal": "policy-loss.csv",
+    "mode": "offline",
+    "oss_files": [
+      "loss.csv",
+      "loss.png"
+    ],
+    "publish_interval_seconds": 3600
+  },
+  "objects": {
+    "base_provenance": {
+      "bytes": 723,
+      "sha256": "0cf239f87c20bee01dad27f949bd9dd1e052dacc46656727b55269be9be8aefb",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/g1_zip_tie_20k_rlinf_cloud/0cf239f87c20bee01dad27f949bd9dd1e052dacc46656727b55269be9be8aefb/policy-provenance.json"
+    },
+    "gemma/added_tokens.json": {
+      "bytes": 35,
+      "sha256": "50b2f405ba56a26d4913fd772089992252d7f942123cc0a034d96424221ba946",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/gemma-3-270m/50b2f405ba56a26d4913fd772089992252d7f942123cc0a034d96424221ba946/added_tokens.json"
+    },
+    "gemma/config.json": {
+      "bytes": 1352,
+      "sha256": "8983343e5bfbf8e336d222a522a1d781443491e9de2d081b8856f8fd26ab6046",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/gemma-3-270m/8983343e5bfbf8e336d222a522a1d781443491e9de2d081b8856f8fd26ab6046/config.json"
+    },
+    "gemma/model.safetensors": {
+      "bytes": 536223056,
+      "sha256": "abb58eb73aece5163624090d5383c59cbcdb9e9539ec84cb864f74386c4b21d5",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/gemma-3-270m/abb58eb73aece5163624090d5383c59cbcdb9e9539ec84cb864f74386c4b21d5/model.safetensors"
+    },
+    "gemma/special_tokens_map.json": {
+      "bytes": 662,
+      "sha256": "2f7b0adf4fb469770bb1490e3e35df87b1dc578246c5e7e6fc76ecf33213a397",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/gemma-3-270m/2f7b0adf4fb469770bb1490e3e35df87b1dc578246c5e7e6fc76ecf33213a397/special_tokens_map.json"
+    },
+    "gemma/tokenizer.json": {
+      "bytes": 33384570,
+      "sha256": "7d4046bf0505a327dd5a0abbb427ecd4fc82f99c2ceaa170bc61ecde12809b0c",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/gemma-3-270m/7d4046bf0505a327dd5a0abbb427ecd4fc82f99c2ceaa170bc61ecde12809b0c/tokenizer.json"
+    },
+    "gemma/tokenizer.model": {
+      "bytes": 4689074,
+      "sha256": "1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/gemma-3-270m/1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c/tokenizer.model"
+    },
+    "gemma/tokenizer_config.json": {
+      "bytes": 1155375,
+      "sha256": "94b03056ec5831e9021c3e3fe9db682778c4f2d081c4188f1fcb8b90541cf1cf",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/gemma-3-270m/94b03056ec5831e9021c3e3fe9db682778c4f2d081c4188f1fcb8b90541cf1cf/tokenizer_config.json"
+    },
+    "ossutil": {
+      "bytes": 11304833,
+      "sha256": "0970061c150262d67e2ff46045ce1237f1cbf0df4fcd9f126802a1dc7e0036bf",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/runtime/0970061c150262d67e2ff46045ce1237f1cbf0df4fcd9f126802a1dc7e0036bf/ossutil64"
+    },
+    "pi05/config.json": {
+      "bytes": 149,
+      "sha256": "9929234d5b58afe819e134bd9d76cd2ea01cdc372d7b7f295219d4939d9b6b90",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/g1_zip_tie_20k_rlinf_cloud/9929234d5b58afe819e134bd9d76cd2ea01cdc372d7b7f295219d4939d9b6b90/config.json"
+    },
+    "pi05/model.safetensors": {
+      "bytes": 7233650408,
+      "sha256": "7d2671f39cabdb216d7b1d935b175e3e8e89d4f33047b90204dfcd0ec67cf843",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/g1_zip_tie_20k_rlinf_cloud/7d2671f39cabdb216d7b1d935b175e3e8e89d4f33047b90204dfcd0ec67cf843/model.safetensors"
+    },
+    "pi05_norm": {
+      "bytes": 3820,
+      "sha256": "62f6cb5b6579e6531168d57776beed5df41b449316c1988df5a0738bbbfb29f1",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/g1_zip_tie_20k_rlinf_cloud/62f6cb5b6579e6531168d57776beed5df41b449316c1988df5a0738bbbfb29f1/norm_stats.json"
+    },
+    "recap_vision/config.json": {
+      "bytes": 536,
+      "sha256": "946cfbcedeb7aaa497606d78540163d13ab92fe70da8f5d25049991bd3b69b8d",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/siglip2-so400m-patch14-224/946cfbcedeb7aaa497606d78540163d13ab92fe70da8f5d25049991bd3b69b8d/config.json"
+    },
+    "recap_vision/model.safetensors": {
+      "bytes": 4541963488,
+      "sha256": "2041e5330b3db96299b26bc3a6506c7fa8d5e61d5c94f267dd8aa4cfb12c1050",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/siglip2-so400m-patch14-224/2041e5330b3db96299b26bc3a6506c7fa8d5e61d5c94f267dd8aa4cfb12c1050/model.safetensors"
+    },
+    "recap_vision/preprocessor_config.json": {
+      "bytes": 394,
+      "sha256": "9b36b57ebaf20f09bf4c22100ccc21877ea6bfe5aead0c00c59f8af8ccefacfc",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/siglip2-so400m-patch14-224/9b36b57ebaf20f09bf4c22100ccc21877ea6bfe5aead0c00c59f8af8ccefacfc/preprocessor_config.json"
+    },
+    "runtime": {
+      "bytes": 4369975483,
+      "sha256": "255d95870636736921453b2093acbb34f4352b943dfd1b34ac48dd1598c4635c",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/runtime/255d95870636736921453b2093acbb34f4352b943dfd1b34ac48dd1598c4635c/runtime.tar.gz"
+    },
+    "runtime_lock": {
+      "bytes": 7125,
+      "sha256": "8c20a0a22ec54d6ef9e136dfe8bb7cafcd919c4a3c12813d190022b97db03bdb",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/runtime/8c20a0a22ec54d6ef9e136dfe8bb7cafcd919c4a3c12813d190022b97db03bdb/runtime.tar.lock.json"
+    },
+    "tokenizer": {
+      "bytes": 4264023,
+      "sha256": "8986bb4f423f07f8c7f70d0dbe3526fb2316056c17bae71b1ea975e77a168fc6",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/tokenizer/8986bb4f423f07f8c7f70d0dbe3526fb2316056c17bae71b1ea975e77a168fc6/paligemma_tokenizer.model"
+    },
+    "value/episode_split.json": {
+      "bytes": 26345,
+      "sha256": "12e5a7e559cb5f841d57fd43d1520ee87b63a302fbca1708cc2e91459a818d39",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/g1_recap_value_4000/12e5a7e559cb5f841d57fd43d1520ee87b63a302fbca1708cc2e91459a818d39/episode_split.json"
+    },
+    "value/full_weights.pt": {
+      "bytes": 1799192037,
+      "sha256": "43f2c33a7e8c801b18614c65490f5940b874fa41d238f501b514ee2c0ebbaeff",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/g1_recap_value_4000/43f2c33a7e8c801b18614c65490f5940b874fa41d238f501b514ee2c0ebbaeff/full_weights.pt"
+    },
+    "value/training.yaml": {
+      "bytes": 4545,
+      "sha256": "da9821066f5a8c79f80c8f943e905fe40b854fcd60f1ad2556c53a3739dd9727",
+      "uri": "oss://tipalgog/sudu/rlinf-cloud/models/g1_recap_value_4000/da9821066f5a8c79f80c8f943e905fe40b854fcd60f1ad2556c53a3739dd9727/composed.yaml"
+    }
+  },
+  "original_policy_checkpoint": "oss://tipalgog/zhunheng/Embodied_ws/ckpts/openpi_train/zh_g1_zip_tie_1677_sft_b256_40k_v1_2w/",
+  "prelabelled_tag": "recap_g1_v4000_n10_q30",
+  "release": "g1-recap4000-pi05-20k-85a5cf850031",
+  "schema": 2,
+  "score": {
+    "checkpoint_step": 4000,
+    "gamma": 1.0,
+    "lookahead": 10,
+    "quantile": 0.3,
+    "threshold": 0.004039475241840073,
+    "threshold_partition": "train"
+  },
+  "training": {
+    "balance_dataset_weights": false,
+    "global_batch": 256,
+    "holdout_report": "holdout-actions.json",
+    "micro_batch": 2,
+    "policy_steps": 10000,
+    "source_weights": [
+      3,
+      1,
+      1,
+      1
+    ],
+    "train_episodes": 1821,
+    "train_frames": 1350185,
+    "val_episodes": 100,
+    "val_frames": 74963
+  }
+}

@@ -28,6 +28,7 @@ def main():
     objects = spec["objects"]
     alg = os.environ["ALGORITHM"]
     if alg not in ("recap", "steam") or os.environ["JOB_MODE"] not in (
+        "policy",
         "env-only",
         "smoke",
         "train",
@@ -50,7 +51,7 @@ def main():
     # Each required CFG base file has its own immutable OSS URI and digest.
     for filename in ("model.safetensors", "config.json"):
         get("pi05/" + filename, home / "models/pi05" / filename)
-    for key in ("gemma", alg + "_vision"):
+    for key in (() if os.environ["JOB_MODE"] == "policy" else ("gemma", alg + "_vision")):
         for name in objects:
             if name.startswith(key + "/"):
                 filename = name.split("/")[1]
@@ -58,7 +59,7 @@ def main():
                 get(name, home / "models" / key / filename)
     job = home / "jobs" / alg / identifier(os.environ["RUN_ID"])
     job.mkdir(parents=True, exist_ok=True)
-    if os.environ["JOB_MODE"] == "train":
+    if os.environ["JOB_MODE"] in ("train", "policy"):
         uri = os.environ["DATA_URI"]
         if not uri.startswith("oss://"):
             raise ValueError("Expected explicit OSS DATA_URI")

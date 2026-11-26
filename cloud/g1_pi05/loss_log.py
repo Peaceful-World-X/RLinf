@@ -59,7 +59,8 @@ def restore_history(job, stage, losses):
 
 
 def publish(job, uri):
-    history = {stage: stage_history(job, stage) for stage in STAGES}
+    stages = ("policy",) if os.getenv("JOB_MODE") == "policy" else STAGES
+    history = {stage: stage_history(job, stage) for stage in stages}
     if not any(history.values()):
         return
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -73,7 +74,8 @@ def publish(job, uri):
         with csv_path.open("w", newline="") as dest:
             writer = csv.writer(dest)
             writer.writerow(("stage", "step", "loss"))
-            for (stage, losses), ax in zip(history.items(), fig.subplots(2, 1)):
+            axes = fig.subplots(len(stages), 1, squeeze=False)[:, 0]
+            for (stage, losses), ax in zip(history.items(), axes):
                 steps = range(1, len(losses) + 1)
                 writer.writerows(
                     (stage, step, loss) for step, loss in zip(steps, losses)

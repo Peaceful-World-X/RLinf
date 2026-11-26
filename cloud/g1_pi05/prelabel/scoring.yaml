@@ -1,0 +1,42 @@
+advantage:
+  value_checkpoint: ${oc.env:G1_VALUE_CHECKPOINT}
+  returns_tag: full_episode_gamma1_fail300
+  tag: recap_g1_v4000_n10_q30
+  positive_quantile: 0.3
+  discount_next_value: true
+  batch_size: 16
+  num_dataloader_workers_per_gpu: 6
+  persistent_workers: false
+  prefetch_factor: 2
+  flush_interval: 256
+  model:
+    critic_expert_variant: gemma_1m
+    num_bins: 201
+    v_min: -1.0
+    v_max: 0.0
+    tokenizer_path: ${oc.env:G1_GEMMA}
+    gemma3_path: ${oc.env:G1_GEMMA}
+    siglip_path: ${oc.env:G1_SIGLIP}
+data:
+  model_type: pi05
+  advantage_lookahead_step: 10
+  gamma: 1.0
+  return_min: -2088.0
+  return_max: 0.0
+  train_data_paths:
+    - dataset_path: ${oc.env:G1_INPUT}/datasets/20260826_0908_merged_delete14
+      robot_type: g1
+      type: sft
+      weight: 3.0
+    - dataset_path: ${oc.env:G1_INPUT}/datasets/zd_105_261111
+      robot_type: g1
+      type: rollout
+      weight: 1.0
+    - dataset_path: ${oc.env:G1_INPUT}/datasets/zd_50_261120
+      robot_type: g1
+      type: rollout
+      weight: 1.0
+    - dataset_path: ${oc.env:G1_INPUT}/datasets/zd_89_261027
+      robot_type: g1
+      type: rollout
+      weight: 1.0

@@ -108,3 +108,46 @@ bash submit.sh steam train --run-id steam-g1-01
 ## 更新发行版
 
 在北京仓库，用训练环境的 Python 运行 `build_runtime.py OUTPUT/runtime.tar.gz`，生成运行时和包版本锁。用 `convert_base.py OFFICIAL_CHECKPOINT_DIR OUTPUT/pi05_base` 将已校验的官方 Orbax 基座转换为 G1 对应的 BF16 safetensors。`publish_assets.py --inputs <本地资产路径的JSON> --release <新版本> --output <仓库外目录> --upload` 发布白名单中的资产和不可变清单。输入键为 pi05、gemma、recap_vision、steam_vision（本地模型目录），以及 runtime、runtime_lock、tokenizer、base_provenance、ossutil（本地文件）。将新生成的 `manifest.json` 放入 `cloud/g1_pi05/assets/`，随训练代码一起提交到 Git。
+
+## 用扎带 20k 和已有 RECAP 优势标签训练策略
+
+在 AIStudio CPU 提交容器中检出发布记录指定的 `cloud` 提交，在本目录执行以下命令。作业按 `assets/recap_g1_v4000.json` 从 OSS 恢复 RLinf/PyTorch 版扎带 20k、G1 归一化统计与带标签归档。
+
+```bash
+source cloud.env.example
+export OSS_CONFIG=/input/workspace/.secrets/rlinf-oss.conf
+# 在独立 run-id 上执行两步 GPU 冒烟，读取本次发布的真实标签和 20k 权重。
+GPU_COUNT=2 POLICY_STEPS=2 POLICY_MICRO_BATCH=1 POLICY_BATCH=2 SAVE_INTERVAL=1 \
+  bash submit.sh recap policy --run-id g1-zip-tie-recap4000-smoke-01
+
+# 正式作业使用默认八卡和 10,000 步。先预览参数，再提交。
+export RUN_ID=g1-zip-tie-recap4000-policy10k-01
+bash submit.sh recap policy --run-id "$RUN_ID" --dry-run
+bash submit.sh recap policy --run-id "$RUN_ID"
+```
+
+默认使用 8 张 A100，从 20k 策略微调 10,000 步，全局 batch 256、每卡 micro-batch 2、学习率 1e-5、余弦衰减、预热 2,000 步。每 1,000 步保存完整检查点。受条件控制的正样本有 10% 概率丢弃条件。动作长度为 50，优势前看 10 帧。每个数据源的训练 episode 白名单来自归档的 `episode_split.json`，1,821 条训练、100 条留出。四个来源按 3:1:1:1 抽样。配置使用 `balance_dataset_weights: false`，示范数据占 50%，三个 rollout 来源各占 1/6。
+
+日志默认离线，训练器逐步写入本地 `policy-loss.csv`。现有发布器每小时更新 OSS 作业目录的 `loss.csv` 和 `loss.png`，正常结束时补传。恢复时使用同一个提交、清单、参数和 RUN_ID，设置 `RESUME=1` 再执行同一提交命令。恢复点和 loss 历史均取自同一份完整检查点清单。`policy/latest.json` 记录最新完整上传，`result.json` 标志正式训练完成。
+
+### 复算优势标签
+
+发布清单的 `value/full_weights.pt`、`value/training.yaml` 和 `value/episode_split.json` 对应价值模型第 4,000 步。将权重放入 `$G1_VALUE_CHECKPOINT/actor/model_state_dict/full_weights.pt`，用清单中的 Gemma 3 和 SigLIP2 文件恢复模型目录。将已验证的归档解压到独立可写目录 `G1_INPUT`。在北京机验证过的 RLinf 环境中设置以下变量。分片程序沿用官方 RECAP 的推理和 N 步优势计算，两个进程用文件锁领取分片。每次更换数据、权重或计分参数都使用新的分片目录。
+
+```bash
+export REPO_PATH="$(git rev-parse --show-toplevel)"
+export PYTHONPATH="$REPO_PATH"
+export G1_INPUT=/path/to/unpacked-data
+export G1_VALUE_CHECKPOINT=/path/to/global_step_4000
+export G1_GEMMA=/path/to/gemma-3-270m G1_SIGLIP=/path/to/siglip2-so400m-patch14-224
+export OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1
+cd "$REPO_PATH/cloud/g1_pi05/prelabel"
+export SHARDS=/path/to/this-release/shards
+CUDA_VISIBLE_DEVICES=0 python score_shards.py scoring.yaml "$SHARDS" & left=$!
+CUDA_VISIBLE_DEVICES=1 python score_shards.py scoring.yaml "$SHARDS" & right=$!
+wait "$left" && wait "$right" && python finalize_labels.py scoring.yaml "$SHARDS" "$G1_INPUT"
+```
+
+`advantage_report.json` 给出训练分位数阈值，以及每个来源、分区和轨迹结果的正标签比例。示教源的布尔标签按官方规则设为正，rollout 以训练分位数作判定。留出轨迹使用同一阈值。
+
+正式策略完成后在 100 条留出轨迹上评测。每条抽取开头、中间和末尾最多三个 50 帧动作段。20k 基座使用原任务提示，最终策略使用正优势条件，两者共用观测、噪声和去噪步数。作业将 `holdout-actions.json` 上传到本次 OSS 目录，按来源分别给出 14 个关节、两个夹爪的记录动作 MSE，以及逐轨迹指标。采样均不跨轨迹边界。

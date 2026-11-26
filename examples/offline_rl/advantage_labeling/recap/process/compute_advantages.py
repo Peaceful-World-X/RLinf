@@ -652,7 +652,10 @@ def compute_advantages_for_dataset(
         batch_size=batch_size,
         num_workers=num_dataloader_workers_per_gpu,
         prefetch_factor=prefetch_factor if num_dataloader_workers_per_gpu > 0 else None,
-        persistent_workers=num_dataloader_workers_per_gpu > 0,
+        persistent_workers=(
+            num_dataloader_workers_per_gpu > 0
+            and cfg.advantage.get("persistent_workers", True)
+        ),
         collate_fn=advantage_collate_fn,
         shuffle=False,
         pin_memory=True,

@@ -254,7 +254,8 @@ class FSDPCfgWorker(FSDPSftWorker):
         data_loader = CFGDataLoaderImpl(data_config, torch_data_loader)
         return data_loader, data_loader.data_config()
 
-    def _build_model_transforms(self, data_config: Any) -> list:
+    @staticmethod
+    def _build_model_transforms(data_config: Any) -> list:
         """Replace TokenizePrompt with TokenizePromptWithGuidance in model transforms."""
         tokenizer = None
         for t in data_config.model_transforms.inputs:

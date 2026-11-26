@@ -6,6 +6,7 @@
   "return_tag": "full_episode_gamma1_fail300",
   "gamma": 1.0,
   "failure_reward": -300.0,
+  "prelabelled_tag": "recap_g1_v4000_n10_q30",
   "recap_quantile": 0.3,
   "steam_k": 32,
   "steam_members": 3
